@@ -1,0 +1,23 @@
+# 统一编辑器配置，避免跨平台换行符与缩进差异
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.go]
+indent_style = tab
+
+[*.{yml,yaml,json,js,ts,tsx,jsx}]
+indent_size = 2
+
+[*.md]
+# Markdown 里行尾双空格表示换行，不能裁剪
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab
