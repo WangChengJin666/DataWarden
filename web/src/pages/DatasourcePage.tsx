@@ -44,12 +44,48 @@ const typeColors: Record<DatasourceType, string> = {
   mongodb: 'green',
 }
 
+// 各类型数据源对账号的要求。
+// Redis 的默认认证方式只有密码（requirepass），没有账号概念；
+// 平台内部的 Redis 客户端也不传用户名，所以这里不允许填，避免误导。
+const usernamePolicy: Record<
+  DatasourceType,
+  { required: boolean; label: string; placeholder: string; hint: string }
+> = {
+  mysql: {
+    required: true,
+    label: '连接账号',
+    placeholder: '例如 readonly',
+    hint: '',
+  },
+  postgresql: {
+    required: true,
+    label: '连接账号',
+    placeholder: '例如 readonly',
+    hint: '',
+  },
+  mongodb: {
+    required: true,
+    label: '连接账号',
+    placeholder: '例如 readonly',
+    hint: '',
+  },
+  redis: {
+    required: false,
+    label: '连接账号（可选）',
+    placeholder: 'Redis 通常不需要',
+    hint: 'Redis 默认只用密码认证，账号留空即可。若你的实例启用了 ACL 且账号不是 default，才需要填写。',
+  },
+}
+
 export default function DatasourcePage() {
   const [items, setItems] = useState<Datasource[]>([])
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState<Datasource | null>(null)
   const [form] = Form.useForm()
+  // 实时监听类型，用于按类型调整账号字段的必填规则与文案
+  const currentType: DatasourceType | undefined = Form.useWatch('type', form)
+  const policy = currentType ? usernamePolicy[currentType] : usernamePolicy.postgresql
 
   const isDBA = ['dba', 'superadmin'].includes(getCurrentUser()?.role ?? '')
 
@@ -338,6 +374,10 @@ export default function DatasourcePage() {
                 }))}
                 onChange={(v: DatasourceType) => {
                   form.setFieldValue('port', v === 'mysql' ? 3306 : v === 'redis' ? 6379 : v === 'mongodb' ? 27017 : 5432)
+                  // 切到不需要账号的类型时清掉残留值，避免把上一次填的账号带进 Redis
+                  if (!usernamePolicy[v].required) {
+                    form.setFieldValue('username', '')
+                  }
                 }}
               />
             </Form.Item>
@@ -368,11 +408,16 @@ export default function DatasourcePage() {
           <Space size="middle" style={{ display: 'flex', alignItems: 'flex-start' }}>
             <Form.Item
               name="username"
-              label="连接账号"
-              rules={[{ required: true, message: '请输入连接账号' }]}
+              label={policy.label}
+              rules={
+                policy.required
+                  ? [{ required: true, message: '请输入连接账号' }]
+                  : []
+              }
+              extra={policy.hint || undefined}
               style={{ flex: 1 }}
             >
-              <Input placeholder="例如 readonly" autoComplete="off" />
+              <Input placeholder={policy.placeholder} autoComplete="off" />
             </Form.Item>
             <Form.Item
               name="password"
