@@ -77,9 +77,11 @@ CREATE TABLE IF NOT EXISTS datasource (
     port         INT         NOT NULL,
     -- SQL：库名；Redis：db 号（如 '37'）
     db_name      TEXT        NOT NULL DEFAULT '',
-    -- 密钥引用，不存明文密码。格式 env:VAR_NAME 表示从环境变量读取
-    secret_ref   TEXT        NOT NULL,
-    env          TEXT        NOT NULL DEFAULT 'prod',
+    -- 连接目标库使用的账号，每个数据源独立配置
+    username     TEXT        NOT NULL DEFAULT '',
+    -- 密码的 AES-GCM 密文（base64）。绝不存明文，
+    -- 主密钥由 DATAWARDEN_MASTER_KEY 环境变量提供
+    password_enc TEXT        NOT NULL DEFAULT '',
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     -- 可申请配置（0002 迁移新增）

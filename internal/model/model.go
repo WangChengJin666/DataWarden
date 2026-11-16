@@ -38,21 +38,30 @@ type ApplyScope struct {
 }
 
 type Datasource struct {
-	ID        int64          `json:"id"`
-	Name      string         `json:"name"`
-	Type      DatasourceType `json:"type"`
-	Host      string         `json:"host"`
-	Port      int            `json:"port"`
-	Database  string         `json:"database"`
-	SecretRef string         `json:"secret_ref"` // 指向密钥管理，绝不存明文密码
-	Env       string         `json:"env"`
-	CreatedAt time.Time      `json:"created_at"`
+	ID       int64          `json:"id"`
+	Name     string         `json:"name"`
+	Type     DatasourceType `json:"type"`
+	Host     string         `json:"host"`
+	Port     int            `json:"port"`
+	Database string         `json:"database"`
+
+	// 连接目标库使用的账号。每个数据源独立配置，便于按库分配最小权限账号。
+	Username string `json:"username"`
+	// 密码的 AES-GCM 密文（base64）。绝不出现在 API 响应里，
+	// 服务端解密后只用于建立连接。
+	PasswordEnc string `json:"-"`
+	// Password 是明文密码，仅在写入路径（Create/Update）中使用，不落库、不序列化。
+	Password string `json:"-"`
+
+	CreatedAt time.Time `json:"created_at"`
 
 	// 可申请配置。管理员决定该数据源是否对开发者开放申请。
 	ApplyEnabled bool         `json:"apply_enabled"`
 	MaxApplyDays int          `json:"max_apply_days"`
 	ApplyScopes  []ApplyScope `json:"apply_scopes"`
 	Description  string       `json:"description"`
+	// HasPassword 供前端判断是否已设置密码，不暴露密码本身。
+	HasPassword bool `json:"has_password"`
 }
 
 // Grant 是生效中的数据源查询授权。Casbin 策略由此表重新生成。

@@ -17,8 +17,10 @@ export interface Datasource {
   host: string
   port: number
   database: string
-  secret_ref: string
-  env: string
+  /** 连接目标库使用的账号 */
+  username: string
+  /** 是否已设置密码。后端永远不会返回密码本身 */
+  has_password: boolean
   created_at: string
   apply_enabled: boolean
   max_apply_days: number
@@ -32,8 +34,9 @@ export interface DatasourceInput {
   host: string
   port: number
   database: string
-  secret_ref: string
-  env: string
+  username: string
+  /** 新建时必填；编辑时留空表示不修改密码 */
+  password?: string
   apply_enabled: boolean
   max_apply_days: number
   apply_scopes: ApplyScope[]

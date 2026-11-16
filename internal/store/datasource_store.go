@@ -18,6 +18,9 @@ func NewDatasourceStore(pool *pgxpool.Pool) *DatasourceStore {
 	return &DatasourceStore{pool: pool}
 }
 
+// Create 插入数据源。
+// ds.PasswordEnc 必须由调用方提前加密填好；本层不做加解密，避免把密钥职责
+// 混进持久化层。
 func (s *DatasourceStore) Create(ctx context.Context, ds *model.Datasource) (int64, error) {
 	scopes, err := json.Marshal(orEmptyScopes(ds.ApplyScopes))
 	if err != nil {
@@ -27,10 +30,11 @@ func (s *DatasourceStore) Create(ctx context.Context, ds *model.Datasource) (int
 	var id int64
 	err = s.pool.QueryRow(ctx,
 		`INSERT INTO datasource
-		   (name, type, host, port, db_name, secret_ref, env,
+		   (name, type, host, port, db_name, username, password_enc,
 		    apply_enabled, max_apply_days, apply_scopes, description)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
-		ds.Name, string(ds.Type), ds.Host, ds.Port, ds.Database, ds.SecretRef, ds.Env,
+		ds.Name, string(ds.Type), ds.Host, ds.Port, ds.Database,
+		ds.Username, ds.PasswordEnc,
 		ds.ApplyEnabled, orDefaultInt(ds.MaxApplyDays, 7), scopes, ds.Description,
 	).Scan(&id)
 	if err != nil {
@@ -40,6 +44,9 @@ func (s *DatasourceStore) Create(ctx context.Context, ds *model.Datasource) (int
 }
 
 // Update 更新数据源。名称唯一冲突会返回错误。
+//
+// 密码列为空时表示「不修改密码」——即前端编辑时没重填密码，
+// 就保留数据库里原有的密文，避免把已设置的密码意外清空。
 func (s *DatasourceStore) Update(ctx context.Context, ds *model.Datasource) error {
 	scopes, err := json.Marshal(orEmptyScopes(ds.ApplyScopes))
 	if err != nil {
@@ -49,10 +56,13 @@ func (s *DatasourceStore) Update(ctx context.Context, ds *model.Datasource) erro
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE datasource SET
 		   name = $1, type = $2, host = $3, port = $4, db_name = $5,
-		   secret_ref = $6, env = $7, apply_enabled = $8,
-		   max_apply_days = $9, apply_scopes = $10, description = $11
+		   username = $6,
+		   password_enc = CASE WHEN $7 = '' THEN password_enc ELSE $7 END,
+		   apply_enabled = $8, max_apply_days = $9, apply_scopes = $10,
+		   description = $11
 		 WHERE id = $12`,
-		ds.Name, string(ds.Type), ds.Host, ds.Port, ds.Database, ds.SecretRef, ds.Env,
+		ds.Name, string(ds.Type), ds.Host, ds.Port, ds.Database,
+		ds.Username, ds.PasswordEnc,
 		ds.ApplyEnabled, orDefaultInt(ds.MaxApplyDays, 7), scopes, ds.Description, ds.ID)
 	if err != nil {
 		return fmt.Errorf("update datasource: %w", err)
@@ -76,8 +86,8 @@ func (s *DatasourceStore) Delete(ctx context.Context, id int64) error {
 }
 
 const datasourceSelect = `
-	SELECT id, name, type, host, port, db_name, secret_ref, env, created_at,
-	       apply_enabled, max_apply_days, apply_scopes, description
+	SELECT id, name, type, host, port, db_name, username, password_enc,
+	       created_at, apply_enabled, max_apply_days, apply_scopes, description
 	FROM datasource`
 
 func scanDatasource(row interface {
@@ -89,12 +99,13 @@ func scanDatasource(row interface {
 		scopes []byte
 	)
 	err := row.Scan(&d.ID, &d.Name, &typ, &d.Host, &d.Port, &d.Database,
-		&d.SecretRef, &d.Env, &d.CreatedAt,
-		&d.ApplyEnabled, &d.MaxApplyDays, &scopes, &d.Description)
+		&d.Username, &d.PasswordEnc,
+		&d.CreatedAt, &d.ApplyEnabled, &d.MaxApplyDays, &scopes, &d.Description)
 	if err != nil {
 		return nil, err
 	}
 	d.Type = model.DatasourceType(typ)
+	d.HasPassword = d.PasswordEnc != ""
 
 	var parsed []model.ApplyScope
 	if len(scopes) > 0 {

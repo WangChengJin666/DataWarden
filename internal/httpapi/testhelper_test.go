@@ -9,7 +9,19 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/opensourceprj/datawarden/internal/auth"
 	"github.com/opensourceprj/datawarden/internal/model"
+	"github.com/opensourceprj/datawarden/internal/secret"
 )
+
+// testCipher 是测试用的固定主密钥 cipher。
+// 用固定值是为了让测试可重复，真实密钥由 DATAWARDEN_MASTER_KEY 提供。
+func testCipher(t *testing.T) *secret.Cipher {
+	t.Helper()
+	c, err := secret.NewCipher("0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatalf("new cipher: %v", err)
+	}
+	return c
+}
 
 // memUsers 是内存用户存储，供 HTTP 层测试使用。
 type memUsers struct {
@@ -93,7 +105,7 @@ func buildRouter(t *testing.T, passwords map[string]string, role string) *gin.En
 	return NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: passwords, role: role}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
 		Query:       &QueryHandler{},
 	})
 }

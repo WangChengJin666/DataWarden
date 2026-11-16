@@ -125,9 +125,9 @@ func TestDatasourceStore_CreateAndList(t *testing.T) {
 		Type:      model.TypePostgreSQL,
 		Host:      "10.0.0.5",
 		Port:      5432,
-		Database:  "shop",
-		SecretRef: "secret/shop-prod",
-		Env:       "prod",
+		Database:    "shop",
+		Username:    "readonly",
+		PasswordEnc: "ZW5jcnlwdGVk",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -173,7 +173,7 @@ func TestGrantStore_ActiveGrantsExcludesExpired(t *testing.T) {
 
 	dss := NewDatasourceStore(pool)
 	dsID, _ := dss.Create(ctx, &model.Datasource{
-		Name: "ds1", Type: model.TypePostgreSQL, Host: "h", Port: 5432, SecretRef: "s",
+		Name: "ds1", Type: model.TypePostgreSQL, Host: "h", Port: 5432, Username: "u", PasswordEnc: "e",
 	})
 
 	gs := NewGrantStore(pool)
@@ -211,7 +211,7 @@ func TestGrantStore_RevokeIdempotent(t *testing.T) {
 	uid, _ := users.Create(ctx, &model.User{Username: "carol", PasswordHash: "x", Role: model.RoleDeveloper})
 	dss := NewDatasourceStore(pool)
 	dsID, _ := dss.Create(ctx, &model.Datasource{
-		Name: "ds2", Type: model.TypePostgreSQL, Host: "h", Port: 5432, SecretRef: "s",
+		Name: "ds2", Type: model.TypePostgreSQL, Host: "h", Port: 5432, Username: "u", PasswordEnc: "e",
 	})
 
 	gs := NewGrantStore(pool)

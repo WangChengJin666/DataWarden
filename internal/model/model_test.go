@@ -39,24 +39,59 @@ func TestDatasourceJSON_UsesSnakeCase(t *testing.T) {
 	ds := Datasource{
 		ID: 1, Name: "shop", Type: TypePostgreSQL,
 		Host: "h", Port: 5432, Database: "db",
-		SecretRef: "s", Env: "prod", CreatedAt: time.Now(),
+		Username: "readonly", CreatedAt: time.Now(),
 	}
 	b, _ := json.Marshal(ds)
 	out := string(b)
 
 	for _, want := range []string{
 		`"id":`, `"name":`, `"type":`, `"host":`, `"port":`,
-		`"database":`, `"secret_ref":`, `"env":`, `"created_at":`,
+		`"database":`, `"username":`, `"created_at":`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing json key %s in %s", want, out)
 		}
 	}
 	// Go 默认大写字段名不应出现
-	for _, bad := range []string{`"ID":`, `"Name":`, `"SecretRef":`} {
+	for _, bad := range []string{`"ID":`, `"Name":`, `"Username":`} {
 		if strings.Contains(out, bad) {
 			t.Errorf("unexpected Go-style key %s in %s", bad, out)
 		}
+	}
+}
+
+// 数据源的密码（明文与密文）都绝不能出现在 API 响应里。
+// 这是本项目的安全底线之一：接口一旦泄露密文，等于泄露了可解密的凭据。
+func TestDatasourceJSON_NeverLeaksPassword(t *testing.T) {
+	ds := Datasource{
+		ID: 1, Name: "shop", Type: TypePostgreSQL,
+		Host: "h", Port: 5432, Database: "db",
+		Username:    "readonly",
+		Password:    "plain-secret-value",
+		PasswordEnc: "ZW5jcnlwdGVkLXNlY3JldA==",
+		HasPassword: true,
+	}
+	b, err := json.Marshal(ds)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	out := string(b)
+
+	if strings.Contains(out, "plain-secret-value") {
+		t.Fatal("plaintext password must never be serialized")
+	}
+	if strings.Contains(out, "ZW5jcnlwdGVkLXNlY3JldA") {
+		t.Fatal("encrypted password must never be serialized")
+	}
+	// 精确匹配字段名。"password" 作为子串会误命中合法的 has_password，不能这么查。
+	for _, bad := range []string{`"Password":`, `"password":`, `"password_enc":`, `"PasswordEnc":`} {
+		if strings.Contains(out, bad) {
+			t.Errorf("password field %s must not appear in JSON: %s", bad, out)
+		}
+	}
+	// 但要能告诉前端「已设置密码」
+	if !strings.Contains(out, `"has_password":true`) {
+		t.Errorf("has_password flag should be exposed, got %s", out)
 	}
 }
 

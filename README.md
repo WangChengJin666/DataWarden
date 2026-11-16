@@ -88,8 +88,35 @@ Redis 没有表的概念，鉴权用 key 前缀。申请范围写成 `<db号>:<k
 通过解析源码强制这条规则，有人写 `Keys()` 会直接测试失败）。前缀去掉分隔符后不足 2 个字符
 的模式会被拒绝，避免退化成接近全库扫描。
 
-数据源配置里 `database` 字段填 Redis 的 **db 号**（如 `37`），密码通过 `secret_ref`
-指向环境变量（格式 `env:VAR_NAME`）。
+数据源配置里 `database` 字段填 Redis 的 **db 号**（如 `37`）。
+
+## 数据源凭据
+
+每个数据源在界面上单独填写 **连接账号** 和 **连接密码**，密码用 AES-256-GCM
+加密后存入 `datasource.password_enc`，数据库中不存明文。
+
+主密钥来自环境变量 `DATAWARDEN_MASTER_KEY`（16/24/32 字节）：
+
+```bash
+openssl rand -base64 24 | cut -c1-32   # 生成一个 32 字节密钥
+```
+
+**这个密钥必须与数据库分开保管。** 数据库被拖走但主密钥还在，密码就不会泄露；
+反过来两者都在同一台机器的同一个 `.env.local` 里时，机器被完全攻破就会一起丢。
+要进一步加固，需要把主密钥移到 KMS。
+
+**密钥不可随意更换。** 已有数据源保存过密码后，换主密钥会导致旧密文全部解不开，
+查询直接报 `decrypt failed`。真要轮换需要先解密再用新密钥重新加密。
+
+### 密码在接口上永远不可见
+
+`GET /api/v1/datasources` 只返回 `has_password: true/false`，不返回密码也不返回密文。
+编辑数据源时密码框留空表示**不修改**现有密码，不会把它清空。
+
+### 账号权限建议
+
+给每个数据源配置**只读账号**，不要用业务主账号。平台虽然只允许 `SELECT` 类语句，
+但一个拥有写权限的账号一旦出现绕过，代价是全库级的。
 
 ### 申请的三道校验
 
@@ -158,9 +185,11 @@ Redis 没有表的概念，鉴权用 key 前缀。申请范围写成 `<db号>:<k
 cp .env.example .env.local
 
 # 2. 编辑 .env.local，填入你的数据库连接信息
-#    DATABASE_URL          应用运行库
-#    TEST_DATABASE_URL     测试专用库（测试会建表删表，不能与 DATABASE_URL 相同）
-#    TEST_REDIS_ADDR       格式 host:port/db，请使用独立 db
+#    DATABASE_URL            应用运行库
+#    TEST_DATABASE_URL       测试专用库（测试会建表删表，不能与 DATABASE_URL 相同）
+#    TEST_REDIS_ADDR         格式 host:port/db，请使用独立 db
+#    DATAWARDEN_MASTER_KEY   数据源密码的加密主密钥，必须 32 字节
+#                            生成：openssl rand -base64 24 | cut -c1-32
 
 # 3. 加载环境变量（每个新终端都要执行）
 source .env.local

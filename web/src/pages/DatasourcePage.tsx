@@ -73,7 +73,6 @@ export default function DatasourcePage() {
     form.resetFields()
     form.setFieldsValue({
       port: 5432,
-      env: 'prod',
       apply_enabled: false,
       max_apply_days: 7,
       apply_scopes: [],
@@ -89,8 +88,9 @@ export default function DatasourcePage() {
       host: record.host,
       port: record.port,
       database: record.database,
-      secret_ref: record.secret_ref,
-      env: record.env,
+      username: record.username,
+      // 密码不回填：后端不返回密码，留空即表示不修改
+      password: undefined,
       apply_enabled: record.apply_enabled,
       max_apply_days: record.max_apply_days,
       apply_scopes: record.apply_scopes,
@@ -117,9 +117,15 @@ export default function DatasourcePage() {
         })),
       }
       if (editing) {
+        // 编辑时密码留空表示不修改，交给后端保留原密文
+        if (!input.password) delete input.password
         await updateDatasource(editing.id, input)
         message.success('已更新')
       } else {
+        if (!input.password) {
+          message.warning('请填写连接密码')
+          return
+        }
         await createDatasource(input)
         message.success('已创建')
       }
@@ -145,7 +151,7 @@ export default function DatasourcePage() {
     {
       title: '名称',
       dataIndex: 'name',
-      width: 160,
+      width: 150,
       render: (v: string, r) => (
         <div>
           <div style={{ fontWeight: 500 }}>{v}</div>
@@ -165,7 +171,7 @@ export default function DatasourcePage() {
     },
     {
       title: '地址',
-      width: 240,
+      width: 200,
       ellipsis: true,
       render: (_, r) => (
         <Text code style={{ fontSize: 12 }}>
@@ -174,7 +180,27 @@ export default function DatasourcePage() {
         </Text>
       ),
     },
-    { title: '环境', dataIndex: 'env', width: 80 },
+    {
+      title: '账号',
+      dataIndex: 'username',
+      width: 150,
+      render: (v: string, r) => {
+        // 没配账号说明这个数据源还是迁移前的旧数据，压根连不上，
+        // 用醒目标签提示去补填，而不是显示一个无意义的 "-"
+        if (!r.has_password || !v) {
+          return (
+            <Tag color="warning" style={{ marginInlineEnd: 0 }}>
+              待配置账号密码
+            </Tag>
+          )
+        }
+        return (
+          <Text code style={{ fontSize: 12 }}>
+            {v}
+          </Text>
+        )
+      },
+    },
     {
       title: '可申请',
       dataIndex: 'apply_enabled',
@@ -193,7 +219,7 @@ export default function DatasourcePage() {
     },
     {
       title: '可申请范围',
-      width: 240,
+      width: 210,
       render: (_, r) => {
         if (!r.apply_enabled) return <Text type="secondary">—</Text>
         if (!r.apply_scopes?.length) return <Text type="warning">未配置范围</Text>
@@ -217,12 +243,12 @@ export default function DatasourcePage() {
     {
       title: '创建时间',
       dataIndex: 'created_at',
-      width: 150,
+      width: 140,
       render: (v: string) => dayjs(v).format('YYYY-MM-DD HH:mm'),
     },
     {
       title: '操作',
-      width: 130,
+      width: 120,
       fixed: 'right',
       render: (_, r) =>
         isDBA ? (
@@ -271,7 +297,7 @@ export default function DatasourcePage() {
         columns={columns}
         dataSource={items}
         loading={loading}
-        scroll={{ x: 1200 }}
+        scroll={{ x: 1220 }}
         pagination={{ pageSize: 20, showTotal: (t) => `共 ${t} 条` }}
       />
 
@@ -310,16 +336,6 @@ export default function DatasourcePage() {
                 }}
               />
             </Form.Item>
-            <Form.Item name="env" label="环境" style={{ width: 120 }}>
-              <Select
-                options={[
-                  { value: 'prod', label: '生产' },
-                  { value: 'staging', label: '预发' },
-                  { value: 'test', label: '测试' },
-                  { value: 'dev', label: '开发' },
-                ]}
-              />
-            </Form.Item>
           </Space>
 
           <Space size="middle" style={{ display: 'flex' }}>
@@ -344,14 +360,36 @@ export default function DatasourcePage() {
             </Form.Item>
           </Space>
 
-          <Form.Item
-            name="secret_ref"
-            label="凭据引用"
-            rules={[{ required: true, message: '请输入凭据引用' }]}
-            extra="指向密钥管理服务的标识，平台不保存明文密码"
-          >
-            <Input placeholder="secret/shop-prod 或 env" />
-          </Form.Item>
+          <Space size="middle" style={{ display: 'flex', alignItems: 'flex-start' }}>
+            <Form.Item
+              name="username"
+              label="连接账号"
+              rules={[{ required: true, message: '请输入连接账号' }]}
+              style={{ flex: 1 }}
+            >
+              <Input placeholder="例如 readonly" autoComplete="off" />
+            </Form.Item>
+            <Form.Item
+              name="password"
+              label="连接密码"
+              rules={
+                editing
+                  ? []
+                  : [{ required: true, message: '请输入连接密码' }]
+              }
+              extra={
+                editing && editing.has_password
+                  ? '留空表示不修改现有密码'
+                  : '密码会加密后保存，保存后不可再查看'
+              }
+              style={{ flex: 1 }}
+            >
+              <Input.Password
+                placeholder={editing && editing.has_password ? '不修改请留空' : '请输入密码'}
+                autoComplete="new-password"
+              />
+            </Form.Item>
+          </Space>
 
           <Form.Item name="description" label="描述">
             <Input.TextArea rows={2} placeholder="给开发者看的说明，会显示在申请页" />

@@ -163,7 +163,9 @@ export default function ApplyPage() {
                     <Space wrap>
                       <Text strong>{ds.name}</Text>
                       <Tag>{ds.type}</Tag>
-                      <Tag color="blue">{ds.env}</Tag>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        {ds.host}:{ds.port}
+                      </Text>
                     </Space>
                     {ds.description ? (
                       <div style={{ marginTop: 6 }}>

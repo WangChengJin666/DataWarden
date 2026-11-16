@@ -2,10 +2,12 @@ package httpapi
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/opensourceprj/datawarden/internal/model"
+	"github.com/opensourceprj/datawarden/internal/secret"
 )
 
 // DatasourceStore 是数据源持久化的最小接口。
@@ -19,6 +21,9 @@ type DatasourceStore interface {
 
 type DatasourceHandler struct {
 	Store DatasourceStore
+	// Cipher 用于加密落库的密码。为 nil 时拒绝 Create/Update，
+	// 避免明文密码被意外写入数据库。
+	Cipher *secret.Cipher
 }
 
 func (h *DatasourceHandler) List(c *gin.Context) {
@@ -55,8 +60,8 @@ type datasourceReq struct {
 	Host         string          `json:"host" binding:"required"`
 	Port         int             `json:"port" binding:"required"`
 	Database     string          `json:"database"`
-	SecretRef    string          `json:"secret_ref" binding:"required"`
-	Env          string          `json:"env"`
+	Username     string          `json:"username"`
+	Password     string          `json:"password"`
 	ApplyEnabled bool            `json:"apply_enabled"`
 	MaxApplyDays int             `json:"max_apply_days"`
 	ApplyScopes  []applyScopeReq `json:"apply_scopes"`
@@ -71,7 +76,8 @@ var validTypes = map[string]bool{
 	string(model.TypeMongoDB):    true,
 }
 
-func (r datasourceReq) toModel() *model.Datasource {
+// toModel 把请求转成模型。密码在此处加密，密文之外的明文不会离开这个函数。
+func (r datasourceReq) toModel(cipher *secret.Cipher) (*model.Datasource, error) {
 	scopes := make([]model.ApplyScope, 0, len(r.ApplyScopes))
 	for _, s := range r.ApplyScopes {
 		scopes = append(scopes, model.ApplyScope{
@@ -79,23 +85,29 @@ func (r datasourceReq) toModel() *model.Datasource {
 			Tables:   s.Tables,
 		})
 	}
-	env := r.Env
-	if env == "" {
-		env = "prod"
+
+	enc := ""
+	if r.Password != "" {
+		var err error
+		enc, err = cipher.Encrypt(r.Password)
+		if err != nil {
+			return nil, fmt.Errorf("encrypt password: %w", err)
+		}
 	}
+
 	return &model.Datasource{
 		Name:         r.Name,
 		Type:         model.DatasourceType(r.Type),
 		Host:         r.Host,
 		Port:         r.Port,
 		Database:     r.Database,
-		SecretRef:    r.SecretRef,
-		Env:          env,
+		Username:     r.Username,
+		PasswordEnc:  enc,
 		ApplyEnabled: r.ApplyEnabled,
 		MaxApplyDays: r.MaxApplyDays,
 		ApplyScopes:  scopes,
 		Description:  r.Description,
-	}
+	}, nil
 }
 
 // requireDBA 校验当前用户是否为 DBA 及以上。返回 false 时已写入响应。
@@ -114,6 +126,10 @@ func (h *DatasourceHandler) Create(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if h.Cipher == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "password cipher not configured"})
+		return
+	}
 
 	var req datasourceReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -125,7 +141,12 @@ func (h *DatasourceHandler) Create(c *gin.Context) {
 		return
 	}
 
-	ds := req.toModel()
+	ds, err := req.toModel(h.Cipher)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	id, err := h.Store.Create(c.Request.Context(), ds)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -134,15 +155,21 @@ func (h *DatasourceHandler) Create(c *gin.Context) {
 	auditEvent(c, uid, username, "datasource.create", id, map[string]any{
 		"name":          ds.Name,
 		"type":          req.Type,
+		"host":          ds.Host,
+		"username":      ds.Username,
 		"apply_enabled": ds.ApplyEnabled,
 	})
 	c.JSON(http.StatusCreated, gin.H{"id": id})
 }
 
-// Update 修改数据源，含可申请配置。
+// Update 修改数据源，含可申请配置。密码留空表示不修改。
 func (h *DatasourceHandler) Update(c *gin.Context) {
 	uid, username, ok := requireDBA(c)
 	if !ok {
+		return
+	}
+	if h.Cipher == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "password cipher not configured"})
 		return
 	}
 	id, ok := parseID(c, "id")
@@ -160,7 +187,11 @@ func (h *DatasourceHandler) Update(c *gin.Context) {
 		return
 	}
 
-	ds := req.toModel()
+	ds, err := req.toModel(h.Cipher)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	ds.ID = id
 	if err := h.Store.Update(c.Request.Context(), ds); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -168,8 +199,10 @@ func (h *DatasourceHandler) Update(c *gin.Context) {
 	}
 	auditEvent(c, uid, username, "datasource.update", id, map[string]any{
 		"name":           ds.Name,
+		"username":       ds.Username,
 		"apply_enabled":  ds.ApplyEnabled,
 		"max_apply_days": ds.MaxApplyDays,
+		"password_reset": req.Password != "",
 	})
 	c.JSON(http.StatusOK, gin.H{"id": id})
 }

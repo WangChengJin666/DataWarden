@@ -57,7 +57,12 @@ func main() {
 	grantStore := store.NewGrantStore(pool)
 	grantReqStore := store.NewGrantRequestStore(pool)
 	auditLogger := audit.NewLogger(pool)
-	secretResolver := secret.NewEnvResolver()
+	// 主密钥用于加解密数据源密码。缺失时 config.Load 已经报错退出，
+	// 这里再做一次构建校验，避免把非法长度的密钥带进运行期。
+	cipher, err := secret.NewCipher(cfg.MasterKey)
+	if err != nil {
+		log.Fatalf("init password cipher: %v", err)
+	}
 	issuer := auth.NewTokenIssuer(cfg.JWTSecret, 12*time.Hour)
 
 	enforcer, err := authz.NewEnforcer()
@@ -96,14 +101,14 @@ func main() {
 		Issuer:      issuer,
 		Auditor:     auditLogger,
 		AuthHandler: &httpapi.AuthHandler{Users: userStore, Issuer: issuer},
-		Datasource:  &httpapi.DatasourceHandler{Store: dsStore},
+		Datasource:  &httpapi.DatasourceHandler{Store: dsStore, Cipher: cipher},
 		Query: &httpapi.QueryHandler{
 			Service: querySvc,
-			Factory: makeAdapterFactory(ctx, dsStore, secretResolver, cfg),
+			Factory: makeAdapterFactory(ctx, dsStore, cipher),
 		},
 		Redis: &httpapi.RedisHandler{
 			Enforcer: enforcer,
-			Factory:  makeRedisTargetFactory(ctx, dsStore, secretResolver, cfg),
+			Factory:  makeRedisTargetFactory(ctx, dsStore, cipher, cfg),
 		},
 		GrantReq: &httpapi.GrantRequestHandler{
 			Requests: grantReqStore,
@@ -163,7 +168,7 @@ func syncAuthz(ctx context.Context, e *authz.Enforcer, users *store.UserStore, g
 
 // makeRedisTargetFactory 按数据源 ID 构造 Redis 查询目标。
 // db 号来自数据源的 database 字段（Redis 存 db index），密码来自 secret_ref。
-func makeRedisTargetFactory(ctx context.Context, dsStore *store.DatasourceStore, resolver secret.Resolver, cfg *config.Config) httpapi.RedisTargetFactory {
+func makeRedisTargetFactory(ctx context.Context, dsStore *store.DatasourceStore, cipher *secret.Cipher, cfg *config.Config) httpapi.RedisTargetFactory {
 	return func(ctx context.Context, datasourceID int64) (*httpapi.RedisTarget, error) {
 		ds, err := dsStore.Get(ctx, datasourceID)
 		if err != nil {
@@ -178,9 +183,11 @@ func makeRedisTargetFactory(ctx context.Context, dsStore *store.DatasourceStore,
 			return nil, err
 		}
 
-		password, err := resolver.Password(ds.SecretRef)
+		// 解密该数据源自己的密码。解密失败说明主密钥换了，
+		// 必须明确报错，不能静默当成空密码去连。
+		password, err := cipher.Decrypt(ds.PasswordEnc)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("datasource %d: %w", datasourceID, err)
 		}
 
 		// 缓存连接：相同数据源复用同一 client，避免每次查询重新握手
@@ -222,26 +229,26 @@ func (c *redisClientCache) get(id int64, ds *model.Datasource, password string, 
 
 // makeAdapterFactory 按数据源 ID 构造 SQL Adapter。
 // 当前所有数据源共用一组环境变量账号，生产环境应改为按数据源从密钥管理读取。
-func makeAdapterFactory(ctx context.Context, dsStore *store.DatasourceStore, resolver secret.Resolver, cfg *config.Config) httpapi.AdapterFactory {
+func makeAdapterFactory(ctx context.Context, dsStore *store.DatasourceStore, cipher *secret.Cipher) httpapi.AdapterFactory {
 	return func(datasourceID int64) (adapter.Adapter, error) {
 		ds, err := dsStore.Get(ctx, datasourceID)
 		if err != nil {
 			return nil, err
 		}
-		password, err := resolver.Password(ds.SecretRef)
+
+		// 账号密码都是数据源自己的配置，不再有全局回落。
+		// 之前所有库共用 QUERY_DB_USER 一组账号，等于放弃最小权限。
+		password, err := cipher.Decrypt(ds.PasswordEnc)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("datasource %d: %w", datasourceID, err)
 		}
-		if password == "" {
-			// 回落到全局配置，兼容阶段一的写法
-			password = cfg.DBPasswordForQuery
-		}
+
 		return adapter.New(adapter.ConnConfig{
 			Type:     string(ds.Type),
 			Host:     ds.Host,
 			Port:     ds.Port,
 			Database: ds.Database,
-			User:     cfg.DBUserForQuery,
+			User:     ds.Username,
 			Password: password,
 		})
 	}

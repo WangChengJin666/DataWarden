@@ -134,7 +134,7 @@ func TestCreateDatasource_RequiresDBA(t *testing.T) {
 
 	tok := loginAndGetToken(t, r, "alice", "correct")
 	body := bytes.NewBufferString(`{
-		"name":"shop","type":"postgresql","host":"h","port":5432,"secret_ref":"s"
+		"name":"shop","type":"postgresql","host":"h","port":5432,"username":"readonly","password":"pw"
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/datasources", body)
 	req.Header.Set("Content-Type", "application/json")
@@ -153,7 +153,7 @@ func TestCreateDatasource_DBAPasses(t *testing.T) {
 
 	tok := loginAndGetToken(t, r, "alice", "correct")
 	body := bytes.NewBufferString(`{
-		"name":"shop","type":"postgresql","host":"h","port":5432,"secret_ref":"s"
+		"name":"shop","type":"postgresql","host":"h","port":5432,"username":"readonly","password":"pw"
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/datasources", body)
 	req.Header.Set("Content-Type", "application/json")
