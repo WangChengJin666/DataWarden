@@ -2,7 +2,7 @@
 -- DataWarden 数据库初始化脚本
 -- ============================================================
 -- 用途：在一个全新的 PostgreSQL 实例上，一次性把 DataWarden 运行所需的
---       数据库、表结构、初始账号与示例数据准备好。
+--       数据库、表结构与初始账号准备好。
 --
 -- 使用方式（二选一）：
 --   1) psql -h <host> -p 5432 -U <superuser> -f init.sql
@@ -11,9 +11,10 @@
 -- 重要说明：
 --   * 本脚本以**超级用户**身份执行。普通账号没有 CREATEDB 权限，会报错。
 --   * 脚本整体幂等，可重复执行；已存在的库/表/账号不会被重复创建。
---     （唯一例外：示例数据用 ON CONFLICT 覆盖，重跑会重置示例账号密码）
+--     （唯一例外：初始账号用 ON CONFLICT 覆盖，重跑会重置其密码）
 --   * 应用启动时也会自动执行 internal/db/migrations 下的迁移，
---     所以如果你只想要表结构、不想要示例数据，可以跳过第 4 节。
+--     所以如果你只想要表结构、不想要初始账号，可以跳过第 4 节。
+--   * 数据源不在本脚本初始化，请启动服务后在「数据源管理」页面登记。
 -- ============================================================
 
 
@@ -213,43 +214,11 @@ ON CONFLICT (username) DO UPDATE
 
 
 -- ============================================================
--- 5. 示例数据源（可选，仅本地体验用）
--- ============================================================
--- 这些是示例配置，host 需要改成你自己的环境。
--- 如果不需要，整段删除即可，不影响功能。
---
--- secret_ref 写成 env:XXX 表示从环境变量 XXX 读取密码，
--- 这样密码不会落进数据库。对应在 .env.local 里配置，例如：
---   QUERY_DB_PASSWORD="xxx"
---   REDIS_PASSWORD="xxx"
-
-INSERT INTO datasource
-    (name, type, host, port, db_name, secret_ref, env,
-     apply_enabled, max_apply_days, apply_scopes, description)
-VALUES
-    (
-        '示例 PostgreSQL', 'postgresql', '127.0.0.1', 5432, 'datawarden',
-        'env:QUERY_DB_PASSWORD', 'dev',
-        true, 14,
-        '[{"database":"public","tables":["dw_probe"]}]'::jsonb,
-        '示例库，仅开放 dw_probe 表。请把 host 改成你自己的地址'
-    ),
-    (
-        '示例 Redis', 'redis', '127.0.0.1', 6379, '37',
-        'env:REDIS_PASSWORD', 'dev',
-        true, 7,
-        '[{"database":"37","tables":["user:1001"]}]'::jsonb,
-        '示例 Redis，db37，仅开放 user:1001 前缀。请把 host 改成你自己的地址'
-    )
-ON CONFLICT (name) DO NOTHING;
-
-
--- ============================================================
--- 6. 验证
+-- 5. 验证
 -- ============================================================
 -- 执行以下查询确认结果，期望：
 --   app_user        3 行
---   datasource      2 行
+--   datasource      0 行（数据源请通过界面登记）
 --   grant_request   0 行
 --   audit_log       0 行
 
@@ -265,6 +234,8 @@ ON CONFLICT (name) DO NOTHING;
 -- ============================================================
 -- 1. 改掉三个初始账号的密码（admin123 / dba123 / dev123 绝对不能留）
 -- 2. 把第 1、3 节的 owner / 授权对象换成真实账号
--- 3. 第 5 节示例数据的 host 换成真实地址，或整段删除
--- 4. 连接串的 sslmode 从 disable 改为 require
--- 5. 确认 audit_log_no_update 触发器存在（这是审计不可篡改的唯一保障）
+-- 3. 连接串的 sslmode 从 disable 改为 require
+-- 4. 确认 audit_log_no_update 触发器存在（这是审计不可篡改的唯一保障）
+--
+-- 数据源不在本脚本里初始化。执行完脚本后启动服务，用 admin 或 dba 账号
+-- 登录界面，在「数据源管理」页登记真实的数据源即可。
