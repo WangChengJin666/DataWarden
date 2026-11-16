@@ -82,6 +82,7 @@ export default function DatasourcePage() {
 
   const openEdit = (record: Datasource) => {
     setEditing(record)
+    form.resetFields()
     form.setFieldsValue({
       name: record.name,
       type: record.type,
@@ -93,7 +94,7 @@ export default function DatasourcePage() {
       password: undefined,
       apply_enabled: record.apply_enabled,
       max_apply_days: record.max_apply_days,
-      apply_scopes: record.apply_scopes,
+      apply_scopes: record.apply_scopes ?? [],
       description: record.description,
     })
     setModalOpen(true)
@@ -308,9 +309,13 @@ export default function DatasourcePage() {
         onOk={submit}
         width={760}
         okText="保存"
-        destroyOnClose
+        // forceRender 让表单在 Modal 首次打开前就挂载，
+        // 这样 setFieldsValue 写入的值不会被丢弃。
+        // 之前用 destroyOnClose，表单在关闭时被销毁，
+        // 打开前 setFieldsValue 的值无处可依，导致编辑弹窗空白。
+        forceRender
       >
-        <Form form={form} layout="vertical" preserve={false}>
+        <Form form={form} layout="vertical">
           <Space size="middle" style={{ display: 'flex' }}>
             <Form.Item
               name="name"
