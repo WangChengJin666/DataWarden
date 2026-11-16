@@ -53,6 +53,30 @@ func (m *memDatasources) Create(ctx context.Context, ds *model.Datasource) (int6
 	return 99, nil
 }
 
+func (m *memDatasources) Update(ctx context.Context, ds *model.Datasource) error {
+	for i := range m.items {
+		if m.items[i].ID == ds.ID {
+			m.items[i] = *ds
+			return nil
+		}
+	}
+	return errors.New("not found")
+}
+
+func (m *memDatasources) Delete(ctx context.Context, id int64) error {
+	return nil
+}
+
+func (m *memDatasources) ListApplyable(ctx context.Context) ([]model.Datasource, error) {
+	out := []model.Datasource{}
+	for _, d := range m.items {
+		if d.ApplyEnabled {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
 func newTestRouter(t *testing.T, passwords map[string]string) *gin.Engine {
 	t.Helper()
 	return buildRouter(t, passwords, "")

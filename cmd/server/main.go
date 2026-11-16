@@ -16,6 +16,7 @@ import (
 	"github.com/opensourceprj/datawarden/internal/config"
 	"github.com/opensourceprj/datawarden/internal/db"
 	"github.com/opensourceprj/datawarden/internal/httpapi"
+	"github.com/opensourceprj/datawarden/internal/model"
 	"github.com/opensourceprj/datawarden/internal/querysvc"
 	"github.com/opensourceprj/datawarden/internal/store"
 )
@@ -50,6 +51,7 @@ func main() {
 	userStore := store.NewUserStore(pool)
 	dsStore := store.NewDatasourceStore(pool)
 	grantStore := store.NewGrantStore(pool)
+	grantReqStore := store.NewGrantRequestStore(pool)
 	auditLogger := audit.NewLogger(pool)
 	issuer := auth.NewTokenIssuer(cfg.JWTSecret, 12*time.Hour)
 
@@ -74,13 +76,32 @@ func main() {
 		DefaultRowLimit: cfg.QueryRowLimit,
 	}
 
+	// 审批通过后立即刷新 Casbin，无需重启
+	refreshAuthz := func(ctx context.Context) {
+		if err := syncAuthz(ctx, enforcer, userStore, grantStore); err != nil {
+			log.Printf("refresh authz failed: %v", err)
+			return
+		}
+		enforcer.AddPolicy("dba", "ds:*", "read")
+		enforcer.AddPolicy("superadmin", "ds:*", "read")
+		log.Println("authz refreshed after approval")
+	}
+
 	router := httpapi.NewRouter(httpapi.Deps{
 		Issuer:      issuer,
+		Auditor:     auditLogger,
 		AuthHandler: &httpapi.AuthHandler{Users: userStore, Issuer: issuer},
 		Datasource:  &httpapi.DatasourceHandler{Store: dsStore},
 		Query: &httpapi.QueryHandler{
 			Service: querySvc,
 			Factory: makeAdapterFactory(ctx, dsStore, cfg),
+		},
+		GrantReq: &httpapi.GrantRequestHandler{
+			Requests: grantReqStore,
+			Datasrc:  dsStore,
+			OnApprove: func(ctx context.Context, g *model.Grant) {
+				refreshAuthz(ctx)
+			},
 		},
 	})
 

@@ -31,6 +31,12 @@ const (
 	TypeMongoDB    DatasourceType = "mongodb"
 )
 
+// ApplyScope 是数据源允许申请的一个库表范围。
+type ApplyScope struct {
+	Database string   `json:"database"`
+	Tables   []string `json:"tables"` // 为空表示该库下全部表
+}
+
 type Datasource struct {
 	ID        int64          `json:"id"`
 	Name      string         `json:"name"`
@@ -41,6 +47,12 @@ type Datasource struct {
 	SecretRef string         `json:"secret_ref"` // 指向密钥管理，绝不存明文密码
 	Env       string         `json:"env"`
 	CreatedAt time.Time      `json:"created_at"`
+
+	// 可申请配置。管理员决定该数据源是否对开发者开放申请。
+	ApplyEnabled bool         `json:"apply_enabled"`
+	MaxApplyDays int          `json:"max_apply_days"`
+	ApplyScopes  []ApplyScope `json:"apply_scopes"`
+	Description  string       `json:"description"`
 }
 
 // Grant 是生效中的数据源查询授权。Casbin 策略由此表重新生成。
@@ -65,4 +77,33 @@ type AuditLog struct {
 	IP        string    `json:"ip"`
 	UserAgent string    `json:"user_agent"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// GrantRequestStatus 是申请单状态。
+type GrantRequestStatus string
+
+const (
+	RequestPending  GrantRequestStatus = "pending"
+	RequestApproved GrantRequestStatus = "approved"
+	RequestRejected GrantRequestStatus = "rejected"
+	RequestCanceled GrantRequestStatus = "canceled"
+)
+
+// GrantRequest 是开发者提交的数据源授权申请。
+// 审批通过后生成一条 Grant（生效授权），并在本记录上回填 grant_id。
+type GrantRequest struct {
+	ID            int64              `json:"id"`
+	UserID        int64              `json:"user_id"`
+	Username      string             `json:"username,omitempty"` // 列表展示用，非表字段
+	DatasourceID  int64              `json:"datasource_id"`
+	DatasourceName string            `json:"datasource_name,omitempty"`
+	Scope         string             `json:"scope"`
+	Days          int                `json:"days"`
+	Reason        string             `json:"reason"`
+	Status        GrantRequestStatus `json:"status"`
+	ReviewerID    *int64             `json:"reviewer_id,omitempty"`
+	ReviewComment string             `json:"review_comment"`
+	ReviewedAt    *time.Time         `json:"reviewed_at,omitempty"`
+	GrantID       *int64             `json:"grant_id,omitempty"`
+	CreatedAt     time.Time          `json:"created_at"`
 }

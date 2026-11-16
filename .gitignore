@@ -97,3 +97,15 @@ $RECYCLE.BIN/
 checkenv.go
 scratch/
 *.local.md
+
+# ============================================================
+# 前端
+# ============================================================
+web/node_modules/
+web/dist/
+web/.vite/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+.playwright-cli/
+*.png.tmp

@@ -11,10 +11,17 @@ type Deps struct {
 	AuthHandler *AuthHandler
 	Datasource  *DatasourceHandler
 	Query       *QueryHandler
+	GrantReq    *GrantRequestHandler
+	// Auditor 用于记录数据源管理与审批动作，可为 nil
+	Auditor EventRecorder
 }
 
 // NewRouter 注册全部路由。公开路由只有登录。
 func NewRouter(d Deps) *gin.Engine {
+	if d.Auditor != nil {
+		SetAuditor(d.Auditor)
+	}
+
 	r := gin.New()
 	r.Use(gin.Recovery())
 
@@ -24,9 +31,26 @@ func NewRouter(d Deps) *gin.Engine {
 	authed := v1.Group("")
 	authed.Use(AuthMiddleware(d.Issuer))
 	{
+		// 数据源管理（DBA）
 		authed.GET("/datasources", d.Datasource.List)
+		authed.GET("/datasources/:id", d.Datasource.Get)
 		authed.POST("/datasources", d.Datasource.Create)
+		authed.PUT("/datasources/:id", d.Datasource.Update)
+		authed.DELETE("/datasources/:id", d.Datasource.Delete)
+
+		// 查询
 		authed.POST("/query/sql", d.Query.ExecuteSQL)
+
+		// 授权申请
+		if d.GrantReq != nil {
+			authed.GET("/grant/applyable", d.GrantReq.ListApplyable)
+			authed.POST("/grant/requests", d.GrantReq.Create)
+			authed.GET("/grant/requests/mine", d.GrantReq.ListMine)
+			authed.GET("/grant/requests", d.GrantReq.ListPending)
+			authed.POST("/grant/requests/:id/approve", d.GrantReq.Approve)
+			authed.POST("/grant/requests/:id/reject", d.GrantReq.Reject)
+			authed.POST("/grant/requests/:id/cancel", d.GrantReq.Cancel)
+		}
 	}
 	return r
 }
