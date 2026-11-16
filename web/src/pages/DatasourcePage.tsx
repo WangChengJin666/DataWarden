@@ -108,21 +108,21 @@ const databasePolicy: Record<
 > = {
   postgresql: {
     required: true,
-    label: '默认库',
+    label: '默认库（必填）',
     placeholder: '例如 shop',
-    hint: 'PostgreSQL 连接时必须指定库名',
+    hint: '',
   },
   mysql: {
     required: false,
     label: '默认库（可选）',
-    placeholder: '留空则查询时写库名.表名',
-    hint: 'MySQL 可以不指定库，查询时用「库名.表名」即可',
+    placeholder: '可留空，查询时写库名.表名',
+    hint: '',
   },
   redis: {
     required: false,
     label: 'db 号（可选）',
     placeholder: '不填为 0',
-    hint: 'Redis 的 db 号，不填默认使用 db 0',
+    hint: '',
   },
   mongodb: {
     required: false,
@@ -295,8 +295,13 @@ export default function DatasourcePage() {
       render: (v: string, r) => (
         <div>
           <div style={{ fontWeight: 500 }}>{v}</div>
-          {r.description ? (
-            <Text type="secondary" style={{ fontSize: 12 }}>
+          {/* 描述与名称相同时不重复显示，否则同一行出现两遍一样的字 */}
+          {r.description && r.description !== v ? (
+            <Text
+              type="secondary"
+              style={{ fontSize: 12 }}
+              ellipsis={{ tooltip: r.description }}
+            >
               {r.description}
             </Text>
           ) : null}
@@ -360,14 +365,17 @@ export default function DatasourcePage() {
       width: 140,
       render: (v: boolean, r) =>
         v ? (
-          <Space direction="vertical" size={0}>
-            <Tag color="success">已开放</Tag>
+          <Space direction="vertical" size={2}>
+            {/* Tag 自带 margin-inline-end，竖向堆叠时会顶得文字偏左，这里清零 */}
+            <Tag color="success" style={{ marginInlineEnd: 0 }}>
+              已开放
+            </Tag>
             <Text type="secondary" style={{ fontSize: 12 }}>
               最长 {r.max_apply_days} 天
             </Text>
           </Space>
         ) : (
-          <Tag>未开放</Tag>
+          <Tag style={{ marginInlineEnd: 0 }}>未开放</Tag>
         ),
     },
     {
@@ -540,7 +548,6 @@ export default function DatasourcePage() {
                   ? [{ required: true, message: 'PostgreSQL 必须填写库名' }]
                   : []
               }
-              extra={dbPolicy.hint || undefined}
               style={{ flex: 1 }}
             >
               <Input placeholder={dbPolicy.placeholder} />
@@ -556,7 +563,12 @@ export default function DatasourcePage() {
                   ? [{ required: true, message: '请输入连接账号' }]
                   : []
               }
-              extra={policy.hint || undefined}
+              // 与密码字段的 extra 保持同高，否则同一行两个字段底部不齐
+              extra={
+                policy.required
+                  ? '建议使用只读账号'
+                  : 'Redis 通常不需要填账号'
+              }
               style={{ flex: 1 }}
             >
               <Input placeholder={policy.placeholder} autoComplete="off" />
