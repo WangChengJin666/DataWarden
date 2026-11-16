@@ -222,13 +222,26 @@ export default function DatasourcePage() {
       dataIndex: 'username',
       width: 150,
       render: (v: string, r) => {
-        // 没配账号说明这个数据源还是迁移前的旧数据，压根连不上，
-        // 用醒目标签提示去补填，而不是显示一个无意义的 "-"
-        if (!r.has_password || !v) {
+        // 是否「可用」要按类型判断：Redis 只用密码认证，没有账号是正常的；
+        // 其他类型必须账号和密码都配齐。
+        // 不配齐的数据源连不上，用醒目标签提示去补填，而不是显示无意义的 "-"
+        const ready = usernamePolicy[r.type].required
+          ? r.has_password && !!v
+          : r.has_password
+
+        if (!ready) {
           return (
             <Tag color="warning" style={{ marginInlineEnd: 0 }}>
               待配置账号密码
             </Tag>
+          )
+        }
+        // Redis 且未填账号：说明用的是默认 default 用户，明确写出来避免误解为空
+        if (!v) {
+          return (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              default
+            </Text>
           )
         }
         return (
