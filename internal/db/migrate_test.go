@@ -6,10 +6,12 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opensourceprj/datawarden/internal/testutil"
 )
 
 func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	testutil.SkipIfShort(t)
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set")
@@ -45,6 +47,37 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 	}
 	if count != 4 {
 		t.Fatalf("expected 4 core tables, got %d", count)
+	}
+}
+
+// TestMigrate_ConcurrentIsSafe 模拟多个实例同时启动：
+// advisory lock 应让迁移串行执行，不出现 DDL 死锁。
+func TestMigrate_ConcurrentIsSafe(t *testing.T) {
+	testutil.SkipIfShort(t)
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+
+	const n = 5
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			pool, err := Open(ctx, dsn)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer pool.Close()
+			errs <- Migrate(ctx, pool)
+		}()
+	}
+
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent migrate %d/%d failed: %v", i+1, n, err)
+		}
 	}
 }
 

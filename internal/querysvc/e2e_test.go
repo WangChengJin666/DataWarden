@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/opensourceprj/datawarden/internal/adapter"
 	"github.com/opensourceprj/datawarden/internal/db"
+	"github.com/opensourceprj/datawarden/internal/testutil"
 )
 
 // realEnforcer 按对象精确放行。
@@ -20,6 +21,7 @@ func (r *realEnforcer) Enforce(subject, object, action string) bool { return r.a
 
 // 端到端验证：真实 PG + 真实鉴权 + 真实脱敏 + 真实审计
 func TestExecuteSQL_EndToEndWithRealPostgres(t *testing.T) {
+	testutil.SkipIfShort(t)
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set")

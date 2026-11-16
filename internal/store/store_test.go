@@ -10,10 +10,12 @@ import (
 	"github.com/opensourceprj/datawarden/internal/auth"
 	"github.com/opensourceprj/datawarden/internal/db"
 	"github.com/opensourceprj/datawarden/internal/model"
+	"github.com/opensourceprj/datawarden/internal/testutil"
 )
 
 func setupPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	testutil.SkipIfShort(t)
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set")

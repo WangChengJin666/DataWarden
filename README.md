@@ -10,7 +10,46 @@
 - **跨库跨实例查询**：基于 Trino 的联邦查询（Redis 走独立通道）
 - **全链路审计**：所有操作留痕，审计表数据库层面不可篡改
 
-> **项目状态**：设计阶段完成，阶段一（地基 + 只读查询 + Redis 通道）开发中。
+> 上表是完整产品目标。当前仅**查询类能力**已落地，变更工单与临时账号属于后续阶段。
+
+> **项目状态**：阶段一（地基 + 只读查询 + Redis 通道）已完成，13 个 Task 全部交付并通过真实数据库验证。
+> 变更工单与回滚（阶段二）尚未开始。
+
+## 已实现能力（阶段一）
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| 用户登录与 JWT 鉴权 | ✅ | bcrypt 密码哈希，令牌含角色 |
+| 角色权限（developer / dba / superadmin） | ✅ | Casbin 策略，库级 `*` 通配 |
+| 数据源登记 | ✅ | 支持 MySQL / PostgreSQL / Redis / MongoDB 类型，仅 DBA 可操作 |
+| PostgreSQL / MySQL 受控查询 | ✅ | 只读白名单、强制限行、超时中断 |
+| Redis 查询通道 | ✅ | 精确 key + `SCAN` 模糊 key，绝不使用 `KEYS` |
+| 查询授权与期限 | ✅ | 授权记录带过期时间，Casbin 按活跃授权重建 |
+| 结果脱敏 | ✅ | 手机号、身份证、邮箱、银行卡按列名关键字匹配 |
+| 全链路审计 | ✅ | 成功/失败/拒绝全部留痕，数据库触发器禁止篡改 |
+
+## API
+
+| 方法 | 路径 | 权限 | 说明 |
+|---|---|---|---|
+| POST | `/api/v1/login` | 公开 | 换取 JWT |
+| GET | `/api/v1/datasources` | 已登录 | 数据源列表 |
+| POST | `/api/v1/datasources` | dba / superadmin | 登记数据源 |
+| POST | `/api/v1/query/sql` | 需表级授权 | 执行只读查询 |
+
+查询请求体示例：
+
+```json
+{
+  "datasource_id": 1,
+  "database": "public",
+  "tables": ["orders"],
+  "sql": "SELECT id, phone FROM orders",
+  "row_limit": 100
+}
+```
+
+`tables` 字段是**必填**的，平台据此逐表鉴权。任一表无权限则整条查询拒绝，且不提示是哪张表。
 
 ## 技术栈
 
@@ -52,15 +91,45 @@ createdb -h HOST -U USER datawarden_test
 ### 运行
 
 ```bash
-# 启动服务
+# 启动服务（会自动执行数据库迁移）
+source .env.local
 go run ./cmd/server
 
 # 运行全部测试
 go test ./...
 
-# 只跑不需要外部依赖的测试
+# 只跑不需要外部依赖的测试（跳过 PG / Redis 集成测试）
 go test ./... -short
 ```
+
+服务启动后默认监听 `:8080`。
+
+### 冒烟验证
+
+```bash
+# 1. 未带令牌应返回 401
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/api/v1/datasources
+
+# 2. 登录换令牌
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"dba1","password":"<你的密码>"}' | jq -r .token)
+
+# 3. 查看数据源
+curl -s http://localhost:8080/api/v1/datasources -H "Authorization: Bearer $TOKEN"
+```
+
+### 创建初始用户
+
+系统不内置默认账号，首次使用需手工插入一个 superadmin：
+
+```sql
+-- 先用 bcrypt 生成密码哈希，再插入
+INSERT INTO app_user (username, email, password_hash, role)
+VALUES ('admin', 'admin@example.com', '<bcrypt-hash>', 'superadmin');
+```
+
+密码哈希可用一小段 Go 代码生成：`auth.HashPassword("你的密码")`。
 
 ## 文档
 

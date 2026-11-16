@@ -12,10 +12,20 @@ import (
 // TestKeyPrefix 是所有测试 key 的统一前缀，便于清理与隔离。
 const TestKeyPrefix = "dwtest:"
 
+// SkipIfShort 在 -short 模式下跳过集成测试。
+// 集成测试依赖远程服务，CI 的快速通道通常不跑。
+func SkipIfShort(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration test in -short mode")
+	}
+}
+
 // RedisAddr 从环境变量读取测试 Redis 地址，未配置则跳过测试。
 // 支持 host:port/db 写法，返回值不含 /db 部分。
 func RedisAddr(t *testing.T) string {
 	t.Helper()
+	SkipIfShort(t)
 	raw := os.Getenv("TEST_REDIS_ADDR")
 	if raw == "" {
 		t.Skip("TEST_REDIS_ADDR not set; skipping redis integration test")

@@ -6,11 +6,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/opensourceprj/datawarden/internal/testutil"
 )
 
 // pgConnFromEnv 从 TEST_DATABASE_URL 解析出连接参数。
 func pgConnFromEnv(t *testing.T) ConnConfig {
 	t.Helper()
+	testutil.SkipIfShort(t)
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set")
