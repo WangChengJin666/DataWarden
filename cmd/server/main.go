@@ -101,7 +101,11 @@ func main() {
 		Issuer:      issuer,
 		Auditor:     auditLogger,
 		AuthHandler: &httpapi.AuthHandler{Users: userStore, Issuer: issuer},
-		Datasource:  &httpapi.DatasourceHandler{Store: dsStore, Cipher: cipher},
+		Datasource: &httpapi.DatasourceHandler{
+			Store:  dsStore,
+			Cipher: cipher,
+			Tester: adapterProbe{},
+		},
 		Query: &httpapi.QueryHandler{
 			Service: querySvc,
 			Factory: makeAdapterFactory(ctx, dsStore, cipher),
@@ -252,4 +256,27 @@ func makeAdapterFactory(ctx context.Context, dsStore *store.DatasourceStore, cip
 			Password: password,
 		})
 	}
+}
+
+// adapterProbe 把 adapter.Probe 适配成 httpapi.ConnTester。
+// 单独包一层是为了让 httpapi 不直接依赖 adapter 的探测细节。
+type adapterProbe struct{}
+
+func (adapterProbe) Test(ctx context.Context, cfg httpapi.TestConnConfig) (*httpapi.TestConnResult, error) {
+	res, err := adapter.Probe(ctx, adapter.ProbeConfig{
+		Type:     cfg.Type,
+		Host:     cfg.Host,
+		Port:     cfg.Port,
+		Database: cfg.Database,
+		User:     cfg.User,
+		Password: cfg.Password,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &httpapi.TestConnResult{
+		OK:        res.OK,
+		Message:   res.Message,
+		ElapsedMs: res.ElapsedMs,
+	}, nil
 }

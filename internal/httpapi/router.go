@@ -34,6 +34,9 @@ func NewRouter(d Deps) *gin.Engine {
 	{
 		// 数据源管理（DBA）
 		authed.GET("/datasources", d.Datasource.List)
+		// 测试连接：不写库，只验证配置能否连上。
+		// 必须放在 /datasources/:id 之前，避免 test 被当成 id 匹配（写在这里更直观）。
+		authed.POST("/datasources/test", d.Datasource.TestConnection)
 		authed.GET("/datasources/:id", d.Datasource.Get)
 		authed.POST("/datasources", d.Datasource.Create)
 		authed.PUT("/datasources/:id", d.Datasource.Update)

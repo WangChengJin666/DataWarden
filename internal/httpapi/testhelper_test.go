@@ -58,7 +58,13 @@ func (m *memDatasources) List(ctx context.Context) ([]model.Datasource, error) {
 }
 
 func (m *memDatasources) Get(ctx context.Context, id int64) (*model.Datasource, error) {
-	return &model.Datasource{ID: id}, nil
+	for i := range m.items {
+		if m.items[i].ID == id {
+			d := m.items[i]
+			return &d, nil
+		}
+	}
+	return nil, errors.New("datasource not found")
 }
 
 func (m *memDatasources) Create(ctx context.Context, ds *model.Datasource) (int64, error) {

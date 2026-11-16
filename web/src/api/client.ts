@@ -2,10 +2,12 @@ import axios, { AxiosError } from 'axios'
 import type {
   Datasource,
   DatasourceInput,
+  DatasourceType,
   GrantRequest,
   LoginResponse,
   QueryResult,
   RedisQueryResult,
+  TestConnResult,
 } from './types'
 
 const TOKEN_KEY = 'dw_token'
@@ -156,5 +158,20 @@ export async function executeRedis(payload: {
   row_limit?: number
 }): Promise<RedisQueryResult> {
   const { data } = await http.post<RedisQueryResult>('/query/redis', payload)
+  return data
+}
+
+/** 测试数据源连接。不写库，只验证配置能否连上。 */
+export async function testDatasourceConnection(payload: {
+  type: DatasourceType | string
+  host: string
+  port: number
+  database?: string
+  username?: string
+  /** 编辑场景可留空，后端会用已存的密码测试 */
+  password?: string
+  datasource_id?: number
+}): Promise<TestConnResult> {
+  const { data } = await http.post<TestConnResult>('/datasources/test', payload)
   return data
 }

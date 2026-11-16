@@ -54,6 +54,7 @@
 | POST | `/api/v1/datasources` | dba / superadmin | 登记数据源（含可申请配置） |
 | PUT | `/api/v1/datasources/:id` | dba / superadmin | 修改数据源与可申请配置 |
 | DELETE | `/api/v1/datasources/:id` | dba / superadmin | 删除数据源 |
+| POST | `/api/v1/datasources/test` | dba / superadmin | 测试连接（不写库） |
 | POST | `/api/v1/query/sql` | 需表级授权 | 执行只读查询 |
 | POST | `/api/v1/query/redis` | 需 key 前缀授权 | 执行 Redis 查询（精确 key 或 SCAN 模式） |
 | GET | `/api/v1/grant/applyable` | 已登录 | 列出开放申请的数据源 |
@@ -112,6 +113,19 @@ openssl rand -base64 24 | cut -c1-32   # 生成一个 32 字节密钥
 
 `GET /api/v1/datasources` 只返回 `has_password: true/false`，不返回密码也不返回密文。
 编辑数据源时密码框留空表示**不修改**现有密码，不会把它清空。
+
+### 测试连接
+
+新增和编辑数据源时，弹窗底部有「测试连接」按钮，会用当前表单值实际连一次目标库。
+
+- **不写库**：不创建记录、不产生授权，只回答「这套配置能否连上」
+- **编辑时可留空密码**：没重填密码就用库里已存的密码解密后测试，不用每次重新输
+- **限时 10 秒**：目标不可达时不会让前端一直转圈
+- **错误已翻译**：认证失败、连接超时、端口不通、库不存在会给出中文说明，
+  而不是把驱动原文直接抛出来
+- **仅 DBA 可用**：否则等于给所有登录用户开了一个内网端口探测器
+
+MongoDB 暂不支持测试连接，接口会明确报错而不是假装成功。
 
 ### 各类型对连接账号的要求
 

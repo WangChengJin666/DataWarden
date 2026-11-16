@@ -24,6 +24,8 @@ type DatasourceHandler struct {
 	// Cipher 用于加密落库的密码。为 nil 时拒绝 Create/Update，
 	// 避免明文密码被意外写入数据库。
 	Cipher *secret.Cipher
+	// Tester 用于「测试连接」。为 nil 时该接口返回 503。
+	Tester ConnTester
 }
 
 func (h *DatasourceHandler) List(c *gin.Context) {

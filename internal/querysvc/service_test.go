@@ -18,6 +18,10 @@ type stubAdapter struct {
 }
 
 func (s *stubAdapter) Ping(ctx context.Context) error { return nil }
+
+// Close 是 adapter.Adapter 接口的一部分。替身也要实现，
+// 否则接口不匹配——真实适配器会释放连接池，替身没有资源可释放。
+func (s *stubAdapter) Close() error { return nil }
 func (s *stubAdapter) ListDatabases(ctx context.Context) ([]string, error) {
 	return []string{"shop"}, nil
 }

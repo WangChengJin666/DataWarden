@@ -121,10 +121,10 @@ func TestDatasourceStore_CreateAndList(t *testing.T) {
 	s := NewDatasourceStore(pool)
 
 	id, err := s.Create(ctx, &model.Datasource{
-		Name:      "shop-prod",
-		Type:      model.TypePostgreSQL,
-		Host:      "10.0.0.5",
-		Port:      5432,
+		Name:        "shop-prod",
+		Type:        model.TypePostgreSQL,
+		Host:        "10.0.0.5",
+		Port:        5432,
 		Database:    "shop",
 		Username:    "readonly",
 		PasswordEnc: "ZW5jcnlwdGVk",

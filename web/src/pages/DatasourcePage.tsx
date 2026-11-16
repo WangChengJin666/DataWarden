@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
+  Alert,
   Button,
   Card,
   Divider,
@@ -16,7 +17,13 @@ import {
   Tag,
   Typography,
 } from 'antd'
-import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons'
+import {
+  ApiOutlined,
+  DeleteOutlined,
+  EditOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+} from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import dayjs from 'dayjs'
 import {
@@ -24,9 +31,16 @@ import {
   deleteDatasource,
   getCurrentUser,
   listDatasources,
+  testDatasourceConnection,
   updateDatasource,
 } from '@/api/client'
-import type { ApplyScope, Datasource, DatasourceInput, DatasourceType } from '@/api/types'
+import type {
+  ApplyScope,
+  Datasource,
+  DatasourceInput,
+  DatasourceType,
+  TestConnResult,
+} from '@/api/types'
 
 const { Text } = Typography
 
@@ -82,6 +96,9 @@ export default function DatasourcePage() {
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState<Datasource | null>(null)
+  // 测试连接的状态：结果只用于展示，不写入任何持久化状态
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<TestConnResult | null>(null)
   const [form] = Form.useForm()
   // 实时监听类型，用于按类型调整账号字段的必填规则与文案
   const currentType: DatasourceType | undefined = Form.useWatch('type', form)
@@ -106,8 +123,12 @@ export default function DatasourcePage() {
 
   const openCreate = () => {
     setEditing(null)
+    setTestResult(null)
     form.resetFields()
     form.setFieldsValue({
+      // 给类型一个默认值：不预设的话「测试连接」会因类型必填而直接被拦，
+      // 用户点了按钮却没有任何反馈，很难理解是哪里没填。
+      type: 'postgresql',
       port: 5432,
       apply_enabled: false,
       max_apply_days: 7,
@@ -118,6 +139,7 @@ export default function DatasourcePage() {
 
   const openEdit = (record: Datasource) => {
     setEditing(record)
+    setTestResult(null)
     form.resetFields()
     form.setFieldsValue({
       name: record.name,
@@ -171,6 +193,45 @@ export default function DatasourcePage() {
     } catch (e) {
       if ((e as { errorFields?: unknown }).errorFields) return
       message.error((e as Error).message)
+    }
+  }
+
+  // testConnection 用当前表单值实连一次目标库。
+  // 只看连接相关的字段，不要求「可申请配置」这类字段已填好——
+  // 用户往往还没配完就想先确认网络和账号能不能通。
+  const testConnection = async () => {
+    setTestResult(null)
+    let values
+    try {
+      // 只校验连接相关字段：用户往往还没配完「可申请范围」就想先确认能否连上。
+      // database 对 SQL 类是必填（不指定库无法连接），对 Redis 可空（默认 db 0）。
+      values = await form.validateFields(
+        currentType === 'redis'
+          ? ['type', 'host', 'port']
+          : ['type', 'host', 'port', 'database'],
+      )
+    } catch {
+      return // 必填项没填，validateFields 已在表单上标红
+    }
+
+    if (!editing && !values.type) return
+
+    setTesting(true)
+    try {
+      const res = await testDatasourceConnection({
+        type: values.type,
+        host: values.host,
+        port: values.port,
+        database: form.getFieldValue('database'),
+        username: form.getFieldValue('username'),
+        password: form.getFieldValue('password') || undefined,
+        datasource_id: editing?.id,
+      })
+      setTestResult(res)
+    } catch (e) {
+      setTestResult({ ok: false, message: (e as Error).message })
+    } finally {
+      setTesting(false)
     }
   }
 
@@ -354,10 +415,26 @@ export default function DatasourcePage() {
       <Modal
         title={editing ? '编辑数据源' : '新增数据源'}
         open={modalOpen}
-        onCancel={() => setModalOpen(false)}
+        onCancel={() => {
+          setModalOpen(false)
+          setTestResult(null)
+        }}
         onOk={submit}
         width={760}
         okText="保存"
+        footer={(_, { OkBtn, CancelBtn }) => (
+          <Space>
+            <Button
+              onClick={testConnection}
+              loading={testing}
+              icon={<ApiOutlined />}
+            >
+              测试连接
+            </Button>
+            <CancelBtn />
+            <OkBtn />
+          </Space>
+        )}
         // forceRender 让表单在 Modal 首次打开前就挂载，
         // 这样 setFieldsValue 写入的值不会被丢弃。
         // 之前用 destroyOnClose，表单在关闭时被销毁，
@@ -413,8 +490,19 @@ export default function DatasourcePage() {
             >
               <InputNumber min={1} max={65535} style={{ width: '100%' }} />
             </Form.Item>
-            <Form.Item name="database" label="默认库" style={{ flex: 1 }}>
-              <Input placeholder="shop（可选）" />
+            <Form.Item
+              name="database"
+              label={currentType === 'redis' ? 'db 号' : '默认库'}
+              rules={
+                currentType === 'redis'
+                  ? [] // Redis 不填默认用 db 0
+                  : [{ required: true, message: 'SQL 类数据源必须指定库名' }]
+              }
+              style={{ flex: 1 }}
+            >
+              <Input
+                placeholder={currentType === 'redis' ? '例如 37，不填为 0' : '例如 shop'}
+              />
             </Form.Item>
           </Space>
 
@@ -453,6 +541,27 @@ export default function DatasourcePage() {
               />
             </Form.Item>
           </Space>
+
+          {testResult ? (
+            <Alert
+              style={{ marginBottom: 16 }}
+              type={testResult.ok ? 'success' : 'error'}
+              showIcon
+              closable
+              onClose={() => setTestResult(null)}
+              message={testResult.ok ? '连接成功' : '连接失败'}
+              description={
+                <Space direction="vertical" size={0}>
+                  {testResult.ok ? null : <Text>{testResult.message}</Text>}
+                  {testResult.ok && testResult.elapsed_ms !== undefined ? (
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      耗时 {testResult.elapsed_ms} ms
+                    </Text>
+                  ) : null}
+                </Space>
+              }
+            />
+          ) : null}
 
           <Form.Item name="description" label="描述">
             <Input.TextArea rows={2} placeholder="给开发者看的说明，会显示在申请页" />

@@ -39,6 +39,8 @@ type Adapter interface {
 	ListDatabases(ctx context.Context) ([]string, error)
 	ListTables(ctx context.Context, db string) ([]string, error)
 	Query(ctx context.Context, sql string, rowLimit int) (*QueryResult, error)
+	// Close 释放底层连接池。测试连接这类一次性使用必须调用，否则会泄漏连接。
+	Close() error
 }
 
 // readOnlyKeywords 是允许的语句起始关键字白名单。

@@ -90,3 +90,10 @@ export interface RedisQueryResult {
   truncated: boolean
   elapsed_ms: number
 }
+
+/** 测试连接的结果。「连不上」用 ok:false 表示，不是 HTTP 错误。 */
+export interface TestConnResult {
+  ok: boolean
+  message: string
+  elapsed_ms?: number
+}
