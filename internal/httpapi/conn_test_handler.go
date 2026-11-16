@@ -137,6 +137,12 @@ func friendlyConnError(err error) string {
 	lower := strings.ToLower(msg)
 
 	switch {
+	// MongoDB 的 Unauthorized 表示连上了但没有执行该命令的权限，
+	// 与「密码错」不是一回事：密码错会报 Authentication failed。
+	// 分开提示，否则用户会一直去改密码却找不到原因。
+	case strings.Contains(lower, "requires authentication"),
+		strings.Contains(lower, "(unauthorized)"):
+		return "权限不足：目标库已开启认证，请填写有查询权限的账号"
 	case strings.Contains(lower, "password authentication failed"),
 		strings.Contains(lower, "access denied"),
 		strings.Contains(lower, "authentication"),

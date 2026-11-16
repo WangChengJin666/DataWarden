@@ -225,6 +225,8 @@ func TestFriendlyConnError(t *testing.T) {
 		// Windows 的错误文案与 Unix 不同，实测是 "No connection could be made ... actively refused"
 		{"dial error: dial tcp 10.0.0.5:5999: connectex: No connection could be made because the target machine actively refused it.", "无法连接到目标主机，请检查主机和端口"},
 		{"unknown database 'foo'", "库不存在，请检查库名（Redis 请填 db 号）"},
+		// MongoDB 的 Unauthorized 是「连上了但没权限」，与密码错不同，必须分开提示
+		{"mongo permission check: (Unauthorized) command listCollections requires authentication", "权限不足：目标库已开启认证，请填写有查询权限的账号"},
 	}
 	for _, c := range cases {
 		got := friendlyConnError(errors.New(c.err))
