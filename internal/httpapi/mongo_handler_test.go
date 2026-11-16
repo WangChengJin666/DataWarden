@@ -18,7 +18,7 @@ func TestMongoQuery_CommandFormAuthz(t *testing.T) {
 	r := NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query: &QueryHandler{
 			Service: newTestQueryServiceWithEnforcer(&recordingAuditor{}, enforcer),
 			Factory: stubMongoFactory(),
@@ -47,7 +47,7 @@ func TestMongoQuery_Forbidden(t *testing.T) {
 	r := NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query: &QueryHandler{
 			Service: newTestQueryServiceWithEnforcer(&recordingAuditor{}, enforcer),
 			Factory: stubMongoFactory(),
@@ -73,7 +73,7 @@ func TestMongoQuery_RejectsWriteCommand(t *testing.T) {
 	r := NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query: &QueryHandler{
 			Service: newTestQueryServiceWithEnforcer(&recordingAuditor{}, enforcer),
 			Factory: stubMongoFactory(),
@@ -104,7 +104,7 @@ func TestMongoQuery_FilterMustBeObject(t *testing.T) {
 	r := NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query: &QueryHandler{
 			Service: newTestQueryService(&recordingAuditor{}),
 			Factory: stubMongoFactory(),
@@ -129,7 +129,7 @@ func TestMongoQuery_RequiresAuth(t *testing.T) {
 	r := NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query: &QueryHandler{
 			Service: newTestQueryService(&recordingAuditor{}),
 			Factory: stubMongoFactory(),
@@ -152,7 +152,7 @@ func TestMongoQuery_RequiresDatasourceID(t *testing.T) {
 	r := NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query: &QueryHandler{
 			Service: newTestQueryService(&recordingAuditor{}),
 			Factory: stubMongoFactory(),
@@ -175,7 +175,7 @@ func TestMongoQuery_RequiresCollection(t *testing.T) {
 	r := NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query: &QueryHandler{
 			Service: newTestQueryService(&recordingAuditor{}),
 			Factory: stubMongoFactory(),

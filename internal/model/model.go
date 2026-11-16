@@ -47,10 +47,14 @@ type Datasource struct {
 
 	// 连接目标库使用的账号。每个数据源独立配置，便于按库分配最小权限账号。
 	Username string `json:"username"`
-	// 密码的 AES-GCM 密文（base64）。绝不出现在 API 响应里，
-	// 服务端解密后只用于建立连接。
-	PasswordEnc string `json:"-"`
-	// Password 是明文密码，仅在写入路径（Create/Update）中使用，不落库、不序列化。
+	// Password 是明文密码，直接落库。
+	//
+	// 这里不做加密是有意的取舍：平台需要把明文交给驱动去连目标库，
+	// 加密只能提升「数据库被单独拖走」这一种场景的安全性，
+	// 挡不住拿到整机权限的人（密钥通常和数据库在同一台机器上）。
+	// 因此改为如实明文存储，并把保护责任放到数据库访问控制与备份加密上。
+	//
+	// 绝不序列化到 API 响应：任何接口都不返回密码。
 	Password string `json:"-"`
 
 	CreatedAt time.Time `json:"created_at"`

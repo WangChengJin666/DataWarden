@@ -60,15 +60,14 @@ func TestDatasourceJSON_UsesSnakeCase(t *testing.T) {
 	}
 }
 
-// 数据源的密码（明文与密文）都绝不能出现在 API 响应里。
-// 这是本项目的安全底线之一：接口一旦泄露密文，等于泄露了可解密的凭据。
+// 数据源的密码绝不能出现在 API 响应里。
+// 密码虽然改成明文落库，但对外暴露的边界没有变：任何接口都不返回密码。
 func TestDatasourceJSON_NeverLeaksPassword(t *testing.T) {
 	ds := Datasource{
 		ID: 1, Name: "shop", Type: TypePostgreSQL,
 		Host: "h", Port: 5432, Database: "db",
 		Username:    "readonly",
 		Password:    "plain-secret-value",
-		PasswordEnc: "ZW5jcnlwdGVkLXNlY3JldA==",
 		HasPassword: true,
 	}
 	b, err := json.Marshal(ds)
@@ -80,8 +79,9 @@ func TestDatasourceJSON_NeverLeaksPassword(t *testing.T) {
 	if strings.Contains(out, "plain-secret-value") {
 		t.Fatal("plaintext password must never be serialized")
 	}
-	if strings.Contains(out, "ZW5jcnlwdGVkLXNlY3JldA") {
-		t.Fatal("encrypted password must never be serialized")
+	// 字段名也不能出现，否则前端可能误以为能读到密码
+	if strings.Contains(out, `"password":`) {
+		t.Fatal("password key must not appear in JSON")
 	}
 	// 精确匹配字段名。"password" 作为子串会误命中合法的 has_password，不能这么查。
 	for _, bad := range []string{`"Password":`, `"password":`, `"password_enc":`, `"PasswordEnc":`} {

@@ -42,7 +42,7 @@ func redisRouter(t *testing.T, enforcerAllow bool, q redisq.Queryer, db int) *gi
 	return NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query:       &QueryHandler{},
 		Redis: &RedisHandler{
 			Enforcer: &recordingEnforcer{allowed: enforcerAllow},
@@ -170,7 +170,7 @@ func TestRedisQuery_AuthObjectIncludesDB(t *testing.T) {
 	r := NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query:       &QueryHandler{},
 		Redis: &RedisHandler{
 			Enforcer: enforcer,
@@ -239,7 +239,7 @@ func TestRedisQuery_PrefixGrantAllowsChildKey(t *testing.T) {
 	r := NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query:       &QueryHandler{},
 		Redis: &RedisHandler{
 			Enforcer: enforcer,
@@ -268,7 +268,7 @@ func TestRedisQuery_PrefixGrantDoesNotLeakSibling(t *testing.T) {
 	r := NewRouter(Deps{
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}}, Issuer: issuer},
-		Datasource:  &DatasourceHandler{Store: &memDatasources{}, Cipher: testCipher(t)},
+		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
 		Query:       &QueryHandler{},
 		Redis: &RedisHandler{
 			Enforcer: enforcer,

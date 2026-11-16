@@ -79,9 +79,9 @@ CREATE TABLE IF NOT EXISTS datasource (
     db_name      TEXT        NOT NULL DEFAULT '',
     -- 连接目标库使用的账号，每个数据源独立配置
     username     TEXT        NOT NULL DEFAULT '',
-    -- 密码的 AES-GCM 密文（base64）。绝不存明文，
-    -- 主密钥由 DATAWARDEN_MASTER_KEY 环境变量提供
-    password_enc TEXT        NOT NULL DEFAULT '',
+    -- 连接密码，明文保存。平台不做应用层加密，
+    -- 因此本表所在库必须有严格的访问控制与备份加密
+    password     TEXT        NOT NULL DEFAULT '',
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     -- 可申请配置（0002 迁移新增）

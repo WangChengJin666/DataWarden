@@ -453,6 +453,23 @@ export default function DatasourcePage() {
         </Text>
       ) : null}
 
+      {isDBA ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="密码以明文保存"
+          description={
+            <span>
+              各数据源的连接密码以明文存入平台元数据库，接口不会返回密码，但任何能读取
+              <Text code>datasource</Text> 表的人（含 DBA、数据库备份文件、误发的 dump）
+              都能直接看到。请为每个数据源使用<Text strong>只读账号</Text>，
+              并对平台元数据库做好访问控制与备份加密。
+            </span>
+          }
+        />
+      ) : null}
+
       <Table
         rowKey="id"
         columns={columns}
@@ -592,7 +609,7 @@ export default function DatasourcePage() {
               extra={
                 editing && editing.has_password
                   ? '留空表示不修改现有密码'
-                  : '密码会加密后保存，保存后不可再查看'
+                  : '密码以明文存入平台库，请使用只读账号'
               }
               style={{ flex: 1 }}
             >

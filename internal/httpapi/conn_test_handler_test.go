@@ -13,7 +13,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/opensourceprj/datawarden/internal/auth"
 	"github.com/opensourceprj/datawarden/internal/model"
-	"github.com/opensourceprj/datawarden/internal/secret"
 )
 
 // stubTester 记录收到的配置并返回预设结果。
@@ -30,7 +29,7 @@ func (s *stubTester) Test(ctx context.Context, cfg TestConnConfig) (*TestConnRes
 	return s.res, s.err
 }
 
-func testConnRouter(t *testing.T, role string, tester ConnTester, c *secret.Cipher, store DatasourceStore) *gin.Engine {
+func testConnRouter(t *testing.T, role string, tester ConnTester, store DatasourceStore) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	issuer := auth.NewTokenIssuer("test-secret", time.Hour)
@@ -39,7 +38,6 @@ func testConnRouter(t *testing.T, role string, tester ConnTester, c *secret.Ciph
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "pw"}, role: role}, Issuer: issuer},
 		Datasource: &DatasourceHandler{
 			Store:  store,
-			Cipher: c,
 			Tester: tester,
 		},
 		Query: &QueryHandler{},
@@ -60,7 +58,7 @@ func postTestConn(t *testing.T, r http.Handler, token string, body map[string]an
 }
 
 func TestTestConnection_RequiresAuth(t *testing.T) {
-	r := testConnRouter(t, "dba", &stubTester{}, testCipher(t), &memDatasources{})
+	r := testConnRouter(t, "dba", &stubTester{}, &memDatasources{})
 	w := postTestConn(t, r, "", map[string]any{"type": "postgresql", "host": "h", "port": 5432})
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
@@ -70,7 +68,7 @@ func TestTestConnection_RequiresAuth(t *testing.T) {
 // 开发者不该能探测任意主机的连通性——这等于一个内网端口扫描器。
 func TestTestConnection_RequiresDBA(t *testing.T) {
 	st := &stubTester{}
-	r := testConnRouter(t, "developer", st, testCipher(t), &memDatasources{})
+	r := testConnRouter(t, "developer", st, &memDatasources{})
 
 	tok := loginAndGetToken(t, r, "alice", "pw")
 	w := postTestConn(t, r, tok, map[string]any{"type": "postgresql", "host": "h", "port": 5432})
@@ -85,7 +83,7 @@ func TestTestConnection_RequiresDBA(t *testing.T) {
 
 func TestTestConnection_Success(t *testing.T) {
 	st := &stubTester{res: &TestConnResult{OK: true, Message: "连接成功", ElapsedMs: 12}}
-	r := testConnRouter(t, "dba", st, testCipher(t), &memDatasources{})
+	r := testConnRouter(t, "dba", st, &memDatasources{})
 
 	tok := loginAndGetToken(t, r, "alice", "pw")
 	w := postTestConn(t, r, tok, map[string]any{
@@ -121,7 +119,7 @@ func TestTestConnection_Success(t *testing.T) {
 // 「连不上」是用户要看的业务结果，不是服务端错误。
 func TestTestConnection_FailureIsNotServerError(t *testing.T) {
 	st := &stubTester{err: errors.New("password authentication failed for user \"x\"")}
-	r := testConnRouter(t, "dba", st, testCipher(t), &memDatasources{})
+	r := testConnRouter(t, "dba", st, &memDatasources{})
 
 	tok := loginAndGetToken(t, r, "alice", "pw")
 	w := postTestConn(t, r, tok, map[string]any{
@@ -149,20 +147,14 @@ func TestTestConnection_FailureIsNotServerError(t *testing.T) {
 // 编辑场景：请求不带密码时，必须用库里已存的密码解密后测试，
 // 否则用户每次想测连接都得重新输入密码。
 func TestTestConnection_UsesStoredPasswordWhenOmitted(t *testing.T) {
-	c := testCipher(t)
-	enc, err := c.Encrypt("stored-secret")
-	if err != nil {
-		t.Fatalf("encrypt: %v", err)
-	}
-
 	store := &memDatasources{items: []model.Datasource{{
 		ID: 7, Name: "shop", Type: model.TypePostgreSQL,
 		Host: "h", Port: 5432, Database: "shop",
-		Username: "readonly", PasswordEnc: enc, HasPassword: true,
+		Username: "readonly", Password: "stored-secret", HasPassword: true,
 	}}}
 
 	st := &stubTester{res: &TestConnResult{OK: true, Message: "连接成功"}}
-	r := testConnRouter(t, "dba", st, c, store)
+	r := testConnRouter(t, "dba", st, store)
 
 	tok := loginAndGetToken(t, r, "alice", "pw")
 	w := postTestConn(t, r, tok, map[string]any{
@@ -179,20 +171,17 @@ func TestTestConnection_UsesStoredPasswordWhenOmitted(t *testing.T) {
 		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
 	}
 	if st.got.Password != "stored-secret" {
-		t.Errorf("password = %q, want decrypted stored secret", st.got.Password)
+		t.Errorf("password = %q, want the stored password", st.got.Password)
 	}
 }
 
 // 请求里显式填了密码时，优先用请求的，不要被库里旧值覆盖。
 func TestTestConnection_RequestPasswordWins(t *testing.T) {
-	c := testCipher(t)
-	enc, _ := c.Encrypt("old-secret")
-
 	store := &memDatasources{items: []model.Datasource{{
-		ID: 7, Type: model.TypePostgreSQL, PasswordEnc: enc, HasPassword: true,
+		ID: 7, Type: model.TypePostgreSQL, Password: "old-secret", HasPassword: true,
 	}}}
 	st := &stubTester{res: &TestConnResult{OK: true}}
-	r := testConnRouter(t, "dba", st, c, store)
+	r := testConnRouter(t, "dba", st, store)
 
 	tok := loginAndGetToken(t, r, "alice", "pw")
 	postTestConn(t, r, tok, map[string]any{
@@ -206,7 +195,7 @@ func TestTestConnection_RequestPasswordWins(t *testing.T) {
 }
 
 func TestTestConnection_RejectsUnknownType(t *testing.T) {
-	r := testConnRouter(t, "dba", &stubTester{}, testCipher(t), &memDatasources{})
+	r := testConnRouter(t, "dba", &stubTester{}, &memDatasources{})
 	tok := loginAndGetToken(t, r, "alice", "pw")
 	w := postTestConn(t, r, tok, map[string]any{"type": "oracle", "host": "h", "port": 1521})
 	if w.Code != http.StatusBadRequest {

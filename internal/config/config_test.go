@@ -2,15 +2,8 @@ package config
 
 import "testing"
 
-const validMasterKey = "0123456789abcdef0123456789abcdef" // 32 字节
-
 func TestLoad_RequiresDatabaseURL(t *testing.T) {
-	_, err := Load(func(key string) string {
-		if key == "DATAWARDEN_MASTER_KEY" {
-			return validMasterKey
-		}
-		return ""
-	})
+	_, err := Load(func(key string) string { return "" })
 	if err == nil {
 		t.Fatal("expected error when DATABASE_URL is empty")
 	}
@@ -19,24 +12,20 @@ func TestLoad_RequiresDatabaseURL(t *testing.T) {
 	}
 }
 
-// 主密钥是必需项：缺了它密码无法解密，服务起来也没法查数据。
-// 这里宁可启动失败，也不要用一个默认密钥兜底——那等于没有加密。
-func TestLoad_RequiresMasterKey(t *testing.T) {
-	_, err := Load(func(key string) string {
-		if key == "DATABASE_URL" {
-			return "postgres://localhost/datawarden"
-		}
-		return ""
-	})
-	if err == nil {
-		t.Fatal("expected error when DATAWARDEN_MASTER_KEY is empty")
+// 密码改为明文存储后不再需要主密钥，配了也不会影响启动。
+func TestLoad_IgnoresLegacyMasterKey(t *testing.T) {
+	env := map[string]string{
+		"DATABASE_URL":          "postgres://localhost/datawarden",
+		"DATAWARDEN_MASTER_KEY": "left-over-from-old-version",
+	}
+	if _, err := Load(func(key string) string { return env[key] }); err != nil {
+		t.Fatalf("legacy master key must not block startup: %v", err)
 	}
 }
 
 func TestLoad_AppliesDefaults(t *testing.T) {
 	env := map[string]string{
-		"DATABASE_URL":          "postgres://localhost/datawarden",
-		"DATAWARDEN_MASTER_KEY": validMasterKey,
+		"DATABASE_URL": "postgres://localhost/datawarden",
 	}
 	cfg, err := Load(func(key string) string { return env[key] })
 	if err != nil {
@@ -57,19 +46,15 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 	if cfg.QueryRowLimit != 500 {
 		t.Errorf("QueryRowLimit = %d, want 500", cfg.QueryRowLimit)
 	}
-	if cfg.MasterKey != validMasterKey {
-		t.Errorf("MasterKey not loaded")
-	}
 }
 
 func TestLoad_OverridesFromEnv(t *testing.T) {
 	env := map[string]string{
-		"DATABASE_URL":          "postgres://localhost/datawarden",
-		"DATAWARDEN_MASTER_KEY": validMasterKey,
-		"HTTP_ADDR":             ":9000",
-		"JWT_SECRET":            "s3cret",
-		"QUERY_TIMEOUT_SEC":     "15",
-		"REDIS_SCAN_MAX_KEYS":   "50",
+		"DATABASE_URL":        "postgres://localhost/datawarden",
+		"HTTP_ADDR":           ":9000",
+		"JWT_SECRET":          "s3cret",
+		"QUERY_TIMEOUT_SEC":   "15",
+		"REDIS_SCAN_MAX_KEYS": "50",
 	}
 	cfg, err := Load(func(key string) string { return env[key] })
 	if err != nil {
@@ -91,9 +76,8 @@ func TestLoad_OverridesFromEnv(t *testing.T) {
 
 func TestLoad_InvalidIntFallsBackToDefault(t *testing.T) {
 	env := map[string]string{
-		"DATABASE_URL":          "postgres://localhost/datawarden",
-		"DATAWARDEN_MASTER_KEY": validMasterKey,
-		"QUERY_TIMEOUT_SEC":     "not-a-number",
+		"DATABASE_URL":      "postgres://localhost/datawarden",
+		"QUERY_TIMEOUT_SEC": "not-a-number",
 	}
 	cfg, err := Load(func(key string) string { return env[key] })
 	if err != nil {

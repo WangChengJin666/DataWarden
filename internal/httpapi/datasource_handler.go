@@ -2,12 +2,10 @@ package httpapi
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/opensourceprj/datawarden/internal/model"
-	"github.com/opensourceprj/datawarden/internal/secret"
 )
 
 // DatasourceStore 是数据源持久化的最小接口。
@@ -21,9 +19,6 @@ type DatasourceStore interface {
 
 type DatasourceHandler struct {
 	Store DatasourceStore
-	// Cipher 用于加密落库的密码。为 nil 时拒绝 Create/Update，
-	// 避免明文密码被意外写入数据库。
-	Cipher *secret.Cipher
 	// Tester 用于「测试连接」。为 nil 时该接口返回 503。
 	Tester ConnTester
 }
@@ -78,23 +73,14 @@ var validTypes = map[string]bool{
 	string(model.TypeMongoDB):    true,
 }
 
-// toModel 把请求转成模型。密码在此处加密，密文之外的明文不会离开这个函数。
-func (r datasourceReq) toModel(cipher *secret.Cipher) (*model.Datasource, error) {
+// toModel 把请求转成模型。密码按明文写入。
+func (r datasourceReq) toModel() *model.Datasource {
 	scopes := make([]model.ApplyScope, 0, len(r.ApplyScopes))
 	for _, s := range r.ApplyScopes {
 		scopes = append(scopes, model.ApplyScope{
 			Database: s.Database,
 			Tables:   s.Tables,
 		})
-	}
-
-	enc := ""
-	if r.Password != "" {
-		var err error
-		enc, err = cipher.Encrypt(r.Password)
-		if err != nil {
-			return nil, fmt.Errorf("encrypt password: %w", err)
-		}
 	}
 
 	return &model.Datasource{
@@ -104,12 +90,12 @@ func (r datasourceReq) toModel(cipher *secret.Cipher) (*model.Datasource, error)
 		Port:         r.Port,
 		Database:     r.Database,
 		Username:     r.Username,
-		PasswordEnc:  enc,
+		Password:     r.Password,
 		ApplyEnabled: r.ApplyEnabled,
 		MaxApplyDays: r.MaxApplyDays,
 		ApplyScopes:  scopes,
 		Description:  r.Description,
-	}, nil
+	}
 }
 
 // requireDBA 校验当前用户是否为 DBA 及以上。返回 false 时已写入响应。
@@ -128,10 +114,6 @@ func (h *DatasourceHandler) Create(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if h.Cipher == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "password cipher not configured"})
-		return
-	}
 
 	var req datasourceReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -143,11 +125,7 @@ func (h *DatasourceHandler) Create(c *gin.Context) {
 		return
 	}
 
-	ds, err := req.toModel(h.Cipher)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	ds := req.toModel()
 
 	id, err := h.Store.Create(c.Request.Context(), ds)
 	if err != nil {
@@ -170,10 +148,6 @@ func (h *DatasourceHandler) Update(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if h.Cipher == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "password cipher not configured"})
-		return
-	}
 	id, ok := parseID(c, "id")
 	if !ok {
 		return
@@ -189,11 +163,7 @@ func (h *DatasourceHandler) Update(c *gin.Context) {
 		return
 	}
 
-	ds, err := req.toModel(h.Cipher)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	ds := req.toModel()
 	ds.ID = id
 	if err := h.Store.Update(c.Request.Context(), ds); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

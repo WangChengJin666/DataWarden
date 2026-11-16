@@ -71,28 +71,15 @@ func (h *DatasourceHandler) TestConnection(c *gin.Context) {
 		return
 	}
 
-	// 密码解析顺序：请求里填了就用请求的；没填则回退到库里已存的密文。
+	// 密码解析顺序：请求里填了就用请求的；没填则回退到库里已存的值。
 	password := req.Password
 	if password == "" && req.DatasourceID != 0 {
-		if h.Cipher == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "password cipher not configured"})
-			return
-		}
 		existing, err := h.Store.Get(c.Request.Context(), req.DatasourceID)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 			return
 		}
-		if existing.PasswordEnc != "" {
-			plain, err := h.Cipher.Decrypt(existing.PasswordEnc)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{
-					"error": "cannot decrypt stored password: " + err.Error(),
-				})
-				return
-			}
-			password = plain
-		}
+		password = existing.Password
 	}
 
 	// 测试连接也要限时，避免目标不可达时前端一直转圈

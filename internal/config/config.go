@@ -14,15 +14,6 @@ type Config struct {
 	QueryTimeoutSec  int
 	RedisScanMaxKeys int
 	QueryRowLimit    int
-
-	// MasterKey 是加密数据源密码的主密钥（AES-128/192/256）。
-	// 必须与数据库分开保管：数据库丢了但主密钥还在，密码不会泄露。
-	MasterKey string
-
-	// DBUserForQuery / DBPasswordForQuery 是旧版全局查询账号，现已废弃。
-	// 数据源改为各自保存账号密码，这两个字段仅为兼容旧 .env 保留。
-	DBUserForQuery     string
-	DBPasswordForQuery string
 }
 
 // Load 从 getenv 读取配置。getenv 可注入，便于测试。
@@ -34,18 +25,10 @@ func Load(getenv func(string) string) (*Config, error) {
 		QueryTimeoutSec:  orDefaultInt(getenv("QUERY_TIMEOUT_SEC"), 30),
 		RedisScanMaxKeys: orDefaultInt(getenv("REDIS_SCAN_MAX_KEYS"), 200),
 		QueryRowLimit:    orDefaultInt(getenv("QUERY_ROW_LIMIT"), 500),
-
-		MasterKey: getenv("DATAWARDEN_MASTER_KEY"),
-
-		DBUserForQuery:     getenv("QUERY_DB_USER"),
-		DBPasswordForQuery: getenv("QUERY_DB_PASSWORD"),
 	}
 
 	if cfg.DatabaseURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL is required")
-	}
-	if cfg.MasterKey == "" {
-		return nil, fmt.Errorf("DATAWARDEN_MASTER_KEY is required (16/24/32 bytes); it encrypts datasource passwords")
 	}
 	return cfg, nil
 }
