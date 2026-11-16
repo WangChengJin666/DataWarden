@@ -14,7 +14,7 @@ import {
   Typography,
 } from 'antd'
 import { PlayCircleOutlined } from '@ant-design/icons'
-import { executeRedis, executeSQL, listDatasources } from '@/api/client'
+import { executeMongo, executeRedis, executeSQL, listDatasources } from '@/api/client'
 import type { Datasource, QueryResult, RedisQueryResult } from '@/api/types'
 
 const { Text, Paragraph } = Typography
@@ -31,6 +31,11 @@ export default function QueryPage() {
   const [redisMode, setRedisMode] = useState<'exact' | 'scan'>('exact')
   const [redisKey, setRedisKey] = useState('')
   const [redisResult, setRedisResult] = useState<RedisQueryResult | null>(null)
+  // Mongo 两种输入模式：集合+过滤条件 / 原生命令
+  const [mongoMode, setMongoMode] = useState<'collection' | 'command'>('collection')
+  const [mongoCollection, setMongoCollection] = useState('')
+  const [mongoFilter, setMongoFilter] = useState('{}')
+  const [mongoCommand, setMongoCommand] = useState('')
 
   useEffect(() => {
     void (async () => {
@@ -47,13 +52,34 @@ export default function QueryPage() {
 
   const current = datasources.find((d) => d.id === datasourceId)
   const isRedis = current?.type === 'redis'
+  const isMongo = current?.type === 'mongodb'
+  const isSQL = !isRedis && !isMongo
 
   const run = async () => {
     if (!datasourceId) {
       message.warning('请先选择数据源')
       return
     }
-    if (!isRedis) {
+    if (isMongo) {
+      // Mongo 没填库名时后端无法确定查哪个库
+      if (!database.trim()) {
+        message.warning('请填写库名')
+        return
+      }
+      if (mongoMode === 'collection') {
+        if (!mongoCollection.trim()) {
+          message.warning('请填写集合名')
+          return
+        }
+        if (!mongoFilter.trim().startsWith('{')) {
+          message.warning('过滤条件必须是 JSON 对象，例如 {"status":"active"}')
+          return
+        }
+      } else if (!mongoCommand.trim()) {
+        message.warning('请输入 MongoDB 命令，例如 db.users.find({"a":1})')
+        return
+      }
+    } else if (isSQL) {
       if (!database.trim()) {
         message.warning('请填写库名')
         return
@@ -96,6 +122,27 @@ export default function QueryPage() {
             : { datasource_id: datasourceId, pattern: redisKey.trim() }
         const res = await executeRedis(payload)
         setRedisResult(res)
+        return
+      }
+      if (isMongo) {
+        // 集合模式下没有涉及表的概念，鉴权按集合名判定，所以集合名必须传准
+        const payload =
+          mongoMode === 'collection'
+            ? {
+                datasource_id: datasourceId,
+                database: database.trim(),
+                collection: mongoCollection.trim(),
+                filter: mongoFilter.trim(),
+                row_limit: rowLimit,
+              }
+            : {
+                datasource_id: datasourceId,
+                database: database.trim(),
+                command: mongoCommand.trim(),
+                row_limit: rowLimit,
+              }
+        const res = await executeMongo(payload)
+        setResult(res)
         return
       }
       const res = await executeSQL({
@@ -213,10 +260,22 @@ export default function QueryPage() {
           style={{ marginBottom: 16 }}
           message="查询规则"
           description={
-            <span>
-              只能执行只读语句（SELECT / SHOW / DESC / EXPLAIN）。必须填写涉及的表名，
-              平台会逐表校验权限，任一表无权限则整条查询被拒绝。结果中的手机号、身份证、邮箱等字段会自动脱敏。
-            </span>
+            isMongo ? (
+              <span>
+                集合名用于逐集合鉴权，无权限的集合会被拒绝。只允许查询操作，
+                写操作与会写库的聚合阶段（$out、$merge）一律拦截。结果中的手机号、身份证、邮箱等字段会自动脱敏。
+              </span>
+            ) : isRedis ? (
+              <span>
+                授权范围按 key 前缀判定，前缀授权会自动覆盖其下所有子 key。
+                模糊查询走 SCAN，绝不使用 KEYS。
+              </span>
+            ) : (
+              <span>
+                只能执行只读语句（SELECT / SHOW / DESC / EXPLAIN）。必须填写涉及的表名，
+                平台会逐表校验权限，任一表无权限则整条查询被拒绝。结果中的手机号、身份证、邮箱等字段会自动脱敏。
+              </span>
+            )
           }
         />
 
@@ -231,20 +290,22 @@ export default function QueryPage() {
               label: `${d.name} (${d.type})`,
             }))}
           />
-          {!isRedis ? (
+          {isRedis ? null : (
             <>
               <Input
-                placeholder="库名，如 public"
+                placeholder={isMongo ? '库名，如 test' : '库名，如 public'}
                 value={database}
                 onChange={(e) => setDatabase(e.target.value)}
                 style={{ width: 160 }}
               />
-              <Input
-                placeholder="涉及的表，逗号分隔"
-                value={tables}
-                onChange={(e) => setTables(e.target.value)}
-                style={{ width: 240 }}
-              />
+              {isSQL ? (
+                <Input
+                  placeholder="涉及的表，逗号分隔"
+                  value={tables}
+                  onChange={(e) => setTables(e.target.value)}
+                  style={{ width: 240 }}
+                />
+              ) : null}
               <InputNumber
                 min={1}
                 max={1000}
@@ -255,10 +316,61 @@ export default function QueryPage() {
                 style={{ width: 170 }}
               />
             </>
-          ) : null}
+          )}
         </Space>
 
-        {isRedis ? (
+        {isMongo ? (
+          <Card size="small" type="inner" title="MongoDB 查询">
+            <Tabs
+              activeKey={mongoMode}
+              onChange={(k) => setMongoMode(k as 'collection' | 'command')}
+              items={[
+                {
+                  key: 'collection',
+                  label: '集合查询',
+                  children: (
+                    <Space direction="vertical" style={{ width: '100%' }}>
+                      <Input
+                        placeholder="集合名，如 users"
+                        value={mongoCollection}
+                        onChange={(e) => setMongoCollection(e.target.value)}
+                      />
+                      <Input.TextArea
+                        rows={5}
+                        placeholder='过滤条件（JSON），如 {"status":"active"}。留空查全部'
+                        value={mongoFilter}
+                        onChange={(e) => setMongoFilter(e.target.value)}
+                        style={{ fontFamily: 'Menlo, Consolas, monospace', fontSize: 13 }}
+                      />
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        集合名用于逐集合鉴权，必须填写准确。查询固定为 find（只读）。
+                      </Text>
+                    </Space>
+                  ),
+                },
+                {
+                  key: 'command',
+                  label: '原生命令',
+                  children: (
+                    <Space direction="vertical" style={{ width: '100%' }}>
+                      <Input.TextArea
+                        rows={5}
+                        placeholder='db.users.find({"status":"active"})'
+                        value={mongoCommand}
+                        onChange={(e) => setMongoCommand(e.target.value)}
+                        style={{ fontFamily: 'Menlo, Consolas, monospace', fontSize: 13 }}
+                      />
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        支持 find / findOne / countDocuments / distinct / aggregate。
+                        写操作（insert / update / delete / drop）以及会写库的聚合阶段（$out、$merge）一律拒绝。
+                      </Text>
+                    </Space>
+                  ),
+                },
+              ]}
+            />
+          </Card>
+        ) : isRedis ? (
           <Card size="small" type="inner" title="Redis 查询">
             <Tabs
               activeKey={redisMode}

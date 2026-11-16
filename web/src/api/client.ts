@@ -175,3 +175,16 @@ export async function testDatasourceConnection(payload: {
   const { data } = await http.post<TestConnResult>('/datasources/test', payload)
   return data
 }
+
+/** 执行 MongoDB 查询。两种形式二选一：传 command，或传 collection+filter。 */
+export async function executeMongo(payload: {
+  datasource_id: number
+  database?: string
+  collection?: string
+  filter?: string
+  command?: string
+  row_limit?: number
+}): Promise<QueryResult> {
+  const { data } = await http.post<QueryResult>('/query/mongo', payload)
+  return data
+}

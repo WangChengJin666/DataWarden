@@ -44,6 +44,7 @@ func NewRouter(d Deps) *gin.Engine {
 
 		// 查询
 		authed.POST("/query/sql", d.Query.ExecuteSQL)
+		authed.POST("/query/mongo", d.Query.ExecuteMongo)
 		if d.Redis != nil {
 			authed.POST("/query/redis", d.Redis.Query)
 		}

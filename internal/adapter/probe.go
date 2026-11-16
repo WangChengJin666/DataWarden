@@ -46,12 +46,16 @@ func Probe(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 			ElapsedMs: time.Since(start).Milliseconds(),
 		}, nil
 
-	case "mysql", "postgresql":
+	case "mysql", "postgresql", "mongodb":
 		// PostgreSQL 的库名是连接串的一部分，留空会连到与用户名同名的库并失败，
 		// 与其抛出难懂的 "database does not exist"，不如提前给出准确提示。
 		// MySQL 允许不选库（DSN 末尾为空），所以不作这个要求。
+		// MongoDB 必须知道默认库才能确定连哪个库，同样必填。
 		if cfg.Type == "postgresql" && cfg.Database == "" {
 			return nil, fmt.Errorf("PostgreSQL 必须填写库名，否则无法建立连接")
+		}
+		if cfg.Type == "mongodb" && cfg.Database == "" {
+			return nil, fmt.Errorf("MongoDB 必须填写默认库，否则无法确定要查哪个库")
 		}
 
 		a, err := New(ConnConfig{
@@ -75,11 +79,6 @@ func Probe(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 			Message:   "连接成功",
 			ElapsedMs: time.Since(start).Milliseconds(),
 		}, nil
-
-	case "mongodb":
-		// MongoDB 适配器还没实现，这里明确拒绝而不是假装成功。
-		// 假装成功会让用户以为配好了，实际查询时才失败，更难排查。
-		return nil, fmt.Errorf("mongodb 暂不支持连接测试（该类型的查询适配器尚未实现）")
 
 	default:
 		return nil, fmt.Errorf("unsupported datasource type: %s", cfg.Type)

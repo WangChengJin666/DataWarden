@@ -125,9 +125,9 @@ const databasePolicy: Record<
     hint: '',
   },
   mongodb: {
-    required: false,
-    label: '默认库（可选）',
-    placeholder: '可留空',
+    required: true,
+    label: '默认库（必填）',
+    placeholder: '例如 test',
     hint: '',
   },
 }
@@ -545,7 +545,15 @@ export default function DatasourcePage() {
               label={dbPolicy.label}
               rules={
                 dbPolicy.required
-                  ? [{ required: true, message: 'PostgreSQL 必须填写库名' }]
+                  ? [
+                      {
+                        required: true,
+                        message:
+                          currentType === 'mongodb'
+                            ? 'MongoDB 必须填写默认库，否则无法确定要查哪个库'
+                            : 'PostgreSQL 必须填写库名',
+                      },
+                    ]
                   : []
               }
               style={{ flex: 1 }}

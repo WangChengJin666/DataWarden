@@ -61,8 +61,8 @@ func TestProbe_RedisRejectsNonNumericDB(t *testing.T) {
 	}
 }
 
-// MongoDB 适配器尚未实现，探测必须明确报不支持，不能假装成功。
-func TestProbe_MongoDBReportsUnsupported(t *testing.T) {
+// MongoDB 现在已支持探测，但默认库必填：不指定库无法确定查哪个库。
+func TestProbe_MongoDBRequiresDatabase(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -70,10 +70,27 @@ func TestProbe_MongoDBReportsUnsupported(t *testing.T) {
 		Type: "mongodb", Host: "127.0.0.1", Port: 27017,
 	})
 	if err == nil {
-		t.Fatal("mongodb probe must not pretend to succeed")
+		t.Fatal("mongodb probe without database must fail")
 	}
-	if !strings.Contains(err.Error(), "暂不支持") {
-		t.Errorf("unexpected error: %v", err)
+	if !strings.Contains(err.Error(), "默认库") {
+		t.Errorf("error should mention the missing database, got: %v", err)
+	}
+}
+
+// 连不上时必须返回错误，不能假装成功。
+func TestProbe_MongoDBUnreachableIsError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping network probe in -short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	// 用一个几乎不可能有 MongoDB 的端口
+	_, err := Probe(ctx, ProbeConfig{
+		Type: "mongodb", Host: "127.0.0.1", Port: 5999, Database: "test",
+	})
+	if err == nil {
+		t.Fatal("mongodb probe against a dead port must not succeed")
 	}
 }
 
