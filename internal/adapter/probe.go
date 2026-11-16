@@ -47,6 +47,13 @@ func Probe(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 		}, nil
 
 	case "mysql", "postgresql":
+		// PostgreSQL 的库名是连接串的一部分，留空会连到与用户名同名的库并失败，
+		// 与其抛出难懂的 "database does not exist"，不如提前给出准确提示。
+		// MySQL 允许不选库（DSN 末尾为空），所以不作这个要求。
+		if cfg.Type == "postgresql" && cfg.Database == "" {
+			return nil, fmt.Errorf("PostgreSQL 必须填写库名，否则无法建立连接")
+		}
+
 		a, err := New(ConnConfig{
 			Type:     cfg.Type,
 			Host:     cfg.Host,

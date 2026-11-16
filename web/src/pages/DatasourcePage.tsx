@@ -91,6 +91,47 @@ const usernamePolicy: Record<
   },
 }
 
+// 「库」字段在各类数据库里的语义不同，必填与否必须分开判断：
+//
+//   PostgreSQL  连接串为 postgres://user:pw@host:port/DBNAME，
+//               库名是连接的一部分，留空会连到与用户同名的库并失败 → 必填
+//   MySQL       DSN 为 user:pw@tcp(host:port)/DBNAME，库名可留空，
+//               留空即「连接但不选库」，语句里写 db.table 完全可用 → 可选
+//   Redis       字段含义是 db 号，留空等于 db 0 → 可选
+//   MongoDB     可以连到实例而不指定库 → 可选
+//
+// 之前一律设成必填是错的：用户完全可以先登记 MySQL 数据源，
+// 之后在查询里用 `库名.表名` 指定，不该被表单拦住。
+const databasePolicy: Record<
+  DatasourceType,
+  { required: boolean; label: string; placeholder: string; hint: string }
+> = {
+  postgresql: {
+    required: true,
+    label: '默认库',
+    placeholder: '例如 shop',
+    hint: 'PostgreSQL 连接时必须指定库名',
+  },
+  mysql: {
+    required: false,
+    label: '默认库（可选）',
+    placeholder: '留空则查询时写库名.表名',
+    hint: 'MySQL 可以不指定库，查询时用「库名.表名」即可',
+  },
+  redis: {
+    required: false,
+    label: 'db 号（可选）',
+    placeholder: '不填为 0',
+    hint: 'Redis 的 db 号，不填默认使用 db 0',
+  },
+  mongodb: {
+    required: false,
+    label: '默认库（可选）',
+    placeholder: '可留空',
+    hint: '',
+  },
+}
+
 export default function DatasourcePage() {
   const [items, setItems] = useState<Datasource[]>([])
   const [loading, setLoading] = useState(false)
@@ -103,6 +144,7 @@ export default function DatasourcePage() {
   // 实时监听类型，用于按类型调整账号字段的必填规则与文案
   const currentType: DatasourceType | undefined = Form.useWatch('type', form)
   const policy = currentType ? usernamePolicy[currentType] : usernamePolicy.postgresql
+  const dbPolicy = currentType ? databasePolicy[currentType] : databasePolicy.postgresql
 
   const isDBA = ['dba', 'superadmin'].includes(getCurrentUser()?.role ?? '')
 
@@ -204,11 +246,11 @@ export default function DatasourcePage() {
     let values
     try {
       // 只校验连接相关字段：用户往往还没配完「可申请范围」就想先确认能否连上。
-      // database 对 SQL 类是必填（不指定库无法连接），对 Redis 可空（默认 db 0）。
+      // 库名是否必填按类型决定（只有 PostgreSQL 必须填），见 databasePolicy。
       values = await form.validateFields(
-        currentType === 'redis'
-          ? ['type', 'host', 'port']
-          : ['type', 'host', 'port', 'database'],
+        dbPolicy.required
+          ? ['type', 'host', 'port', 'database']
+          : ['type', 'host', 'port'],
       )
     } catch {
       return // 必填项没填，validateFields 已在表单上标红
@@ -492,17 +534,16 @@ export default function DatasourcePage() {
             </Form.Item>
             <Form.Item
               name="database"
-              label={currentType === 'redis' ? 'db 号' : '默认库'}
+              label={dbPolicy.label}
               rules={
-                currentType === 'redis'
-                  ? [] // Redis 不填默认用 db 0
-                  : [{ required: true, message: 'SQL 类数据源必须指定库名' }]
+                dbPolicy.required
+                  ? [{ required: true, message: 'PostgreSQL 必须填写库名' }]
+                  : []
               }
+              extra={dbPolicy.hint || undefined}
               style={{ flex: 1 }}
             >
-              <Input
-                placeholder={currentType === 'redis' ? '例如 37，不填为 0' : '例如 shop'}
-              />
+              <Input placeholder={dbPolicy.placeholder} />
             </Form.Item>
           </Space>
 
