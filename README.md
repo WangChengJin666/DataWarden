@@ -21,12 +21,28 @@
 |---|---|---|
 | 用户登录与 JWT 鉴权 | ✅ | bcrypt 密码哈希，令牌含角色 |
 | 角色权限（developer / dba / superadmin） | ✅ | Casbin 策略，库级 `*` 通配 |
-| 数据源登记 | ✅ | 支持 MySQL / PostgreSQL / Redis / MongoDB 类型，仅 DBA 可操作 |
+| 数据源管理 | ✅ | 增删改查，仅 DBA 可操作 |
+| 可申请数据源配置 | ✅ | 按数据源设置是否开放、最长天数、可申请库表范围 |
+| 授权申请与审批 | ✅ | 提交 → DBA 审批 → 授权即时生效；禁止自审 |
 | PostgreSQL / MySQL 受控查询 | ✅ | 只读白名单、强制限行、超时中断 |
 | Redis 查询通道 | ✅ | 精确 key + `SCAN` 模糊 key，绝不使用 `KEYS` |
 | 查询授权与期限 | ✅ | 授权记录带过期时间，Casbin 按活跃授权重建 |
 | 结果脱敏 | ✅ | 手机号、身份证、邮箱、银行卡按列名关键字匹配 |
-| 全链路审计 | ✅ | 成功/失败/拒绝全部留痕，数据库触发器禁止篡改 |
+| 全链路审计 | ✅ | 查询、数据源变更、审批动作全部留痕，表级触发器禁止篡改 |
+| Web 界面 | ✅ | React 18 + Ant Design，四个页面，菜单按角色动态渲染 |
+
+## 界面
+
+前端为 React 18 + Ant Design，四个页面：
+
+| 页面 | 可见角色 | 功能 |
+|---|---|---|
+| 数据查询 | 全部 | 选择数据源执行只读查询，结果自动脱敏 |
+| 申请授权 | 全部 | 查看可申请的数据源、提交申请、查看自己的申请进度 |
+| 数据源管理 | 全部可见，仅 DBA 可改 | 登记数据源，配置「是否开放申请 / 最长天数 / 可申请库表范围」 |
+| 授权审批 | DBA / superadmin | 审批申请，通过后授权立即生效 |
+
+侧边栏菜单按角色动态渲染：开发者看不到「授权审批」。
 
 ## API
 
@@ -34,8 +50,45 @@
 |---|---|---|---|
 | POST | `/api/v1/login` | 公开 | 换取 JWT |
 | GET | `/api/v1/datasources` | 已登录 | 数据源列表 |
-| POST | `/api/v1/datasources` | dba / superadmin | 登记数据源 |
+| GET | `/api/v1/datasources/:id` | 已登录 | 数据源详情 |
+| POST | `/api/v1/datasources` | dba / superadmin | 登记数据源（含可申请配置） |
+| PUT | `/api/v1/datasources/:id` | dba / superadmin | 修改数据源与可申请配置 |
+| DELETE | `/api/v1/datasources/:id` | dba / superadmin | 删除数据源 |
 | POST | `/api/v1/query/sql` | 需表级授权 | 执行只读查询 |
+| GET | `/api/v1/grant/applyable` | 已登录 | 列出开放申请的数据源 |
+| POST | `/api/v1/grant/requests` | 已登录 | 提交授权申请 |
+| GET | `/api/v1/grant/requests/mine` | 已登录 | 我的申请列表 |
+| GET | `/api/v1/grant/requests` | dba / superadmin | 按状态列出申请（默认 pending） |
+| POST | `/api/v1/grant/requests/:id/approve` | dba / superadmin | 审批通过 |
+| POST | `/api/v1/grant/requests/:id/reject` | dba / superadmin | 驳回（必须填原因） |
+| POST | `/api/v1/grant/requests/:id/cancel` | 申请人本人 | 撤销待审申请 |
+
+### 申请的三道校验
+
+提交申请时后端会依次校验，任何一条不满足都拒绝：
+
+1. 数据源已开启 `apply_enabled`
+2. 申请天数在 `1 ~ max_apply_days` 之间
+3. 申请的库表范围命中 `apply_scopes` 白名单
+
+**审批人不能审批自己的申请**，前后端都有拦截。单人 DBA 团队需要另一个 DBA 或 superadmin 来批。
+
+### 可申请配置示例
+
+管理员在数据源管理页配置：
+
+```json
+{
+  "apply_enabled": true,
+  "max_apply_days": 14,
+  "apply_scopes": [
+    { "database": "public", "tables": ["dw_probe"] },
+    { "database": "shop", "tables": [] }
+  ]
+}
+```
+
+`tables` 为空数组表示该库下**全部表**都可申请。`apply_scopes` 为空则任何人都申请不了。
 
 查询请求体示例：
 
@@ -60,7 +113,7 @@
 | 联邦查询 | Trino |
 | 缓存与队列 | Redis |
 | 权限 | Casbin |
-| 前端 | React 18 + TypeScript + Ant Design Pro |
+| 前端 | React 18 + TypeScript + Ant Design 5 + Vite |
 
 ## 快速开始
 
@@ -88,7 +141,7 @@ source .env.local
 createdb -h HOST -U USER datawarden_test
 ```
 
-### 运行
+### 运行后端
 
 ```bash
 # 启动服务（会自动执行数据库迁移）
@@ -103,6 +156,37 @@ go test ./... -short
 ```
 
 服务启动后默认监听 `:8080`。
+
+### 运行前端
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+访问 http://localhost:5173 。Vite 已配置 `/api` 代理到 `localhost:8080`，无需处理跨域。
+
+首次访问需要先有一个账号登录。系统不内置默认账号：
+
+```sql
+-- 用 bcrypt 生成密码哈希后插入
+INSERT INTO app_user (username, email, password_hash, role)
+VALUES ('admin', 'admin@example.com', '<bcrypt-hash>', 'superadmin');
+```
+
+### 常用流程
+
+1. **DBA 配置数据源**：数据源管理 → 新增，勾选「开放申请」，设置最长天数与可申请库表范围
+2. **开发者申请**：申请授权 → 选择数据源 → 选范围、填天数与理由 → 提交
+3. **DBA 审批**：授权审批 → 通过（可填意见）→ 授权立即生效，无需重启
+4. **开发者查询**：数据查询 → 选数据源、填库名与涉及的表 → 执行
+
+生产构建：
+
+```bash
+cd web && npm run build   # 产物在 web/dist
+```
 
 ### 冒烟验证
 
@@ -119,17 +203,6 @@ TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/login \
 curl -s http://localhost:8080/api/v1/datasources -H "Authorization: Bearer $TOKEN"
 ```
 
-### 创建初始用户
-
-系统不内置默认账号，首次使用需手工插入一个 superadmin：
-
-```sql
--- 先用 bcrypt 生成密码哈希，再插入
-INSERT INTO app_user (username, email, password_hash, role)
-VALUES ('admin', 'admin@example.com', '<bcrypt-hash>', 'superadmin');
-```
-
-密码哈希可用一小段 Go 代码生成：`auth.HashPassword("你的密码")`。
 
 ## 文档
 
