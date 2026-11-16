@@ -97,3 +97,14 @@ func buildRouter(t *testing.T, passwords map[string]string, role string) *gin.En
 		Query:       &QueryHandler{},
 	})
 }
+
+// recordingEnforcer 记录最后一次鉴权 object，便于断言。
+type recordingEnforcer struct {
+	allowed bool
+	lastObj string
+}
+
+func (r *recordingEnforcer) Enforce(subject, object, action string) bool {
+	r.lastObj = object
+	return r.allowed
+}

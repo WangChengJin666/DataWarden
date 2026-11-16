@@ -55,6 +55,7 @@
 | PUT | `/api/v1/datasources/:id` | dba / superadmin | 修改数据源与可申请配置 |
 | DELETE | `/api/v1/datasources/:id` | dba / superadmin | 删除数据源 |
 | POST | `/api/v1/query/sql` | 需表级授权 | 执行只读查询 |
+| POST | `/api/v1/query/redis` | 需 key 前缀授权 | 执行 Redis 查询（精确 key 或 SCAN 模式） |
 | GET | `/api/v1/grant/applyable` | 已登录 | 列出开放申请的数据源 |
 | POST | `/api/v1/grant/requests` | 已登录 | 提交授权申请 |
 | GET | `/api/v1/grant/requests/mine` | 已登录 | 我的申请列表 |
@@ -62,6 +63,33 @@
 | POST | `/api/v1/grant/requests/:id/approve` | dba / superadmin | 审批通过 |
 | POST | `/api/v1/grant/requests/:id/reject` | dba / superadmin | 驳回（必须填原因） |
 | POST | `/api/v1/grant/requests/:id/cancel` | 申请人本人 | 撤销待审申请 |
+
+### Redis 查询
+
+Redis 没有表的概念，鉴权用 key 前缀。申请范围写成 `<db号>:<key前缀>`，例如 `37:user:1001`，
+平台会把它转成鉴权对象 `ds:<数据源ID>:37:user:1001`。
+
+**前缀授权自动向下覆盖。** 授权 `user:1001` 后可以查 `user:1001:name`、`user:1001:profile`
+等所有子 key，但查不到 `user:1002:name`。实现方式是对目标 key 逐级向上生成候选
+（`user:1001:name` → `user:1001:*` → `user:1001` → `user:*` → `user` → `*`），
+任意一个命中即放行。
+
+请求示例：
+
+```json
+// 精确查询
+{ "datasource_id": 2, "key": "user:1001:name" }
+
+// 模糊查询（必须带至少 2 个有效字符的前缀）
+{ "datasource_id": 2, "pattern": "user:1001:*" }
+```
+
+模糊查询走 `SCAN` 游标遍历，**绝不使用 `KEYS`**（`internal/redisq/safety_test.go`
+通过解析源码强制这条规则，有人写 `Keys()` 会直接测试失败）。前缀去掉分隔符后不足 2 个字符
+的模式会被拒绝，避免退化成接近全库扫描。
+
+数据源配置里 `database` 字段填 Redis 的 **db 号**（如 `37`），密码通过 `secret_ref`
+指向环境变量（格式 `env:VAR_NAME`）。
 
 ### 申请的三道校验
 

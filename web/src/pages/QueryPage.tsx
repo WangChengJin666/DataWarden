@@ -14,8 +14,8 @@ import {
   Typography,
 } from 'antd'
 import { PlayCircleOutlined } from '@ant-design/icons'
-import { executeSQL, listDatasources } from '@/api/client'
-import type { Datasource, QueryResult } from '@/api/types'
+import { executeRedis, executeSQL, listDatasources } from '@/api/client'
+import type { Datasource, QueryResult, RedisQueryResult } from '@/api/types'
 
 const { Text, Paragraph } = Typography
 
@@ -30,6 +30,7 @@ export default function QueryPage() {
   const [result, setResult] = useState<QueryResult | null>(null)
   const [redisMode, setRedisMode] = useState<'exact' | 'scan'>('exact')
   const [redisKey, setRedisKey] = useState('')
+  const [redisResult, setRedisResult] = useState<RedisQueryResult | null>(null)
 
   useEffect(() => {
     void (async () => {
@@ -68,13 +69,33 @@ export default function QueryPage() {
     } else if (!redisKey.trim()) {
       message.warning('请输入 key 或 key 模式')
       return
+    } else if (redisMode === 'exact' && /[*?[]/.test(redisKey)) {
+      // 用户在「精确 Key」里填了通配符，多半是想模糊查询，明确引导而不是静默返回空
+      message.warning('精确查询不支持通配符，请切换到「模糊 Key」标签页')
+      return
+    } else if (redisMode === 'scan' && !/[*?[]/.test(redisKey)) {
+      message.warning('模糊查询需要带通配符（如 user:1001:*），精确 key 请用「精确 Key」')
+      return
+    } else if (redisMode === 'scan') {
+      // 与服务端规则保持一致：取第一个通配符之前的部分，去掉分隔符后至少 2 个字符
+      const prefix = redisKey.split(/[*?[]/)[0].replace(/[:.\-_/]/g, '')
+      if (prefix.length < 2) {
+        message.warning('模糊查询的前缀至少需要 2 个有效字符，否则扫描范围过宽')
+        return
+      }
     }
 
     setLoading(true)
     setResult(null)
+    setRedisResult(null)
     try {
       if (isRedis) {
-        message.info('Redis 查询通道在后续版本接入，当前后端尚未开放该接口')
+        const payload =
+          redisMode === 'exact'
+            ? { datasource_id: datasourceId, key: redisKey.trim() }
+            : { datasource_id: datasourceId, pattern: redisKey.trim() }
+        const res = await executeRedis(payload)
+        setRedisResult(res)
         return
       }
       const res = await executeSQL({
@@ -91,6 +112,68 @@ export default function QueryPage() {
       setLoading(false)
     }
   }
+
+  // Redis 结果：key / 类型 / 值 / TTL。hash 类型把 fields 展开成一行。
+  const redisTable = redisResult ? (
+    <Space direction="vertical" style={{ width: '100%' }}>
+      <Space wrap>
+        <Text type="secondary">
+          返回 {redisResult.items.length} 个 key，耗时 {redisResult.elapsed_ms} ms
+        </Text>
+        <Tag color={redisResult.exact ? 'blue' : 'default'}>
+          {redisResult.exact ? '精确查询' : 'SCAN 模糊查询'}
+        </Tag>
+        {redisResult.truncated ? <Tag color="warning">结果已截断</Tag> : null}
+      </Space>
+      <Table
+        size="small"
+        rowKey={(r) => r.key}
+        dataSource={redisResult.items}
+        locale={{ emptyText: '没有匹配的 key' }}
+        columns={[
+          {
+            title: 'Key',
+            dataIndex: 'key',
+            width: 260,
+            ellipsis: true,
+            render: (v: string) => <Text code>{v}</Text>,
+          },
+          {
+            title: '类型',
+            dataIndex: 'type',
+            width: 100,
+            render: (v: string) => <Tag>{v}</Tag>,
+          },
+          {
+            title: '值',
+            ellipsis: true,
+            render: (_, r) =>
+              r.fields ? (
+                <Text style={{ fontSize: 13 }}>
+                  {Object.entries(r.fields)
+                    .map(([k, val]) => `${k}=${val}`)
+                    .join(', ')}
+                </Text>
+              ) : (
+                <Text style={{ fontSize: 13 }}>{r.value ?? ''}</Text>
+              ),
+          },
+          {
+            title: 'TTL',
+            dataIndex: 'ttl',
+            width: 100,
+            render: (v: number) =>
+              v > 0 ? <Text type="secondary">{v}s</Text> : <Text type="secondary">永久</Text>,
+          },
+        ]}
+        scroll={{ x: 'max-content', y: 420 }}
+        pagination={{ pageSize: 50, showSizeChanger: false }}
+      />
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        提示：Redis 结果不做脱敏（值是二进制安全的原始内容），授权范围本身已限制可见的 key 前缀。
+      </Text>
+    </Space>
+  ) : null
 
   const resultTable = result ? (
     <Space direction="vertical" style={{ width: '100%' }}>
@@ -229,6 +312,7 @@ export default function QueryPage() {
       </Card>
 
       {result ? <Card title="查询结果">{resultTable}</Card> : null}
+      {redisResult ? <Card title="Redis 查询结果">{redisTable}</Card> : null}
 
       <Paragraph type="secondary" style={{ fontSize: 12 }}>
         提示：所有查询都会记录审计日志，包含 SQL、涉及表、返回行数与耗时。

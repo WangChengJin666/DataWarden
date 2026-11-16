@@ -12,6 +12,7 @@ type Deps struct {
 	Datasource  *DatasourceHandler
 	Query       *QueryHandler
 	GrantReq    *GrantRequestHandler
+	Redis       *RedisHandler
 	// Auditor 用于记录数据源管理与审批动作，可为 nil
 	Auditor EventRecorder
 }
@@ -40,6 +41,9 @@ func NewRouter(d Deps) *gin.Engine {
 
 		// 查询
 		authed.POST("/query/sql", d.Query.ExecuteSQL)
+		if d.Redis != nil {
+			authed.POST("/query/redis", d.Redis.Query)
+		}
 
 		// 授权申请
 		if d.GrantReq != nil {

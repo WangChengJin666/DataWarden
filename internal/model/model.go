@@ -92,18 +92,18 @@ const (
 // GrantRequest 是开发者提交的数据源授权申请。
 // 审批通过后生成一条 Grant（生效授权），并在本记录上回填 grant_id。
 type GrantRequest struct {
-	ID            int64              `json:"id"`
-	UserID        int64              `json:"user_id"`
-	Username      string             `json:"username,omitempty"` // 列表展示用，非表字段
-	DatasourceID  int64              `json:"datasource_id"`
-	DatasourceName string            `json:"datasource_name,omitempty"`
-	Scope         string             `json:"scope"`
-	Days          int                `json:"days"`
-	Reason        string             `json:"reason"`
-	Status        GrantRequestStatus `json:"status"`
-	ReviewerID    *int64             `json:"reviewer_id,omitempty"`
-	ReviewComment string             `json:"review_comment"`
-	ReviewedAt    *time.Time         `json:"reviewed_at,omitempty"`
-	GrantID       *int64             `json:"grant_id,omitempty"`
-	CreatedAt     time.Time          `json:"created_at"`
+	ID             int64              `json:"id"`
+	UserID         int64              `json:"user_id"`
+	Username       string             `json:"username,omitempty"` // 列表展示用，非表字段
+	DatasourceID   int64              `json:"datasource_id"`
+	DatasourceName string             `json:"datasource_name,omitempty"`
+	Scope          string             `json:"scope"`
+	Days           int                `json:"days"`
+	Reason         string             `json:"reason"`
+	Status         GrantRequestStatus `json:"status"`
+	ReviewerID     *int64             `json:"reviewer_id,omitempty"`
+	ReviewComment  string             `json:"review_comment"`
+	ReviewedAt     *time.Time         `json:"reviewed_at,omitempty"`
+	GrantID        *int64             `json:"grant_id,omitempty"`
+	CreatedAt      time.Time          `json:"created_at"`
 }

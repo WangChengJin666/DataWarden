@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +20,8 @@ import (
 	"github.com/opensourceprj/datawarden/internal/httpapi"
 	"github.com/opensourceprj/datawarden/internal/model"
 	"github.com/opensourceprj/datawarden/internal/querysvc"
+	"github.com/opensourceprj/datawarden/internal/redisq"
+	"github.com/opensourceprj/datawarden/internal/secret"
 	"github.com/opensourceprj/datawarden/internal/store"
 )
 
@@ -53,6 +57,7 @@ func main() {
 	grantStore := store.NewGrantStore(pool)
 	grantReqStore := store.NewGrantRequestStore(pool)
 	auditLogger := audit.NewLogger(pool)
+	secretResolver := secret.NewEnvResolver()
 	issuer := auth.NewTokenIssuer(cfg.JWTSecret, 12*time.Hour)
 
 	enforcer, err := authz.NewEnforcer()
@@ -94,7 +99,11 @@ func main() {
 		Datasource:  &httpapi.DatasourceHandler{Store: dsStore},
 		Query: &httpapi.QueryHandler{
 			Service: querySvc,
-			Factory: makeAdapterFactory(ctx, dsStore, cfg),
+			Factory: makeAdapterFactory(ctx, dsStore, secretResolver, cfg),
+		},
+		Redis: &httpapi.RedisHandler{
+			Enforcer: enforcer,
+			Factory:  makeRedisTargetFactory(ctx, dsStore, secretResolver, cfg),
 		},
 		GrantReq: &httpapi.GrantRequestHandler{
 			Requests: grantReqStore,
@@ -152,13 +161,80 @@ func syncAuthz(ctx context.Context, e *authz.Enforcer, users *store.UserStore, g
 	return e.SyncGrants(policies)
 }
 
+// makeRedisTargetFactory 按数据源 ID 构造 Redis 查询目标。
+// db 号来自数据源的 database 字段（Redis 存 db index），密码来自 secret_ref。
+func makeRedisTargetFactory(ctx context.Context, dsStore *store.DatasourceStore, resolver secret.Resolver, cfg *config.Config) httpapi.RedisTargetFactory {
+	return func(ctx context.Context, datasourceID int64) (*httpapi.RedisTarget, error) {
+		ds, err := dsStore.Get(ctx, datasourceID)
+		if err != nil {
+			return nil, err
+		}
+		if ds.Type != model.TypeRedis {
+			return nil, fmt.Errorf("datasource %d is not a redis datasource", datasourceID)
+		}
+
+		dbIndex, err := redisq.ParseDBIndex(ds.Database)
+		if err != nil {
+			return nil, err
+		}
+
+		password, err := resolver.Password(ds.SecretRef)
+		if err != nil {
+			return nil, err
+		}
+
+		// 缓存连接：相同数据源复用同一 client，避免每次查询重新握手
+		client, err := redisClients.get(datasourceID, ds, password, dbIndex, cfg.RedisScanMaxKeys)
+		if err != nil {
+			return nil, err
+		}
+
+		return &httpapi.RedisTarget{
+			Query:    redisq.NewQueryService(client, cfg.RedisScanMaxKeys),
+			Database: dbIndex,
+		}, nil
+	}
+}
+
+// redisClientCache 复用 Redis 连接，避免每次查询都重新 AUTH。
+type redisClientCache struct {
+	mu      sync.Mutex
+	clients map[int64]*redisq.Client
+}
+
+var redisClients = &redisClientCache{clients: map[int64]*redisq.Client{}}
+
+func (c *redisClientCache) get(id int64, ds *model.Datasource, password string, dbIndex, maxKeys int) (*redisq.Client, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if cl, ok := c.clients[id]; ok {
+		return cl, nil
+	}
+	addr := fmt.Sprintf("%s:%d", ds.Host, ds.Port)
+	cl, err := redisq.NewClient(addr, password, dbIndex, maxKeys)
+	if err != nil {
+		return nil, err
+	}
+	c.clients[id] = cl
+	return cl, nil
+}
+
 // makeAdapterFactory 按数据源 ID 构造 SQL Adapter。
 // 当前所有数据源共用一组环境变量账号，生产环境应改为按数据源从密钥管理读取。
-func makeAdapterFactory(ctx context.Context, dsStore *store.DatasourceStore, cfg *config.Config) httpapi.AdapterFactory {
+func makeAdapterFactory(ctx context.Context, dsStore *store.DatasourceStore, resolver secret.Resolver, cfg *config.Config) httpapi.AdapterFactory {
 	return func(datasourceID int64) (adapter.Adapter, error) {
 		ds, err := dsStore.Get(ctx, datasourceID)
 		if err != nil {
 			return nil, err
+		}
+		password, err := resolver.Password(ds.SecretRef)
+		if err != nil {
+			return nil, err
+		}
+		if password == "" {
+			// 回落到全局配置，兼容阶段一的写法
+			password = cfg.DBPasswordForQuery
 		}
 		return adapter.New(adapter.ConnConfig{
 			Type:     string(ds.Type),
@@ -166,7 +242,7 @@ func makeAdapterFactory(ctx context.Context, dsStore *store.DatasourceStore, cfg
 			Port:     ds.Port,
 			Database: ds.Database,
 			User:     cfg.DBUserForQuery,
-			Password: cfg.DBPasswordForQuery,
+			Password: password,
 		})
 	}
 }

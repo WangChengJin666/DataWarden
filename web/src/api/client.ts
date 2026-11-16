@@ -5,6 +5,7 @@ import type {
   GrantRequest,
   LoginResponse,
   QueryResult,
+  RedisQueryResult,
 } from './types'
 
 const TOKEN_KEY = 'dw_token'
@@ -145,5 +146,15 @@ export async function executeSQL(payload: {
   row_limit?: number
 }): Promise<QueryResult> {
   const { data } = await http.post<QueryResult>('/query/sql', payload)
+  return data
+}
+
+export async function executeRedis(payload: {
+  datasource_id: number
+  key?: string
+  pattern?: string
+  row_limit?: number
+}): Promise<RedisQueryResult> {
+  const { data } = await http.post<RedisQueryResult>('/query/redis', payload)
   return data
 }

@@ -71,3 +71,19 @@ export interface LoginResponse {
   token: string
   role: Role
 }
+
+// Redis 查询结果。与 SQL 结果结构不同：Redis 是键值对，hash 类型带 fields。
+export interface RedisKeyValue {
+  key: string
+  type: string
+  value?: string
+  fields?: Record<string, string>
+  ttl: number
+}
+
+export interface RedisQueryResult {
+  exact: boolean
+  items: RedisKeyValue[]
+  truncated: boolean
+  elapsed_ms: number
+}
