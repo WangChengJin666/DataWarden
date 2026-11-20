@@ -20,10 +20,20 @@ export interface Datasource {
   /** 连接目标库使用的账号 */
   username: string
   /**
+   * 仅 MongoDB：账号所在的认证库（authSource）。
+   * 留空表示与 database 相同。建在 admin 库的管理员账号需填 admin。
+   */
+  auth_source: string
+  /**
    * 是否已设置密码。
    * 后端永远不会返回密码本身，无论它在库里是明文还是密文。
    */
   has_password: boolean
+  /**
+   * 连接密码明文，只在「DBA 编辑数据源」时由详情接口返回，用于直接填进编辑框。
+   * 列表接口不返回该字段。没有配置密码时该字段不存在。
+   */
+  password?: string
   created_at: string
   apply_enabled: boolean
   max_apply_days: number
@@ -43,6 +53,8 @@ export interface DatasourceInput {
    * 平台按明文保存，不会加密。
    */
   password?: string
+  /** 仅 MongoDB：账号所在的认证库，留空表示与 database 相同。 */
+  auth_source?: string
   apply_enabled: boolean
   max_apply_days: number
   apply_scopes: ApplyScope[]

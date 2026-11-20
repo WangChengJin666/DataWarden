@@ -170,6 +170,8 @@ export async function testDatasourceConnection(payload: {
   username?: string
   /** 编辑场景可留空，后端会用已存的密码测试 */
   password?: string
+  /** 仅 MongoDB：账号所在的认证库，留空表示与 database 相同 */
+  auth_source?: string
   datasource_id?: number
 }): Promise<TestConnResult> {
   const { data } = await http.post<TestConnResult>('/datasources/test', payload)

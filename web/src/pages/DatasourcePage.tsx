@@ -30,6 +30,7 @@ import {
   createDatasource,
   deleteDatasource,
   getCurrentUser,
+  getDatasource,
   listDatasources,
   testDatasourceConnection,
   updateDatasource,
@@ -172,6 +173,8 @@ export default function DatasourcePage() {
       // 用户点了按钮却没有任何反馈，很难理解是哪里没填。
       type: 'postgresql',
       port: 5432,
+      // 认证库留空表示与默认库相同，这也是 MongoDB 的默认行为
+      auth_source: '',
       apply_enabled: false,
       max_apply_days: 7,
       apply_scopes: [],
@@ -190,7 +193,11 @@ export default function DatasourcePage() {
       port: record.port,
       database: record.database,
       username: record.username,
-      // 密码不回填：后端不返回密码，留空即表示不修改
+      // 认证库要一起带进表单，否则编辑时会被空值覆盖掉，
+      // 账号建在 admin 的数据源保存后就再也连不上了。
+      auth_source: record.auth_source ?? '',
+      // 先留空，随后用详情接口拿到的明文填进去。
+      // 列表接口不回显密码（一次带走全部凭据），只有详情接口返回。
       password: undefined,
       apply_enabled: record.apply_enabled,
       max_apply_days: record.max_apply_days,
@@ -198,6 +205,16 @@ export default function DatasourcePage() {
       description: record.description,
     })
     setModalOpen(true)
+    // 详情接口返回明文密码，直接填进密码框，省去管理员去翻密码本的步骤。
+    // 用 setFieldValue 单独写而不是塞进上面的 setFieldsValue：
+    // 它依赖一次异步请求，晚于弹窗打开，不能和初始值一起写。
+    if (record.has_password) {
+      getDatasource(record.id)
+        .then((d) => form.setFieldValue('password', d.password ?? ''))
+        .catch(() => {
+          // 取不到就保持空，按钮旁的提示会说明「留空表示不修改」
+        })
+    }
   }
 
   const submit = async () => {
@@ -267,6 +284,9 @@ export default function DatasourcePage() {
         database: form.getFieldValue('database'),
         username: form.getFieldValue('username'),
         password: form.getFieldValue('password') || undefined,
+        // MongoDB 必须把认证库一起送过去：后端用的是表单里的值，
+        // 不传就会退回「按默认库认证」，测出来的结果和保存后不一致。
+        auth_source: form.getFieldValue('auth_source') || undefined,
         datasource_id: editing?.id,
       })
       setTestResult(res)
@@ -448,9 +468,21 @@ export default function DatasourcePage() {
       }
     >
       {!isDBA ? (
-        <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
-          当前角色为开发者，仅可查看数据源。管理操作需要 DBA 或超级管理员权限。
-        </Text>
+        // 正常路径下开发者已经进不来这个页面（侧边栏隐藏 + 路由拦截），
+        // 这里只是兜底：权限是后加的，可能有人收藏了旧链接。
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="数据源管理不开放给开发者"
+          description={
+            <span>
+              数据源的登记、编辑、删除由 DBA 负责。开发者需要连接库时，请到
+              <Text strong>「申请授权」</Text>
+              页提交申请，由 DBA 审批后获得对应库表的只读授权。
+            </span>
+          }
+        />
       ) : null}
 
       {isDBA ? (
@@ -461,7 +493,8 @@ export default function DatasourcePage() {
           message="密码以明文保存"
           description={
             <span>
-              各数据源的连接密码以明文存入平台元数据库，接口不会返回密码，但任何能读取
+              各数据源的连接密码以明文存入平台元数据库，接口只回显掩码（如{' '}
+              <Text code>s3cr******</Text>），不返回明文，但任何能读取
               <Text code>datasource</Text> 表的人（含 DBA、数据库备份文件、误发的 dump）
               都能直接看到。请为每个数据源使用<Text strong>只读账号</Text>，
               并对平台元数据库做好访问控制与备份加密。
@@ -534,6 +567,10 @@ export default function DatasourcePage() {
                   // 切到不需要账号的类型时清掉残留值，避免把上一次填的账号带进 Redis
                   if (!usernamePolicy[v].required) {
                     form.setFieldValue('username', '')
+                  }
+                  // 认证库只有 MongoDB 用，切走就清掉，否则会给其他类型存下一个无意义的值
+                  if (v !== 'mongodb') {
+                    form.setFieldValue('auth_source', '')
                   }
                 }}
               />
@@ -608,17 +645,33 @@ export default function DatasourcePage() {
               }
               extra={
                 editing && editing.has_password
-                  ? '留空表示不修改现有密码'
+                  ? '已回显当前密码，可直接修改；清空则保留原密码'
                   : '密码以明文存入平台库，请使用只读账号'
               }
               style={{ flex: 1 }}
             >
               <Input.Password
-                placeholder={editing && editing.has_password ? '不修改请留空' : '请输入密码'}
-                autoComplete="new-password"
+                placeholder="请输入密码"
+                // 关掉浏览器的自动填充/自动保存提示：
+                // 密码是直接从接口回显的，浏览器若再介入可能覆盖或提示保存。
+                autoComplete="off"
               />
             </Form.Item>
           </Space>
+
+          {/* 认证库只对 MongoDB 有意义：账号归属于某个库，
+              用错库会在服务端表现成「认证失败」，而密码其实是对的。
+              其他类型不渲染，避免多出一个看不懂的字段。 */}
+          {currentType === 'mongodb' ? (
+            <Form.Item
+              name="auth_source"
+              label="认证库（authSource）"
+              extra="账号建在哪个库就填哪个。全局管理员账号填 admin；不填则按上面的默认库认证。"
+              style={{ maxWidth: 360 }}
+            >
+              <Input placeholder="留空 = 与默认库相同；管理员账号填 admin" autoComplete="off" />
+            </Form.Item>
+          ) : null}
 
           {testResult ? (
             <Alert
@@ -642,7 +695,7 @@ export default function DatasourcePage() {
           ) : null}
 
           <Form.Item name="description" label="描述">
-            <Input.TextArea rows={2} placeholder="给开发者看的说明，会显示在申请页" />
+            <Input.TextArea rows={2} placeholder="给开发者看的说明，会显示在「申请授权」页" />
           </Form.Item>
 
           <Divider orientation="left" plain>
@@ -654,7 +707,7 @@ export default function DatasourcePage() {
               name="apply_enabled"
               label="开放申请"
               valuePropName="checked"
-              extra="关闭后开发者无法在申请页看到该数据源"
+              extra="关闭后开发者无法在「申请授权」页看到该数据源"
             >
               <Switch />
             </Form.Item>
@@ -670,7 +723,7 @@ export default function DatasourcePage() {
           <Form.Item
             name="apply_scopes"
             label="允许申请的库表范围"
-            extra="库名 + 表名列表；表名留空表示该库下全部表。未配置范围则任何人都无法申请。"
+            extra="库名 + 表名列表；表名留空表示该库下全部表。未配置范围的数据源，即使开启申请也无人能提交申请。"
           >
             <ScopeList />
           </Form.Item>

@@ -27,21 +27,26 @@ export default function AppLayout() {
   const isDBA = ['dba', 'superadmin'].includes(user?.role ?? '')
 
   const items = useMemo(() => {
+    // 数据源管理只对 DBA / 超级管理员开放：
+    // 里面是主机、端口、库名、连接账号和密码配置，开发者用不到，
+    // 也不该看到。不放在菜单里，避免点进去才发现无权操作。
     const base = [
       { key: '/query', icon: <SearchOutlined />, label: <Link to="/query">数据查询</Link> },
       { key: '/apply', icon: <FileProtectOutlined />, label: <Link to="/apply">申请授权</Link> },
-      {
-        key: '/datasources',
-        icon: <DatabaseOutlined />,
-        label: <Link to="/datasources">数据源管理</Link>,
-      },
     ]
     if (isDBA) {
-      base.push({
-        key: '/review',
-        icon: <AuditOutlined />,
-        label: <Link to="/review">授权审批</Link>,
-      })
+      base.push(
+        {
+          key: '/datasources',
+          icon: <DatabaseOutlined />,
+          label: <Link to="/datasources">数据源管理</Link>,
+        },
+        {
+          key: '/review',
+          icon: <AuditOutlined />,
+          label: <Link to="/review">授权审批</Link>,
+        },
+      )
     }
     return base
   }, [isDBA])
