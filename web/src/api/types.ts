@@ -19,15 +19,18 @@ export interface Datasource {
   database: string
   /** 连接目标库使用的账号 */
   username: string
-  /**
-   * 仅 MongoDB：账号所在的认证库（authSource）。
-   * 留空表示与 database 相同。建在 admin 库的管理员账号需填 admin。
-   */
+  /** 仅 MongoDB：账号所在的认证库（authSource）。留空回落 admin。 */
   auth_source: string
   /**
    * 是否已设置密码。
    * 后端永远不会返回密码本身，无论它在库里是明文还是密文。
    */
+  /**
+   * 连接高级参数，透传给驱动。
+   * MongoDB：replicaSet / tls / tlsCAFile / tlsInsecure / readPreference 等
+   * PostgreSQL：sslmode
+   */
+  options: Record<string, string>
   has_password: boolean
   /**
    * 连接密码明文，只在「DBA 编辑数据源」时由详情接口返回，用于直接填进编辑框。
@@ -53,8 +56,10 @@ export interface DatasourceInput {
    * 平台按明文保存，不会加密。
    */
   password?: string
-  /** 仅 MongoDB：账号所在的认证库，留空表示与 database 相同。 */
+  /** 仅 MongoDB：账号所在的认证库，留空表示 admin。 */
   auth_source?: string
+  /** 连接高级参数，键值透传给驱动（见 Datasource.options）。 */
+  options?: Record<string, string>
   apply_enabled: boolean
   max_apply_days: number
   apply_scopes: ApplyScope[]
@@ -62,6 +67,47 @@ export interface DatasourceInput {
 }
 
 export type GrantRequestStatus = 'pending' | 'approved' | 'rejected' | 'canceled'
+
+/** 已生效的授权。与 GrantRequest 不同：这是「现在真的能查」的记录。 */
+export interface GrantView {  id: number
+  user_id: number
+  username: string
+  datasource_id: number
+  datasource_name: string
+  /** 形如 "db:*" 或 "db:tbl1,db:tbl2" */
+  scope: string
+  action: string
+  expires_at: string
+  created_at: string
+}
+
+/**
+ * 授权范围的结构化形态。
+ * 后端已经把 "shop" / "shop:*" / "shop:orders,users" 三种写法归一，
+ * 前端不需要再解析字符串。
+ */
+export interface ScopeView {
+  database: string
+  /** 空数组表示整库授权（对应后端的 "shop" 或 "shop:*"） */
+  tables: string[]
+}
+
+/**
+ * 「我能查的数据源」——查询页下拉用。
+ *
+ * 与 Datasource 的区别：不含 host / port / username，
+ * 这些是内网拓扑与账号信息，只该给管理员看。
+ */
+export interface DatasourceBrief {
+  id: number
+  name: string
+  type: DatasourceType
+  description: string
+  /** 数据源配置的默认库，用于预填查询表单（Redis 下是 db 号） */
+  database: string
+  /** 我在这个数据源上的授权范围（已结构化，无需再 split） */
+  scopes: ScopeView[]
+}
 
 export interface GrantRequest {
   id: number

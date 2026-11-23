@@ -1,9 +1,11 @@
 import axios, { AxiosError } from 'axios'
 import type {
   Datasource,
+  DatasourceBrief,
   DatasourceInput,
   DatasourceType,
   GrantRequest,
+  GrantView,
   LoginResponse,
   QueryResult,
   RedisQueryResult,
@@ -138,6 +140,68 @@ export async function cancelRequest(id: number): Promise<void> {
   await http.post(`/grant/requests/${id}/cancel`)
 }
 
+// ---------- 已生效授权 ----------
+
+/**
+ * 列出「我能查的数据源」。
+ *
+ * 查询页必须用这个而不是 listDatasources()：后者走 GET /datasources，
+ * 路由限 DBA，开发者调用会 403，下拉变成空的，什么都查不了。
+ * 而且它返回的是一份精简视图，不含 host/port/username。
+ */
+export async function listMyDatasources(): Promise<DatasourceBrief[]> {
+  const { data } = await http.get<{ items: DatasourceBrief[] }>('/grants/mine')
+  return data.items ?? []
+}
+
+export async function listActiveGrants(): Promise<GrantView[]> {
+  const { data } = await http.get<{ items: GrantView[] }>('/grants')
+  return data.items ?? []
+}
+
+export async function revokeGrant(id: number): Promise<void> {
+  await http.post(`/grants/${id}/revoke`)
+}
+
+// ---------- 元数据（库 / 表 / 字段） ----------
+
+/**
+ * 列出数据源上当前用户可见的库。
+ *
+ * 后端会按授权过滤，所以返回为空有两种可能：
+ *   1. 没有任何授权
+ *   2. 账号只有单库权限，列不出全量库名
+ * 两种情况下前端都退回「手填」，不当作错误处理。
+ */
+export async function listDatabases(datasourceId: number): Promise<string[]> {
+  const { data } = await http.get<{ items: string[] }>(
+    `/datasources/${datasourceId}/databases`,
+  )
+  return data.items ?? []
+}
+
+/** 列出指定库下当前用户可见的表 / 集合。 */
+export async function listTables(datasourceId: number, db: string): Promise<string[]> {
+  const { data } = await http.get<{ items: string[] }>(
+    `/datasources/${datasourceId}/tables`,
+    { params: { db } },
+  )
+  return data.items ?? []
+}
+
+/** 列出表的字段名，供 SQL 编辑器做列名补全。 */
+export async function listColumns(
+  datasourceId: number,
+  db: string,
+  table: string,
+): Promise<string[]> {
+  const { data } = await http.get<{ items: string[] }>(
+    `/datasources/${datasourceId}/columns`,
+    { params: { db, table } },
+  )
+  return data.items ?? []
+}
+
 // ---------- 查询 ----------
 
 export async function executeSQL(payload: {
@@ -170,8 +234,10 @@ export async function testDatasourceConnection(payload: {
   username?: string
   /** 编辑场景可留空，后端会用已存的密码测试 */
   password?: string
-  /** 仅 MongoDB：账号所在的认证库，留空表示与 database 相同 */
+  /** 仅 MongoDB：账号所在的认证库，留空回落 admin */
   auth_source?: string
+  /** 连接高级参数，必须与保存时一致的同一套 */
+  options?: Record<string, string>
   datasource_id?: number
 }): Promise<TestConnResult> {
   const { data } = await http.post<TestConnResult>('/datasources/test', payload)

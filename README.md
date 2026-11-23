@@ -21,7 +21,7 @@
 |---|---|---|
 | 用户登录与 JWT 鉴权 | ✅ | bcrypt 密码哈希，令牌含角色 |
 | 角色权限（developer / dba / superadmin） | ✅ | Casbin 策略，库级 `*` 通配 |
-| 数据源管理 | ✅ | 增删改查，仅 DBA 可操作 |
+| 数据源管理 | ✅ | 增删改查，仅 DBA / superadmin 可访问（列表与详情同样限权） |
 | 可申请数据源配置 | ✅ | 按数据源设置是否开放、最长天数、可申请库表范围 |
 | 授权申请与审批 | ✅ | 提交 → DBA 审批 → 授权即时生效；禁止自审 |
 | PostgreSQL / MySQL 受控查询 | ✅ | 只读白名单、强制限行、超时中断 |
@@ -30,28 +30,49 @@
 | 查询授权与期限 | ✅ | 授权记录带过期时间，Casbin 按活跃授权重建 |
 | 结果脱敏 | ✅ | 手机号、身份证、邮箱、银行卡按列名关键字匹配 |
 | 全链路审计 | ✅ | 查询、数据源变更、审批动作全部留痕，表级触发器禁止篡改 |
-| Web 界面 | ✅ | React 18 + Ant Design，四个页面，菜单按角色动态渲染 |
+| Web 界面 | ✅ | React 18 + Ant Design + CodeMirror 6，五个页面，菜单按角色动态渲染 |
 
 ## 界面
 
-前端为 React 18 + Ant Design，四个页面：
+前端为 React 18 + Ant Design + CodeMirror 6，五个页面：
 
 | 页面 | 可见角色 | 功能 |
 |---|---|---|
-| 数据查询 | 全部 | 选择数据源执行只读查询，结果自动脱敏 |
+| 数据查询 | 全部 | 选择数据源执行只读查询，结果自动脱敏；SQL 编辑器带表名/字段名补全 |
 | 申请授权 | 全部 | 查看可申请的数据源、提交申请、查看自己的申请进度 |
-| 数据源管理 | 全部可见，仅 DBA 可改 | 登记数据源，配置「是否开放申请 / 最长天数 / 可申请库表范围」 |
+| 数据源管理 | DBA / superadmin | 登记数据源，配置「是否开放申请 / 最长天数 / 可申请库表范围 / 高级连接参数」 |
 | 授权审批 | DBA / superadmin | 审批申请，通过后授权立即生效 |
+| 授权管理 | DBA / superadmin | 查看生效中的授权，可立即收回 |
 
-侧边栏菜单按角色动态渲染：开发者看不到「授权审批」。
+侧边栏菜单按角色动态渲染：开发者只看到「数据查询」和「申请授权」，看不到 DBA 的三个页面；
+直接访问 `/datasources` 会被重定向回「申请授权」，接口层同样返回 403。
+
+### SQL 编辑器的补全
+
+编辑器是 CodeMirror 6 + `@codemirror/lang-sql`，补全候选来自元数据接口：
+
+1. **库**：进入页面或切换数据源时按 `GET /datasources/:id/databases` 拉取（后端按授权过滤）
+2. **表**：选定库后按 `GET /datasources/:id/tables?db=` 拉取，页面上是**多选**——
+   SQL 查询的鉴权就是按这个清单逐表判定的，手打字拼错一个字母就是 403
+3. **字段**：选中表后按 `GET /datasources/:id/columns?db=&table=` 拉取，
+   组织成 `{库: {表: [字段...]}}` 交给 lang-sql，输入 `表名.` 时弹出该表的字段
+
+只把**已选表**的字段放进 schema，不放整个库：全量候选会有几千条，
+而且用户没权限的表本来就不该出现在补全列表里。
+
+字段接口对 MongoDB 走「采样一条文档取键名」——Mongo 没有列定义，只能采样；
+空集合取不到字段，界面上会显示成「未采样」而不是报错。
+
+**库表未授权时补全退回手填：** 账号只有单库权限时 `ListDatabases` 会失败，
+前端不报错，只把下拉变成可自由输入，不阻断查询。
 
 ## API
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
 | POST | `/api/v1/login` | 公开 | 换取 JWT |
-| GET | `/api/v1/datasources` | 已登录 | 数据源列表 |
-| GET | `/api/v1/datasources/:id` | 已登录 | 数据源详情 |
+| GET | `/api/v1/datasources` | dba / superadmin | 数据源列表（只返回 `has_password`） |
+| GET | `/api/v1/datasources/:id` | dba / superadmin | 数据源详情（含明文 `password`，供编辑框直接回显） |
 | POST | `/api/v1/datasources` | dba / superadmin | 登记数据源（含可申请配置） |
 | PUT | `/api/v1/datasources/:id` | dba / superadmin | 修改数据源与可申请配置 |
 | DELETE | `/api/v1/datasources/:id` | dba / superadmin | 删除数据源 |
@@ -59,6 +80,11 @@
 | POST | `/api/v1/query/sql` | 需表级授权 | 执行只读查询 |
 | POST | `/api/v1/query/redis` | 需 key 前缀授权 | 执行 Redis 查询（精确 key 或 SCAN 模式） |
 | POST | `/api/v1/query/mongo` | 需集合级授权 | 执行 MongoDB 查询（集合+过滤 或 原生命令） |
+| GET | `/api/v1/datasources/:id/databases` | 已登录 | 列出可见的库（按授权过滤） |
+| GET | `/api/v1/datasources/:id/tables?db=` | 已登录 | 列出库下可见的表（按授权过滤） |
+| GET | `/api/v1/datasources/:id/columns?db=&table=` | 需表级授权 | 列出表的字段（供编辑器补全） |
+| GET | `/api/v1/grants` | dba / superadmin | 列出生效中的授权 |
+| POST | `/api/v1/grants/:id/revoke` | dba / superadmin | 立即收回一条授权 |
 | GET | `/api/v1/grant/applyable` | 已登录 | 列出开放申请的数据源 |
 | POST | `/api/v1/grant/requests` | 已登录 | 提交授权申请 |
 | GET | `/api/v1/grant/requests/mine` | 已登录 | 我的申请列表 |
@@ -108,7 +134,7 @@ Redis 没有表的概念，鉴权用 key 前缀。申请范围写成 `<db号>:<k
 - **平台元数据库必须做访问控制与网络隔离**
 - **备份与 dump 文件要加密**——`pg_dump` 出来的文件里就有明文密码
 - **每个数据源使用只读账号**，绝不用业务主账号
-- 密码不通过任何接口返回，前端只能看到 `has_password`
+- 列表接口不返回密码（只有 `has_password`）；编辑单条数据源时详情接口返回明文，直接填进编辑框
 
 **残余风险，部署前请确认能接受：**
 
@@ -120,10 +146,27 @@ Redis 没有表的概念，鉴权用 key 前缀。申请范围写成 `<db号>:<k
 接口（`Encode`/`Decode`），当前实现是恒等变换。切到 AES 只需替换实现，
 并在列值上加版本前缀（如 `v2:<base64>`）以区分新旧格式，可逐行迁移。
 
-### 密码在接口上永远不可见
+### 密码回显只发生在单条详情接口
 
-`GET /api/v1/datasources` 只返回 `has_password: true/false`，不返回密码。
-编辑数据源时密码框留空表示**不修改**现有密码，不会把它清空。
+| 接口 | 是否返回密码 |
+|---|---|
+| `GET /api/v1/datasources`（列表） | **否**，只有 `has_password: true/false` |
+| `GET /api/v1/datasources/:id`（详情） | **是**，明文 `password` 字段 |
+
+分开的理由很简单：列表一次返回全部数据源，回显密码等于一次响应就把全库凭据带到浏览器；
+而编辑只需要一条，所以只在详情接口回显。
+
+两个接口都限定 `dba` / `superadmin`。能拿到明文的人本来就有权改掉这条密码，
+所以回显并不放宽权限边界——它只是省去了管理员翻密码本这一步。
+
+模型层用单独的序列化字段 `PlainPassword`（`json:"password,omitempty"`）承载回显，
+`Password` 本身永久 `json:"-"`。只有显式调用 `WithPlainPassword()` 的接口才会带出密码，
+「哪个接口会吐密码」在代码里一眼可查。
+
+编辑时密码框里是当前明文：
+- 直接改 → 新密码写入
+- **清空 → 保留原密码**，不会把已配好的密码抹掉
+- 没有配置密码的数据源，详情响应里就没有 `password` 字段
 
 ### 测试连接
 
@@ -141,12 +184,12 @@ Redis 没有表的概念，鉴权用 key 前缀。申请范围写成 `<db号>:<k
 
 ### 各类型对连接字段的要求
 
-| 类型 | 账号 | 密码 | 库名 / db 号 |
-|---|---|---|---|
-| PostgreSQL | 必填 | 必填 | **必填** |
-| MySQL | 必填 | 必填 | 可选 |
-| MongoDB | 必填 | 必填 | **必填** |
-| Redis | **可选** | 视实例而定 | 可选（默认 db 0） |
+| 类型 | 账号 | 密码 | 库名 / db 号 | 认证库 |
+|---|---|---|---|---|
+| PostgreSQL | 必填 | 必填 | **必填** | — |
+| MySQL | 必填 | 必填 | 可选 | — |
+| MongoDB | 必填 | 必填 | **必填** | 留空 = `admin`（与 mongosh 一致）；业务库账号填该库名 |
+| Redis | **可选** | 视实例而定 | 可选（默认 db 0） | — |
 
 **为什么只有 PostgreSQL 必须填库名：** 它的连接串是
 `postgres://user:pw@host:port/DBNAME`，库名是连接的一部分，留空会连到与用户同名的库
@@ -155,8 +198,47 @@ Redis 没有表的概念，鉴权用 key 前缀。申请范围写成 `<db号>:<k
 MySQL 不一样，DSN 为 `user:pw@tcp(host:port)/DBNAME`，库名留空表示「连接但不选库」，
 查询时写 `库名.表名` 完全可用，所以不该强制填写。
 
-**Redis 默认只用密码认证**（`requirepass`），没有账号概念，界面上留空即可。
-只有一种情况需要填账号：实例启用了 ACL 且使用的不是 `default` 用户。
+**Redis 支持 ACL 账号。** 早期版本只传密码，填了账号也会被静默丢掉，
+遇到 Redis 6+ ACL 或云托管实例时表现为「测试连接失败，且报错和账号毫无关系」。
+现在会同时传 username；只有 `requirepass` 的老实例留空即可。
+
+**MongoDB 的「认证库」不是「默认库」。** MongoDB 的账号归属于某个库：
+
+- 建在 `admin` 的账号是全局管理员 → **认证库留空即可**（平台按 `admin` 认证）
+- 建在业务库的账号只对该库有效 → 认证库填该库名
+
+默认值是 `admin`，与 MongoDB 官方工具一致：驱动的 URI 不带 `authSource` 时
+用 `admin`，`mongosh --authenticationDatabase` 的默认值也是 `admin`。
+连接串路径里的库只决定「连上后默认切到哪个库」，不参与认证。
+
+两者混淆的代价很大：认证库填错时服务端**一律返回 `AuthenticationFailed`**，
+表现就是「认证失败，请检查账号和密码」，而密码其实完全正确。
+现在"测试连接"失败时会把**实际使用的认证库**写进提示，直接对照即可：
+
+> 认证失败：账号或密码不正确。当前未指定认证库，平台按默认的 admin 认证（与 mongosh 一致）。
+> 若该账号是建在业务库里的专属用户，请把「认证库」填成那个库名
+
+### 高级连接参数
+
+云实例、副本集、TLS 这些场景，光有 host/port/user/password 是不够的。
+表单底部有「高级连接参数」折叠面板，键值以白名单方式透传给驱动：
+
+| 类型 | 支持的参数 |
+|---|---|
+| MongoDB | `replicaSet`、`directConnection`、`tls`、`tlsCAFile`、`tlsInsecure`、`readPreference`、`authMechanism`、`appName` |
+| PostgreSQL | `sslmode`（`disable` / `allow` / `prefer` / `require` / `verify-ca` / `verify-full`） |
+| MySQL | `tls`（`true` / `false`） |
+
+**白名单而不是任意透传：** 这些参数会改变连接语义，未知键直接报错而不是静默忽略——
+用户填了 `replicaSet` 却没生效，比明确报「不支持该参数」更难排查。
+
+**MongoDB 的 host 支持多个成员**，逗号分隔（`10.0.0.5,10.0.0.6`），
+端口统一用「端口」字段；单独指定某个成员的端口可写 `10.0.0.5:27018`。
+IPv6 必须加方括号（`[::1]` 或 `[::1]:27017`）：裸写 `::1:27017` 无法区分
+最后一段是端口还是地址，驱动会当成非法地址。
+
+**PostgreSQL 的 `sslmode` 之前硬编码成 `disable`**，云厂商的 PG（RDS / ApsaraDB / TencentDB）
+基本强制 SSL，一连接就被拒。现在默认仍是 `disable`（内网直连最常见），但可以覆盖。
 
 数据库类数据源请配置**只读账号**，不要用业务主账号。平台虽然只允许 `SELECT` 类语句，
 但一个拥有写权限的账号一旦出现绕过，代价是全库级的。
@@ -205,6 +287,28 @@ MongoDB 不支持 SQL，查询接口是 `POST /api/v1/query/mongo`，支持两�
 3. 申请的库表范围命中 `apply_scopes` 白名单
 
 **审批人不能审批自己的申请**，前后端都有拦截。单人 DBA 团队需要另一个 DBA 或 superadmin 来批。
+
+### 授权什么时候失效
+
+授权记录带 `expires_at`，但 Casbin 的策略在**内存里**。早期只在启动和「审批通过」两个
+时刻重建策略，于是：
+
+- 一条 7 天的授权，过期后**依然可用**，直到下次重启或有人审批 —— 这是真实的越权窗口
+- 吊销更是完全没有入口：`GrantStore.Revoke` 写了，但没有 HTTP 路由
+
+现在两条路径都补上了：
+
+| 场景 | 触发方式 | 生效延迟 |
+|---|---|---|
+| 到期 | 后台定时重建策略（`AUTHZ_REFRESH_SEC`，默认 60 秒） | ≤ 1 分钟 |
+| 立即收回 | 「授权管理」页点「收回」→ `POST /grants/:id/revoke` | 立即（同步重建策略） |
+
+定时重建走的是同一条 `syncAuthz`：按 `grant_record` 里
+`revoked_at IS NULL AND expires_at > now()` 的记录全量重建，所以过期和吊销都会被清掉。
+
+注意 `SyncGrants` 会先清空 p 段再重建，内置的 `dba` / `superadmin` 策略不在数据库里，
+会被一起清掉。所以凡调用 `syncAuthz` 之后都必须补一次 `reAddBuiltinPolicies`，
+否则刷新一次策略，DBA 自己就查不了任何数据了。
 
 ### 可申请配置示例
 
@@ -267,7 +371,7 @@ cp .env.example .env.local
 #    TEST_DATABASE_URL       测试专用库（测试会建表删表，不能与 DATABASE_URL 相同）
 #    TEST_REDIS_ADDR         格式 host:port/db，请使用独立 db
 
-# 3. 加载环境变量（每个新终端都要执行）
+# 3. 加载环境变量（仅运行测试时需要；启动服务会自动读取 .env.local）
 source .env.local
 
 # 4. 准备测试库
@@ -276,9 +380,12 @@ createdb -h HOST -U USER datawarden_test
 
 ### 运行后端
 
+服务启动时会自动读取工作目录下的 `.env.local`（其次 `.env`），
+因此在 LiteIDE / VS Code 里直接点运行也能拿到配置，无需手动加载。
+进程环境中已存在的变量优先级更高，不会被文件覆盖。
+
 ```bash
 # 启动服务（会自动执行数据库迁移）
-source .env.local
 go run ./cmd/server
 
 # 运行全部测试

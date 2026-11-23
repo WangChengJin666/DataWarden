@@ -3,6 +3,7 @@ import {
   Alert,
   Button,
   Card,
+  Collapse,
   Divider,
   Form,
   Input,
@@ -59,6 +60,24 @@ const typeColors: Record<DatasourceType, string> = {
   mongodb: 'green',
 }
 
+/**
+ * 去掉空值的高级参数项。
+ *
+ * Form.Item 用 Select allowClear 清空后留下的是 undefined，
+ * 直接提交会变成 {"replicaSet": undefined}。后端遍历时 `v == ""` 拦不住
+ * undefined 的 JSON 序列化差异，所以统一在这里清一遍。
+ */
+function cleanOptions(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (v !== undefined && v !== null && String(v).trim() !== '') {
+      out[k] = String(v).trim()
+    }
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
 // 各类型数据源对账号的要求。
 // Redis 的默认认证方式只有密码（requirepass），没有账号概念；
 // 平台内部的 Redis 客户端也不传用户名，所以这里不允许填，避免误导。
@@ -109,9 +128,14 @@ const databasePolicy: Record<
 > = {
   postgresql: {
     required: true,
-    label: '默认库（必填）',
-    placeholder: '例如 shop',
-    hint: '',
+    // 这个字段是**连接用的 database 名**（DSN 的 dbname），
+    // 不是查询页里选的那个「模式（schema）」。两者在 PG 下是不同概念，
+    // 但共用了一个输入框——label 必须说清是哪一种，
+    // 否则用户会照查询页看到的下拉（public 等 schema）来填，
+    // 存进库后 DSN 变成 dbname=public，直接连不上。
+    label: '数据库名（必填，连接用）',
+    placeholder: '例如 postgres 或业务库名',
+    hint: '这是连接时用的 database 名；查询页里选的「模式」是 schema，两者不同',
   },
   mysql: {
     required: false,
@@ -133,6 +157,85 @@ const databasePolicy: Record<
   },
 }
 
+// 各类型支持的「高级参数」白名单与默认值。
+//
+// 为什么要做成白名单而不是自由键值对：这些参数会改变连接语义，
+// 后端也只接受白名单里的键（adapter.mongoAllowedOptions）。
+// 前端给出候选，用户不用去翻驱动文档；后端仍然独立校验，不信任前端。
+const advancedOptions: Record<
+  DatasourceType,
+  { key: string; label: string; placeholder: string; options?: { value: string; label: string }[] }[]
+> = {
+  mongodb: [
+    {
+      key: 'replicaSet',
+      label: '副本集名称（replicaSet）',
+      placeholder: '例如 rs0；单节点可留空',
+    },
+    {
+      key: 'readPreference',
+      label: '读偏好（readPreference）',
+      placeholder: '默认 primary',
+      options: [
+        { value: 'primary', label: 'primary（只读主）' },
+        { value: 'primaryPreferred', label: 'primaryPreferred（主优先）' },
+        { value: 'secondary', label: 'secondary（只读从）' },
+        { value: 'secondaryPreferred', label: 'secondaryPreferred（从优先）' },
+        { value: 'nearest', label: 'nearest（最近节点）' },
+      ],
+    },
+    {
+      key: 'tls',
+      label: '启用 TLS（tls）',
+      placeholder: 'true / false',
+      options: [
+        { value: 'true', label: 'true（云实例通常需要）' },
+        { value: 'false', label: 'false' },
+      ],
+    },
+    {
+      key: 'tlsCAFile',
+      label: 'CA 证书路径（tlsCAFile）',
+      placeholder: '服务器上的绝对路径，如 /etc/ssl/mongo-ca.pem',
+    },
+    {
+      key: 'authMechanism',
+      label: '认证机制（authMechanism）',
+      placeholder: '默认 SCRAM-SHA-256',
+      options: [
+        { value: 'SCRAM-SHA-256', label: 'SCRAM-SHA-256' },
+        { value: 'SCRAM-SHA-1', label: 'SCRAM-SHA-1（老版本实例）' },
+        { value: 'MONGODB-X509', label: 'MONGODB-X509' },
+      ],
+    },
+  ],
+  postgresql: [
+    {
+      key: 'sslmode',
+      label: 'SSL 模式（sslmode）',
+      placeholder: '默认 disable',
+      options: [
+        { value: 'disable', label: 'disable（内网直连）' },
+        { value: 'require', label: 'require（云实例必须）' },
+        { value: 'verify-ca', label: 'verify-ca' },
+        { value: 'verify-full', label: 'verify-full' },
+      ],
+    },
+  ],
+  mysql: [
+    {
+      key: 'tls',
+      label: '启用 TLS（tls）',
+      placeholder: 'true / false',
+      options: [
+        { value: 'true', label: 'true' },
+        { value: 'false', label: 'false' },
+      ],
+    },
+  ],
+  redis: [],
+}
+
 export default function DatasourcePage() {
   const [items, setItems] = useState<Datasource[]>([])
   const [loading, setLoading] = useState(false)
@@ -146,6 +249,7 @@ export default function DatasourcePage() {
   const currentType: DatasourceType | undefined = Form.useWatch('type', form)
   const policy = currentType ? usernamePolicy[currentType] : usernamePolicy.postgresql
   const dbPolicy = currentType ? databasePolicy[currentType] : databasePolicy.postgresql
+  const advancedFields = currentType ? advancedOptions[currentType] : []
 
   const isDBA = ['dba', 'superadmin'].includes(getCurrentUser()?.role ?? '')
 
@@ -173,8 +277,9 @@ export default function DatasourcePage() {
       // 用户点了按钮却没有任何反馈，很难理解是哪里没填。
       type: 'postgresql',
       port: 5432,
-      // 认证库留空表示与默认库相同，这也是 MongoDB 的默认行为
+      // 认证库留空表示用默认的 admin（与 mongosh 一致）
       auth_source: '',
+      options: {},
       apply_enabled: false,
       max_apply_days: 7,
       apply_scopes: [],
@@ -193,9 +298,9 @@ export default function DatasourcePage() {
       port: record.port,
       database: record.database,
       username: record.username,
-      // 认证库要一起带进表单，否则编辑时会被空值覆盖掉，
-      // 账号建在 admin 的数据源保存后就再也连不上了。
+      // 认证库要一起带进表单，否则编辑时会被空值覆盖掉。
       auth_source: record.auth_source ?? '',
+      options: record.options ?? {},
       // 先留空，随后用详情接口拿到的明文填进去。
       // 列表接口不回显密码（一次带走全部凭据），只有详情接口返回。
       password: undefined,
@@ -222,6 +327,8 @@ export default function DatasourcePage() {
       const values = await form.validateFields()
       const input: DatasourceInput = {
         ...values,
+        // 空的高级参数不提交：后端会按「未设置」处理，避免存一堆空字符串
+        options: cleanOptions(values.options) ?? {},
         apply_scopes: (values.apply_scopes ?? []).map((s: ApplyScope) => ({
           database: s?.database ?? '',
           tables: Array.isArray(s?.tables)
@@ -285,8 +392,11 @@ export default function DatasourcePage() {
         username: form.getFieldValue('username'),
         password: form.getFieldValue('password') || undefined,
         // MongoDB 必须把认证库一起送过去：后端用的是表单里的值，
-        // 不传就会退回「按默认库认证」，测出来的结果和保存后不一致。
+        // 不传就会退回默认的 admin，测出来的结果和保存后不一致。
         auth_source: form.getFieldValue('auth_source') || undefined,
+        // 高级参数也一样：测试连接和正式查询必须是同一套连接条件，
+        // 否则会出现「测试通过但查询连不上」这种最难查的错。
+        options: cleanOptions(form.getFieldValue('options')),
         datasource_id: editing?.id,
       })
       setTestResult(res)
@@ -564,13 +674,35 @@ export default function DatasourcePage() {
                 }))}
                 onChange={(v: DatasourceType) => {
                   form.setFieldValue('port', v === 'mysql' ? 3306 : v === 'redis' ? 6379 : v === 'mongodb' ? 27017 : 5432)
-                  // 切到不需要账号的类型时清掉残留值，避免把上一次填的账号带进 Redis
+                  // 切换类型时必须清掉「语义已经变了」的字段：
+                  //   database —— MySQL 里是库名，Redis 里是 db 号。
+                  //     从 MySQL(shop) 切到 Redis 会残留 "shop"，测试连接报
+                  //     「db 号必须是整数」，而界面上看不出这个值是哪来的。
+                  //   username —— Redis 通常是密码认证，残留账号会被拿去 AUTH 失败。
+                  //   auth_source —— 只有 MongoDB 用。
+                  // 之前只清了 username 和 auth_source，database 一直没清。
+                  form.setFieldValue('database', '')
+                  form.setFieldValue('auth_source', '')
+                  // 高级参数不能整体清空。
+                  //
+                  // 之前的写法是 form.setFieldValue('options', {})，这会带来两个问题：
+                  //   1. 编辑已有数据源时，用户只是想改端口，碰一下「类型」下拉
+                  //      （哪怕又选回原类型）就把已保存的 replicaSet / sslmode 全删了，
+                  //      保存后数据源静默失效
+                  //   2. Collapse 里的 Form.Item 是嵌套字段 ['options', key]，
+                  //      整体置空后 UI 上也不会提示「这些值被丢了」
+                  //
+                  // 正确做法是只删掉「新类型不支持」的键：后端对不支持的键会
+                  // 直接报错，所以必须清理；但属于两类型共有的键（如 tls）应当保留。
+                  const allowedKeys = new Set(advancedOptions[v].map((f) => f.key))
+                  const prev = (form.getFieldValue('options') ?? {}) as Record<string, string>
+                  const kept: Record<string, string> = {}
+                  for (const [k, val] of Object.entries(prev)) {
+                    if (allowedKeys.has(k) && val !== undefined && val !== '') kept[k] = val
+                  }
+                  form.setFieldValue('options', kept)
                   if (!usernamePolicy[v].required) {
                     form.setFieldValue('username', '')
-                  }
-                  // 认证库只有 MongoDB 用，切走就清掉，否则会给其他类型存下一个无意义的值
-                  if (v !== 'mongodb') {
-                    form.setFieldValue('auth_source', '')
                   }
                 }}
               />
@@ -582,9 +714,18 @@ export default function DatasourcePage() {
               name="host"
               label="主机"
               rules={[{ required: true, message: '请输入主机' }]}
+              extra={
+                currentType === 'mongodb'
+                  ? '副本集可填多个成员，用逗号分隔；IPv6 需写成 [::1]'
+                  : ''
+              }
               style={{ flex: 1 }}
             >
-              <Input placeholder="10.0.0.5" />
+              <Input
+                placeholder={
+                  currentType === 'mongodb' ? '10.0.0.5 或 10.0.0.5,10.0.0.6' : '10.0.0.5'
+                }
+              />
             </Form.Item>
             <Form.Item
               name="port"
@@ -597,6 +738,9 @@ export default function DatasourcePage() {
             <Form.Item
               name="database"
               label={dbPolicy.label}
+              // hint 之前定义了却没渲染，是死字段。这里接上 extra，
+              // 让「PG 下填的是 database 名、不是 schema」这句话能真正显示出来。
+              extra={dbPolicy.hint || undefined}
               rules={
                 dbPolicy.required
                   ? [
@@ -605,7 +749,7 @@ export default function DatasourcePage() {
                         message:
                           currentType === 'mongodb'
                             ? 'MongoDB 必须填写默认库，否则无法确定要查哪个库'
-                            : 'PostgreSQL 必须填写库名',
+                            : 'PostgreSQL 必须填写数据库名',
                       },
                     ]
                   : []
@@ -666,11 +810,56 @@ export default function DatasourcePage() {
             <Form.Item
               name="auth_source"
               label="认证库（authSource）"
-              extra="账号建在哪个库就填哪个。全局管理员账号填 admin；不填则按上面的默认库认证。"
+              extra="留空按 admin 认证（与 mongosh 一致）。账号建在业务库的专属用户，请填该库名。"
               style={{ maxWidth: 360 }}
             >
-              <Input placeholder="留空 = 与默认库相同；管理员账号填 admin" autoComplete="off" />
+              <Input placeholder="留空 = admin" autoComplete="off" />
             </Form.Item>
+          ) : null}
+
+          {/* 高级参数默认折叠：只在连不上云实例或副本集时才需要动，
+              常驻会让人误以为必填。 */}
+          {advancedFields.length > 0 ? (
+            <Collapse
+              ghost
+              style={{ marginBottom: 8 }}
+              items={[
+                {
+                  key: 'advanced',
+                  label: (
+                    <Text style={{ fontSize: 13 }}>
+                      高级连接参数
+                      <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
+                        云实例 / 副本集 / TLS 通常需要
+                      </Text>
+                    </Text>
+                  ),
+                  children: (
+                    <Space direction="vertical" style={{ width: '100%' }}>
+                      {advancedFields.map((f) => (
+                        <Form.Item
+                          key={f.key}
+                          name={['options', f.key]}
+                          label={f.label}
+                          style={{ marginBottom: 12 }}
+                        >
+                          {f.options ? (
+                            <Select
+                              allowClear
+                              placeholder={f.placeholder}
+                              options={f.options}
+                              style={{ maxWidth: 340 }}
+                            />
+                          ) : (
+                            <Input placeholder={f.placeholder} style={{ maxWidth: 340 }} />
+                          )}
+                        </Form.Item>
+                      ))}
+                    </Space>
+                  ),
+                },
+              ]}
+            />
           ) : null}
 
           {testResult ? (

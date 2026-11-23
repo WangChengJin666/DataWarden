@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
+  AutoComplete,
   Button,
   Card,
   Input,
@@ -8,52 +9,251 @@ import {
   message,
   Select,
   Space,
+  Spin,
   Table,
   Tabs,
   Tag,
   Typography,
 } from 'antd'
-import { PlayCircleOutlined } from '@ant-design/icons'
-import { executeMongo, executeRedis, executeSQL, listDatasources } from '@/api/client'
-import type { Datasource, QueryResult, RedisQueryResult } from '@/api/types'
+import { PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons'
+import CodeMirror from '@uiw/react-codemirror'
+import { sql as sqlLang, MySQL, PostgreSQL, type SQLNamespace } from '@codemirror/lang-sql'
+import { EditorView } from '@codemirror/view'
+import {
+  executeMongo,
+  executeRedis,
+  executeSQL,
+  listColumns,
+  listDatabases,
+  listMyDatasources,
+  listTables,
+} from '@/api/client'
+import type { DatasourceBrief, QueryResult, RedisQueryResult } from '@/api/types'
 
 const { Text, Paragraph } = Typography
 
+/**
+ * MongoDB 的字段名是「采样」得来的——取一条文档看看有哪些键。
+ * 空集合取不到，所以要把「已知为空」和「还没取过」区分开：
+ * 前者显示成「无字段」，后者显示成「未采样」。
+ */
+type ColumnCache = Record<string, string[] | undefined>
+
 export default function QueryPage() {
-  const [datasources, setDatasources] = useState<Datasource[]>([])
+  const [datasources, setDatasources] = useState<DatasourceBrief[]>([])
   const [datasourceId, setDatasourceId] = useState<number>()
+
+  // 库名在 SQL 下是库/模式名，在 Mongo 下是库名，在 Redis 下是 db 号
   const [database, setDatabase] = useState('')
-  const [tables, setTables] = useState('')
+  // 涉及的表：改成多选。之前是手填逗号分隔的字符串，
+  // 而鉴权就是按这份清单逐表判定的——拼错一个字母 = 403，
+  // 用户分不清是「打错了」还是「真没权限」。
+  const [tables, setTables] = useState<string[]>([])
+
   const [sql, setSql] = useState('')
   const [rowLimit, setRowLimit] = useState(100)
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<QueryResult | null>(null)
+
   const [redisMode, setRedisMode] = useState<'exact' | 'scan'>('exact')
   const [redisKey, setRedisKey] = useState('')
   const [redisResult, setRedisResult] = useState<RedisQueryResult | null>(null)
+
   // Mongo 两种输入模式：集合+过滤条件 / 原生命令
   const [mongoMode, setMongoMode] = useState<'collection' | 'command'>('collection')
   const [mongoCollection, setMongoCollection] = useState('')
   const [mongoFilter, setMongoFilter] = useState('{}')
   const [mongoCommand, setMongoCommand] = useState('')
 
+  // 元数据：库列表、表列表、字段缓存
+  const [dbOptions, setDbOptions] = useState<string[]>([])
+  const [dbLoading, setDbLoading] = useState(false)
+  // 元数据接口的真故障信息（502）。空串表示正常或「确实没有数据」。
+  const [dbError, setDbError] = useState('')
+  const [tableOptions, setTableOptions] = useState<string[]>([])
+  const [tableLoading, setTableLoading] = useState(false)
+  const [tableError, setTableError] = useState('')
+  const [columns, setColumns] = useState<ColumnCache>({})
+  // 记录哪些字段已经请求过，避免每次输入都重复发请求
+  const fetchedColumns = useRef<Set<string>>(new Set())
+  // 库列表请求的序号，用于丢弃过期响应（见 loadDatabases）
+  const dbReqSeq = useRef(0)
+
+  const current = datasources.find((d) => d.id === datasourceId)
+  const isRedis = current?.type === 'redis'
+  const isMongo = current?.type === 'mongodb'
+  const isSQL = !isRedis && !isMongo
+
   useEffect(() => {
     void (async () => {
       try {
-        const list = await listDatasources()
+        // 用 listMyDatasources 而不是 listDatasources：
+        // 后者走 GET /datasources，路由限 DBA，开发者调用会 403，
+        // 下拉变成空、什么都查不了。这里返回的是「我拿到授权的数据源」。
+        const list = await listMyDatasources()
         setDatasources(list)
-        const firstSql = list.find((d) => d.type === 'postgresql' || d.type === 'mysql')
-        if (firstSql) setDatasourceId(firstSql.id)
+        // 优先选 SQL 类型，没有就选第一个可查的。
+        //
+        // 这里只负责「选出默认数据源」，不负责拉库列表——
+        // 拉列表统一由下面监听 current 的 effect 做。
+        // 若在这里也拉一次，两个 effect 会双请求同一份数据，
+        // 而后者返回顺序不确定，可能把先到的结果覆盖掉。
+        const firstSql = list.find(
+          (d) => d.type === 'postgresql' || d.type === 'mysql',
+        )
+        const chosen = firstSql ?? list[0]
+        if (chosen) setDatasourceId(chosen.id)
       } catch (e) {
         message.error((e as Error).message)
       }
     })()
   }, [])
 
-  const current = datasources.find((d) => d.id === datasourceId)
-  const isRedis = current?.type === 'redis'
-  const isMongo = current?.type === 'mongodb'
-  const isSQL = !isRedis && !isMongo
+  // 数据源变化的唯一处理入口：清状态 + 拉库列表。
+  //
+  // 依赖 [current] 而不是 [datasourceId]：
+  //   - datasourceId 先设置、datasources 后到位的那一帧，用 id 去
+  //     datasources.find() 拿到 undefined，默认库预填必然失效
+  //   - current = datasources.find(...) 返回的是数组内元素的**同一引用**，
+  //     所以 [current] 不会每帧触发，只在 datasources / datasourceId
+  //     真正变化时触发
+  //
+  // 不设「首次跳过」门闩：那种早退写在清空之后，
+  // 会让首次的 setDatabase('') 覆盖掉刚预填的默认库且无人重设，
+  // 是否生效变成时序巧合。首次加载与手动切换走完全相同的一条路径。
+  useEffect(() => {
+    setDatabase('')
+    setTables([])
+    setSql('')
+    setTableOptions([])
+    setColumns({})
+    fetchedColumns.current = new Set()
+    setResult(null)
+    setRedisResult(null)
+    setRedisKey('')
+    setMongoCollection('')
+    setMongoFilter('{}')
+    setMongoCommand('')
+
+    if (!current || current.type === 'redis') {
+      setDbOptions([])
+      return
+    }
+    void loadDatabases(current)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [current])
+
+  // loadDatabases 接收数据源对象而不是只接 id。
+  //
+  // 为什么：要在里面读 ds.database 作为默认库。如果只传 id 再去
+  // datasources 里 find，首次加载时 datasources 还是空数组
+  // （setDatasources 与 setDatasourceId 在同一批更新里，effect 拿到的是旧闭包），
+  // 默认库必然取不到。传对象则调用方一定持有它，逻辑上不可能为空。
+  const loadDatabases = async (ds: DatasourceBrief) => {
+    // 用自增序号丢弃过期响应：用户快速切换数据源时，
+    // 前一个请求可能后到，把新数据源的库列表覆盖掉。
+    // 不做这层保护的现象是「切到 A 显示 B 的库」，而且无从复现。
+    const seq = ++dbReqSeq.current
+    setDbLoading(true)
+    try {
+      const list = await listDatabases(ds.id)
+      if (seq !== dbReqSeq.current) return // 已有更新的请求，丢弃
+      setDbOptions(list)
+      setDbError('')
+      // 数据源配置里有默认库时优先用它；否则只在唯一候选时自动选中
+      if (ds.database && list.includes(ds.database)) {
+        setDatabase(ds.database)
+      } else if (list.length === 1) {
+        setDatabase(list[0])
+      }
+    } catch (e) {
+      if (seq !== dbReqSeq.current) return
+      // 后端对「列不出库」已经区分了语义：
+      //   - 200 + 空列表 = 确实没有可见的库（无授权），静默降级为手填是合理的
+      //   - 502 = 真故障（连不上、配置错）
+      // 这里收到的是异常，说明是后者，必须告诉用户，
+      // 否则「下拉空着」会被误认为「没有权限」，排查方向直接跑偏。
+      setDbOptions([])
+      setDbError((e as Error).message)
+    } finally {
+      if (seq === dbReqSeq.current) setDbLoading(false)
+    }
+  }
+
+  const loadTables = useCallback(
+    async (id: number, db: string) => {
+      if (!id || !db || isRedis) {
+        setTableOptions([])
+        return
+      }
+      setTableLoading(true)
+      try {
+        setTableOptions(await listTables(id, db))
+        setTableError('')
+      } catch (e) {
+        setTableOptions([])
+        // 与库列表同理：走到这里说明是故障而不是「这个库没表」
+        setTableError((e as Error).message)
+      } finally {
+        setTableLoading(false)
+      }
+    },
+    [isRedis],
+  )
+
+  // 库变了就重拉表清单，并清掉已选表（上一个库的表名在新库里不成立）
+  const onDatabaseChange = (db: string) => {
+    setDatabase(db)
+    setTables([])
+    setColumns({})
+    fetchedColumns.current = new Set()
+    if (datasourceId) void loadTables(datasourceId, db)
+  }
+
+  // 选中表后异步取字段，用于 SQL 补全。失败不提示：补全拿不到不影响查询。
+  useEffect(() => {
+    if (!datasourceId || !database || tables.length === 0) return
+    for (const t of tables) {
+      const key = `${datasourceId}.${database}.${t}`
+      if (fetchedColumns.current.has(key)) continue
+      fetchedColumns.current.add(key)
+      void listColumns(datasourceId, database, t)
+        .then((cols) => setColumns((prev) => ({ ...prev, [t]: cols })))
+        .catch(() => {
+          // 允许下次重试
+          fetchedColumns.current.delete(key)
+          setColumns((prev) => ({ ...prev, [t]: [] }))
+        })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [datasourceId, database, tables])
+
+  /**
+   * 构造 CodeMirror 的补全 schema。
+   *
+   * 结构是 { 库名: { 表名: [字段...] } }，lang-sql 会据此补全
+   * 表名、`表名.` 之后的字段名，以及 SELECT 里直接出现的字段名。
+   *
+   * 只放「当前已选表」而不放整个库的表：全量 schema 会让补全列表变成
+   * 几千条，而且用户没权限的表本来就不该出现在候选里。
+   */
+  const sqlSchema = useMemo<SQLNamespace>(() => {
+    const inner: SQLNamespace = {}
+    for (const t of tables) {
+      inner[t] = columns[t] ?? []
+    }
+    if (!database) return inner
+    return { [database]: inner, public: inner }
+  }, [database, tables, columns])
+
+  const extensions = useMemo(() => {
+    const dialect = current?.type === 'mysql' ? MySQL : PostgreSQL
+    return [
+      sqlLang({ dialect, schema: sqlSchema, upperCaseKeywords: true }),
+      // 允许 Tab 缩进而不跳转到下一个控件，编辑器里这更符合直觉
+      EditorView.contentAttributes.of({ 'aria-label': 'SQL 编辑器' }),
+    ]
+  }, [current?.type, sqlSchema])
 
   const run = async () => {
     if (!datasourceId) {
@@ -61,14 +261,13 @@ export default function QueryPage() {
       return
     }
     if (isMongo) {
-      // Mongo 没填库名时后端无法确定查哪个库
       if (!database.trim()) {
-        message.warning('请填写库名')
+        message.warning('请选择库')
         return
       }
       if (mongoMode === 'collection') {
         if (!mongoCollection.trim()) {
-          message.warning('请填写集合名')
+          message.warning('请选择或填写集合名')
           return
         }
         if (!mongoFilter.trim().startsWith('{')) {
@@ -81,11 +280,11 @@ export default function QueryPage() {
       }
     } else if (isSQL) {
       if (!database.trim()) {
-        message.warning('请填写库名')
+        message.warning('请选择库')
         return
       }
-      if (!tables.trim()) {
-        message.warning('请填写涉及的表名，平台需要逐表鉴权')
+      if (tables.length === 0) {
+        message.warning('请选择查询涉及的表，平台需要逐表鉴权')
         return
       }
       if (!sql.trim()) {
@@ -96,14 +295,12 @@ export default function QueryPage() {
       message.warning('请输入 key 或 key 模式')
       return
     } else if (redisMode === 'exact' && /[*?[]/.test(redisKey)) {
-      // 用户在「精确 Key」里填了通配符，多半是想模糊查询，明确引导而不是静默返回空
       message.warning('精确查询不支持通配符，请切换到「模糊 Key」标签页')
       return
     } else if (redisMode === 'scan' && !/[*?[]/.test(redisKey)) {
       message.warning('模糊查询需要带通配符（如 user:1001:*），精确 key 请用「精确 Key」')
       return
     } else if (redisMode === 'scan') {
-      // 与服务端规则保持一致：取第一个通配符之前的部分，去掉分隔符后至少 2 个字符
       const prefix = redisKey.split(/[*?[]/)[0].replace(/[:.\-_/]/g, '')
       if (prefix.length < 2) {
         message.warning('模糊查询的前缀至少需要 2 个有效字符，否则扫描范围过宽')
@@ -120,12 +317,10 @@ export default function QueryPage() {
           redisMode === 'exact'
             ? { datasource_id: datasourceId, key: redisKey.trim() }
             : { datasource_id: datasourceId, pattern: redisKey.trim() }
-        const res = await executeRedis(payload)
-        setRedisResult(res)
+        setRedisResult(await executeRedis(payload))
         return
       }
       if (isMongo) {
-        // 集合模式下没有涉及表的概念，鉴权按集合名判定，所以集合名必须传准
         const payload =
           mongoMode === 'collection'
             ? {
@@ -141,18 +336,18 @@ export default function QueryPage() {
                 command: mongoCommand.trim(),
                 row_limit: rowLimit,
               }
-        const res = await executeMongo(payload)
-        setResult(res)
+        setResult(await executeMongo(payload))
         return
       }
-      const res = await executeSQL({
-        datasource_id: datasourceId,
-        database: database.trim(),
-        tables: tables.split(',').map((t) => t.trim()).filter(Boolean),
-        sql,
-        row_limit: rowLimit,
-      })
-      setResult(res)
+      setResult(
+        await executeSQL({
+          datasource_id: datasourceId,
+          database: database.trim(),
+          tables,
+          sql,
+          row_limit: rowLimit,
+        }),
+      )
     } catch (e) {
       message.error((e as Error).message)
     } finally {
@@ -160,7 +355,7 @@ export default function QueryPage() {
     }
   }
 
-  // Redis 结果：key / 类型 / 值 / TTL。hash 类型把 fields 展开成一行。
+  // Redis 结果：key / 类型 / 值 / TTL
   const redisTable = redisResult ? (
     <Space direction="vertical" style={{ width: '100%' }}>
       <Space wrap>
@@ -272,7 +467,7 @@ export default function QueryPage() {
               </span>
             ) : (
               <span>
-                只能执行只读语句（SELECT / SHOW / DESC / EXPLAIN）。必须填写涉及的表名，
+                只能执行只读语句（SELECT / SHOW / DESC / EXPLAIN）。必须选择查询涉及的表，
                 平台会逐表校验权限，任一表无权限则整条查询被拒绝。结果中的手机号、身份证、邮箱等字段会自动脱敏。
               </span>
             )
@@ -285,27 +480,69 @@ export default function QueryPage() {
             placeholder="选择数据源"
             value={datasourceId}
             onChange={setDatasourceId}
+            showSearch
+            optionFilterProp="label"
             options={datasources.map((d) => ({
               value: d.id,
               label: `${d.name} (${d.type})`,
             }))}
           />
+
           {isRedis ? null : (
             <>
-              <Input
-                placeholder={isMongo ? '库名，如 test' : '库名，如 public'}
+              {/* 库名从下拉选：之前是纯 Input，用户得自己记住库名，
+                  填错就是一次 403，还看不出是填错还是没权限。 */}
+              <AutoComplete
+                style={{ width: 200 }}
+                placeholder={isMongo ? '选择库，如 test' : '选择库'}
                 value={database}
-                onChange={(e) => setDatabase(e.target.value)}
-                style={{ width: 160 }}
-              />
-              {isSQL ? (
+                onChange={setDatabase}
+                onSelect={onDatabaseChange}
+                options={dbOptions.map((d) => ({ value: d, label: d }))}
+                notFoundContent={
+                  dbLoading ? <Spin size="small" /> : '无法列出库，可直接输入'
+                }
+                allowClear
+              >
                 <Input
-                  placeholder="涉及的表，逗号分隔"
+                  // 有真故障时把输入框标红：用户一眼能看出「这里不对」，
+                  // 而不是以为「就是没有库，只能自己打」。
+                  status={dbError ? 'error' : undefined}
+                  suffix={
+                    <ReloadOutlined
+                      style={{ color: '#999', cursor: 'pointer' }}
+                      onClick={() => {
+                        // current 一定存在：这段渲染在 isRedis===false 的分支里，
+                        // 而 current 为 undefined 时也走不到这里（依赖 datasourceId）。
+                        if (current) void loadDatabases(current)
+                      }}
+                    />
+                  }
+                />
+              </AutoComplete>
+
+              {isSQL ? (
+                <Select
+                  mode="multiple"
+                  style={{ minWidth: 280, maxWidth: 420 }}
+                  placeholder="选择涉及的表（用于逐表鉴权）"
                   value={tables}
-                  onChange={(e) => setTables(e.target.value)}
-                  style={{ width: 240 }}
+                  onChange={setTables}
+                  // onDropdownVisibleChange 在 antd v5 已废弃（会告警且行为不确定），
+                  // 改用 onOpenChange。
+                  onOpenChange={(open) => {
+                    if (open && datasourceId && database) {
+                      void loadTables(datasourceId, database)
+                    }
+                  }}
+                  options={tableOptions.map((t) => ({ value: t, label: t }))}
+                  loading={tableLoading}
+                  status={tableError ? 'error' : undefined}
+                  maxTagCount="responsive"
+                  allowClear
                 />
               ) : null}
+
               <InputNumber
                 min={1}
                 max={1000}
@@ -319,6 +556,42 @@ export default function QueryPage() {
           )}
         </Space>
 
+        {/* 元数据接口的真故障提示。
+            放在输入行下面而不是用 message 弹窗：弹窗一闪而过，
+            用户没看清就消失了；这里的错误往往需要照着提示去查配置。 */}
+        {dbError ? (
+          <Alert
+            type="error"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="无法获取库列表"
+            description={
+              <span>
+                {dbError}。可以直接手动输入库名继续查询；
+                若手动输入也无法连接，请让 DBA 检查数据源的连接配置。
+              </span>
+            }
+            closable
+            onClose={() => setDbError('')}
+          />
+        ) : null}
+        {tableError ? (
+          <Alert
+            type="error"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="无法获取表列表"
+            description={
+              <span>
+                {tableError}。鉴权依赖准确的表名，
+                在没有表列表的情况下请谨慎手填，拼错会导致 403 且难以分辨原因。
+              </span>
+            }
+            closable
+            onClose={() => setTableError('')}
+          />
+        ) : null}
+
         {isMongo ? (
           <Card size="small" type="inner" title="MongoDB 查询">
             <Tabs
@@ -330,10 +603,13 @@ export default function QueryPage() {
                   label: '集合查询',
                   children: (
                     <Space direction="vertical" style={{ width: '100%' }}>
-                      <Input
-                        placeholder="集合名，如 users"
+                      <AutoComplete
+                        style={{ width: '100%' }}
+                        placeholder="选择或填写集合名，如 users"
                         value={mongoCollection}
-                        onChange={(e) => setMongoCollection(e.target.value)}
+                        onChange={setMongoCollection}
+                        options={tableOptions.map((t) => ({ value: t, label: t }))}
+                        notFoundContent="先选择库再选择集合"
                       />
                       <Input.TextArea
                         rows={5}
@@ -361,7 +637,8 @@ export default function QueryPage() {
                         style={{ fontFamily: 'Menlo, Consolas, monospace', fontSize: 13 }}
                       />
                       <Text type="secondary" style={{ fontSize: 12 }}>
-                        支持 find / findOne / countDocuments / distinct / aggregate。
+                        支持 find / findOne / countDocuments / distinct / aggregate，
+                        也支持 db.getCollection("名字").find(...) 写法。
                         写操作（insert / update / delete / drop）以及会写库的聚合阶段（$out、$merge）一律拒绝。
                       </Text>
                     </Space>
@@ -407,13 +684,34 @@ export default function QueryPage() {
             />
           </Card>
         ) : (
-          <Input.TextArea
-            rows={8}
-            placeholder="SELECT id, phone FROM orders WHERE created_at > now() - interval '1 day' LIMIT 100"
-            value={sql}
-            onChange={(e) => setSql(e.target.value)}
-            style={{ fontFamily: 'Menlo, Consolas, monospace', fontSize: 13 }}
-          />
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <CodeMirror
+              value={sql}
+              onChange={setSql}
+              extensions={extensions}
+              height="220px"
+              placeholder={
+                "SELECT id, phone FROM orders WHERE created_at > now() - interval '1 day' LIMIT 100"
+              }
+              basicSetup={{
+                lineNumbers: true,
+                // 补全交给 lang-sql 的 schemaCompletionSource，
+                // 关掉默认的单词联想避免候选里混进无关变量名
+                autocompletion: true,
+                foldGutter: false,
+                highlightActiveLine: true,
+              }}
+              style={{ border: '1px solid #d9d9d9', borderRadius: 6, fontSize: 13 }}
+            />
+            <Space size={4} wrap>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                输入表名或 <Text code>表名.</Text> 会弹出字段补全；
+              </Text>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                字段候选来自上面「涉及的表」，先选表才有补全。
+              </Text>
+            </Space>
+          </Space>
         )}
 
         <div style={{ marginTop: 16 }}>

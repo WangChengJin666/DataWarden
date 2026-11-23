@@ -5,6 +5,7 @@ import QueryPage from './pages/QueryPage'
 import ApplyPage from './pages/ApplyPage'
 import DatasourcePage from './pages/DatasourcePage'
 import ReviewPage from './pages/ReviewPage'
+import GrantsPage from './pages/GrantsPage'
 import { getCurrentUser, getToken } from './api/client'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -49,6 +50,14 @@ export default function App() {
           }
         />
         <Route path="review" element={<ReviewPage />} />
+        <Route
+          path="grants"
+          element={
+            <RequireDBA>
+              <GrantsPage />
+            </RequireDBA>
+          }
+        />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

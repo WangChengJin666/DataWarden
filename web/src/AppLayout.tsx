@@ -7,6 +7,7 @@ import {
   SearchOutlined,
   UserOutlined,
   AuditOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons'
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { clearSession, getCurrentUser } from '@/api/client'
@@ -45,6 +46,11 @@ export default function AppLayout() {
           key: '/review',
           icon: <AuditOutlined />,
           label: <Link to="/review">授权审批</Link>,
+        },
+        {
+          key: '/grants',
+          icon: <SafetyCertificateOutlined />,
+          label: <Link to="/grants">授权管理</Link>,
         },
       )
     }
