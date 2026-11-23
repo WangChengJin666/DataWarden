@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/opensourceprj/datawarden/internal/auth"
+	"github.com/opensourceprj/datawarden/internal/model"
 )
 
 // context key，避免字符串字面量散落各处。
@@ -32,6 +33,25 @@ func AuthMiddleware(issuer *auth.TokenIssuer) gin.HandlerFunc {
 		c.Set(ctxUserID, claims.UserID)
 		c.Set(ctxUsername, claims.Username)
 		c.Set(ctxRole, claims.Role)
+		c.Next()
+	}
+}
+
+// requireDBAMiddleware 在路由层拦截非 DBA 请求，避免「前端藏了按钮、接口仍然全开」。
+//
+// 原本权限校验只写在各个 handler 里，List / Get 两个读接口漏掉了。
+// 把它们收到路由层统一拦截，比逐个 handler 里记得写 requireDBA 更不容易漏。
+// handler 内仍保留 requireDBA 校验：路由是唯一入口时才安全，
+// 将来有人把 handler 挂到别的 group 上，也不会意外放开。
+func requireDBAMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		_, _, role := currentUser(c)
+		if role != string(model.RoleDBA) && role != string(model.RoleSuperAdmin) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error": "forbidden: only dba can manage datasources",
+			})
+			return
+		}
 		c.Next()
 	}
 }

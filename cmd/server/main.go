@@ -68,8 +68,7 @@ func main() {
 	log.Println("authz policies loaded")
 
 	// 内置角色策略：dba 与 superadmin 可读全部数据源
-	enforcer.AddPolicy("dba", "ds:*", "read")
-	enforcer.AddPolicy("superadmin", "ds:*", "read")
+	reAddBuiltinPolicies(enforcer)
 
 	querySvc := &querysvc.Service{
 		Enforcer:        enforcer,
@@ -85,10 +84,30 @@ func main() {
 			log.Printf("refresh authz failed: %v", err)
 			return
 		}
-		enforcer.AddPolicy("dba", "ds:*", "read")
-		enforcer.AddPolicy("superadmin", "ds:*", "read")
+		reAddBuiltinPolicies(enforcer)
 		log.Println("authz refreshed after approval")
 	}
+
+	// 定时重建策略：授权带 expires_at，而过期只体现在数据库里。
+	// 不刷的话，一条过期授权会一直生效到下次重启——这是真实越权窗口。
+	// 审批通过走的 refreshAuthz 是「即时」路径，这里负责兜住「自然过期」。
+	go func() {
+		interval := time.Duration(cfg.AuthzRefreshSec) * time.Second
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := syncAuthz(ctx, enforcer, userStore, grantStore); err != nil {
+					log.Printf("periodic authz refresh failed: %v", err)
+					continue
+				}
+				reAddBuiltinPolicies(enforcer)
+			}
+		}
+	}()
 
 	router := httpapi.NewRouter(httpapi.Deps{
 		Issuer:      issuer,
@@ -113,6 +132,20 @@ func main() {
 				refreshAuthz(ctx)
 			},
 		},
+		Grant: &httpapi.GrantHandler{
+			Store: grantStore,
+			// 吊销后立即重建策略：收回权限是应急动作，不能等定时刷新。
+			OnRevoke: func(ctx context.Context) {
+				refreshAuthz(ctx)
+			},
+		},
+		Metadata: &httpapi.MetadataHandler{
+			// 元数据接口同时需要「数据源配置」和「授权 scope」，
+			// 用 grantStore 实现 scopeLister，交给类型断言即可。
+			Store:    metadataStore{ds: dsStore, grants: grantStore},
+			Factory:  makeAdapterFactory(ctx, dsStore),
+			Enforcer: enforcer,
+		},
 	})
 
 	srv := &http.Server{
@@ -133,6 +166,50 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	log.Println("datawarden stopped")
+}
+
+// reAddBuiltinPolicies 重新挂上内置角色策略。
+//
+// SyncGrants 会先清空 p 段再按数据库记录重建，内置的 dba / superadmin 策略
+// 不在数据库里，会被一起清掉。所以凡是调用 syncAuthz 之后都必须补一次，
+// 否则刷新一次策略，DBA 自己就查不了任何数据了。
+func reAddBuiltinPolicies(e *authz.Enforcer) {
+	e.AddPolicy("dba", "ds:*", "read")
+	e.AddPolicy("superadmin", "ds:*", "read")
+}
+
+// metadataStore 把「数据源读取」和「授权 scope 查询」组合成元数据接口需要的存储。
+//
+// 拆成两个 store 是因为职责不同（一个是配置，一个是权限），
+// 但元数据接口两个都要：读配置才知道连哪，读授权才知道能看哪些表。
+// 用一个适配器组合起来比让 DatasourceStore 反依赖 GrantStore 更干净。
+type metadataStore struct {
+	ds     *store.DatasourceStore
+	grants *store.GrantStore
+}
+
+func (m metadataStore) List(ctx context.Context) ([]model.Datasource, error) {
+	return m.ds.List(ctx)
+}
+
+func (m metadataStore) Get(ctx context.Context, id int64) (*model.Datasource, error) {
+	return m.ds.Get(ctx, id)
+}
+
+func (m metadataStore) Create(ctx context.Context, ds *model.Datasource) (int64, error) {
+	return m.ds.Create(ctx, ds)
+}
+
+func (m metadataStore) Update(ctx context.Context, ds *model.Datasource) error {
+	return m.ds.Update(ctx, ds)
+}
+
+func (m metadataStore) Delete(ctx context.Context, id int64) error {
+	return m.ds.Delete(ctx, id)
+}
+
+func (m metadataStore) GrantScopes(ctx context.Context, userID, datasourceID int64) ([]string, error) {
+	return m.grants.GrantScopes(ctx, userID, datasourceID)
 }
 
 // syncAuthz 用数据库现状重建 Casbin 策略。
@@ -210,7 +287,7 @@ func (c *redisClientCache) get(id int64, ds *model.Datasource, password string, 
 		return cl, nil
 	}
 	addr := fmt.Sprintf("%s:%d", ds.Host, ds.Port)
-	cl, err := redisq.NewClient(addr, password, dbIndex, maxKeys)
+	cl, err := redisq.NewClient(addr, ds.Username, password, dbIndex, maxKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -231,12 +308,14 @@ func makeAdapterFactory(ctx context.Context, dsStore *store.DatasourceStore) htt
 		// 之前所有库共用 QUERY_DB_USER 一组账号，等于放弃最小权限。
 
 		return adapter.New(adapter.ConnConfig{
-			Type:     string(ds.Type),
-			Host:     ds.Host,
-			Port:     ds.Port,
-			Database: ds.Database,
-			User:     ds.Username,
-			Password: ds.Password,
+			Type:       string(ds.Type),
+			Host:       ds.Host,
+			Port:       ds.Port,
+			Database:   ds.Database,
+			User:       ds.Username,
+			Password:   ds.Password,
+			AuthSource: ds.AuthSource,
+			Options:    ds.Options,
 		})
 	}
 }
@@ -247,12 +326,14 @@ type adapterProbe struct{}
 
 func (adapterProbe) Test(ctx context.Context, cfg httpapi.TestConnConfig) (*httpapi.TestConnResult, error) {
 	res, err := adapter.Probe(ctx, adapter.ProbeConfig{
-		Type:     cfg.Type,
-		Host:     cfg.Host,
-		Port:     cfg.Port,
-		Database: cfg.Database,
-		User:     cfg.User,
-		Password: cfg.Password,
+		Type:       cfg.Type,
+		Host:       cfg.Host,
+		Port:       cfg.Port,
+		Database:   cfg.Database,
+		User:       cfg.User,
+		Password:   cfg.Password,
+		AuthSource: cfg.AuthSource,
+		Options:    cfg.Options,
 	})
 	if err != nil {
 		return nil, err

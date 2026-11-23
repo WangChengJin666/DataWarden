@@ -29,11 +29,11 @@ func (s *DatasourceStore) Create(ctx context.Context, ds *model.Datasource) (int
 	var id int64
 	err = s.pool.QueryRow(ctx,
 		`INSERT INTO datasource
-		   (name, type, host, port, db_name, username, password,
+		   (name, type, host, port, db_name, username, password, auth_source, options,
 		    apply_enabled, max_apply_days, apply_scopes, description)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
 		ds.Name, string(ds.Type), ds.Host, ds.Port, ds.Database,
-		ds.Username, ds.Password,
+		ds.Username, ds.Password, ds.AuthSource, orEmptyOptions(ds.Options),
 		ds.ApplyEnabled, orDefaultInt(ds.MaxApplyDays, 7), scopes, ds.Description,
 	).Scan(&id)
 	if err != nil {
@@ -58,11 +58,12 @@ func (s *DatasourceStore) Update(ctx context.Context, ds *model.Datasource) erro
 		   username = $6,
 		   password = CASE WHEN $7 = '' THEN password ELSE $7 END,
 		   apply_enabled = $8, max_apply_days = $9, apply_scopes = $10,
-		   description = $11
-		 WHERE id = $12`,
+		   description = $11, auth_source = $12, options = $13
+		 WHERE id = $14`,
 		ds.Name, string(ds.Type), ds.Host, ds.Port, ds.Database,
 		ds.Username, ds.Password,
-		ds.ApplyEnabled, orDefaultInt(ds.MaxApplyDays, 7), scopes, ds.Description, ds.ID)
+		ds.ApplyEnabled, orDefaultInt(ds.MaxApplyDays, 7), scopes, ds.Description,
+		ds.AuthSource, orEmptyOptions(ds.Options), ds.ID)
 	if err != nil {
 		return fmt.Errorf("update datasource: %w", err)
 	}
@@ -85,7 +86,7 @@ func (s *DatasourceStore) Delete(ctx context.Context, id int64) error {
 }
 
 const datasourceSelect = `
-	SELECT id, name, type, host, port, db_name, username, password,
+	SELECT id, name, type, host, port, db_name, username, password, auth_source, options,
 	       created_at, apply_enabled, max_apply_days, apply_scopes, description
 	FROM datasource`
 
@@ -93,12 +94,13 @@ func scanDatasource(row interface {
 	Scan(dest ...any) error
 }) (*model.Datasource, error) {
 	var (
-		d      model.Datasource
-		typ    string
-		scopes []byte
+		d       model.Datasource
+		typ     string
+		scopes  []byte
+		optsRaw []byte
 	)
 	err := row.Scan(&d.ID, &d.Name, &typ, &d.Host, &d.Port, &d.Database,
-		&d.Username, &d.Password,
+		&d.Username, &d.Password, &d.AuthSource, &optsRaw,
 		&d.CreatedAt, &d.ApplyEnabled, &d.MaxApplyDays, &scopes, &d.Description)
 	if err != nil {
 		return nil, err
@@ -113,7 +115,32 @@ func scanDatasource(row interface {
 		}
 	}
 	d.ApplyScopes = orEmptyScopes(parsed)
+	d.Options = parseOptions(optsRaw)
 	return &d, nil
+}
+
+// parseOptions 解析 options 列的 JSON 对象。
+//
+// 解析失败不报错而是退回空 map：老数据、手工改坏的列都不该让整个列表页挂掉，
+// 缺少高级参数最多是连不上，而不是「数据源管理打不开」。
+func parseOptions(raw []byte) map[string]string {
+	out := map[string]string{}
+	if len(raw) == 0 {
+		return out
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return map[string]string{}
+	}
+	return out
+}
+
+// orEmptyOptions 保证传给数据库的是合法 JSON 对象，不是 nil。
+// pgx 会把 nil map 写成 SQL NULL，与列上的 NOT NULL 冲突。
+func orEmptyOptions(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
 }
 
 func (s *DatasourceStore) List(ctx context.Context) ([]model.Datasource, error) {

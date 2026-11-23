@@ -15,6 +15,30 @@ type ConnConfig struct {
 	Database string
 	User     string
 	Password string
+	// AuthSource 是 MongoDB 的认证库，即「账号建在哪个库」。
+	//
+	// 它和 Database 不是一回事：账号可以建在 admin（全局管理员），
+	// 也可以建在某个业务库（该库的专属用户）。填对才能通过 SCRAM 认证。
+	// 留空时回落 admin，与 MongoDB 官方工具（驱动 URI 默认值、mongosh
+	// 的 --authenticationDatabase 默认值）一致。
+	// 其他数据库类型忽略此字段。
+	AuthSource string
+
+	// Options 是连接高级参数，键值直接透传给驱动。
+	//
+	// 为什么需要：真实环境的连接远不止 host/port/user/password——
+	//   - MongoDB 副本集只能填一个 host，必须带 replicaSet=
+	//   - 云数据库普遍要求 TLS，需要 tls=true 与 CA 证书路径
+	//   - 生产的只读查询通常挂从库，需要 readPreference=secondaryPreferred
+	//   - PostgreSQL 的 sslmode 之前被硬编码成 disable，云实例直接连不上
+	//
+	// 用 map[string]string 而不是给每类库加一串字段：不同类型支持的参数
+	// 差别很大（Mongo 的 replicaSet、PG 的 sslmode），穷举字段会让结构
+	// 无限膨胀；透传给驱动则「驱动支持什么就能填什么」。
+	//
+	// 白名单在 newMongo/newPostgres 里做，不接受任意参数——
+	// 否则 readonly 用户也能通过参数改变连接语义。
+	Options map[string]string
 }
 
 // QueryResult 是统一的查询结果，屏蔽各驱动差异。
@@ -39,6 +63,12 @@ type Adapter interface {
 	ListDatabases(ctx context.Context) ([]string, error)
 	ListTables(ctx context.Context, db string) ([]string, error)
 	Query(ctx context.Context, sql string, rowLimit int) (*QueryResult, error)
+	// QueryWithArgs 执行带参数的只读查询。
+	//
+	// 只给元数据接口用（information_schema 查询要传库名/表名）。
+	// 用户 SQL 永远走 Query，不接受外部传入的参数——
+	// 否则「参数化查询」会变成一个绕过只读白名单的后门。
+	QueryWithArgs(ctx context.Context, sql string, args []any, rowLimit int) (*QueryResult, error)
 	// Close 释放底层连接池。测试连接这类一次性使用必须调用，否则会泄漏连接。
 	Close() error
 }
@@ -137,16 +167,116 @@ func isIdentChar(b byte) bool {
 	return b == '_' || (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
 
-// EnsureRowLimit 在语句没有 LIMIT 时追加外层包裹的限行。
+// EnsureRowLimit 给语句加上行数上限，返回可直接执行的 SQL。
+//
+// 不能一律包成 SELECT * FROM (...) —— SHOW / DESC / EXPLAIN 不是 SELECT，
+// 嵌进子查询后语法直接报错：
+//
+//	SHOW VARIABLES LIKE 'x'
+//	→ SELECT * FROM (SHOW VARIABLES LIKE 'x') AS _dw_limit_wrap LIMIT 101   ✗
+//
+// 而 IsReadOnlySQL 明确放行了这五个关键字，放行了却执行不了。
+// 所以按语句类型分流：
+//
+//	SELECT / WITH             → 外层包裹限行
+//	SHOW / DESC / DESCRIBE    → 原样执行，靠驱动读取的行数截断
+//	EXPLAIN                   → 原样执行（PG 的 EXPLAIN 不接受 LIMIT 包裹）
+//
+// 语义类语句（SHOW/DESC/EXPLAIN）的返回规模本身有限：SHOW 是元数据行，
+// DESC 是列定义，EXPLAIN 是执行计划，不存在「扫全表」的风险，
+// 真正的兜底在 adapter.Query 的 rowLimit 循环计数里。
 func EnsureRowLimit(sql string, limit int) string {
 	s := strings.TrimSpace(sql)
-	trimmed := strings.TrimSuffix(s, ";")
-	trimmed = strings.TrimSpace(trimmed)
+	trimmed := strings.TrimRight(strings.TrimSpace(s), "; \t\r\n")
 
-	if strings.Contains(strings.ToUpper(trimmed), " LIMIT ") {
+	upper := strings.ToUpper(trimmed)
+
+	// 语义类语句：加不了 LIMIT，原样执行
+	for _, kw := range []string{"SHOW", "DESC", "DESCRIBE", "EXPLAIN"} {
+		if strings.HasPrefix(upper, kw) {
+			return trimmed
+		}
+	}
+
+	// 已经有 LIMIT 的语句不再改：外层再包一层会让 LIMIT 语义变化
+	// （内层的 LIMIT 先截断，外层再截一次，行数还是内层的），
+	// 也躲不过「LIMIT 写在换行后」这类写法，所以这里做词法级判断。
+	if hasTopLevelLimit(trimmed) {
 		return trimmed
 	}
 	return fmt.Sprintf("SELECT * FROM (%s) AS _dw_limit_wrap LIMIT %d", trimmed, limit)
+}
+
+// hasTopLevelLimit 判断语句顶层是否已经带了 LIMIT 子句。
+//
+// 之前用 strings.Contains(upper, " LIMIT ")，有三个坑：
+//   1. LIMIT 写在换行后（"...\nLIMIT 10"）→ 判不出来，被外层再包一层
+//   2. LIMIT 后面是制表符 → 同样判不出来
+//   3. 字符串字面量里出现 " limit "（如 WHERE note = 'no limit here'）→ 误判为已限行，
+//      结果真的没有限行
+//
+// 这里做一次轻量词法扫描：跳过字符串、标识符、注释，只认顶层的 LIMIT 关键字。
+func hasTopLevelLimit(s string) bool {
+	depth := 0
+	inStr := false
+	var quote byte
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case inStr:
+			if c == quote {
+				// 处理 SQL 的 '' 转义
+				if i+1 < len(s) && s[i+1] == quote {
+					i++
+					continue
+				}
+				inStr = false
+			}
+			continue
+		case c == '\'' || c == '"' || c == '`':
+			inStr = true
+			quote = c
+			continue
+		case c == '-' && i+1 < len(s) && s[i+1] == '-':
+			// 行注释：跳到行尾
+			for i < len(s) && s[i] != '\n' {
+				i++
+			}
+			continue
+		case c == '/' && i+1 < len(s) && s[i+1] == '*':
+			// 块注释：跳到 */
+			end := strings.Index(s[i+2:], "*/")
+			if end < 0 {
+				return false
+			}
+			i += end + 3
+			continue
+		case c == '(':
+			depth++
+			continue
+		case c == ')':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+
+		if depth != 0 || (c != 'l' && c != 'L') {
+			continue
+		}
+		// 顶层出现 "limit" 且前后都不是标识符字符
+		if i+5 > len(s) || !strings.EqualFold(s[i:i+5], "limit") {
+			continue
+		}
+		beforeOK := i == 0 || !isIdentChar(s[i-1])
+		after := i + 5
+		afterOK := after >= len(s) || !isIdentChar(s[after])
+		if beforeOK && afterOK {
+			return true
+		}
+	}
+	return false
 }
 
 func elapsed(start time.Time) int64 {

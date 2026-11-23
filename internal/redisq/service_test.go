@@ -47,7 +47,7 @@ func setupService(t *testing.T, maxKeys int) *QueryService {
 	testutil.CleanTestKeys(t, addr)
 	t.Cleanup(func() { testutil.CleanTestKeys(t, addr) })
 
-	c, err := NewClient(addr, testutil.RedisPassword(), testutil.RedisDB(t), maxKeys)
+	c, err := NewClient(addr, "", testutil.RedisPassword(), testutil.RedisDB(t), maxKeys)
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}

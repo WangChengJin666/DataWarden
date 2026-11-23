@@ -59,9 +59,14 @@ func (m *memDatasources) Create(ctx context.Context, ds *model.Datasource) (int6
 	return 99, nil
 }
 
+// Update 与真实 store 保持一致：密码为空表示「不修改」，保留原值。
+// 内存实现如果直接整体覆盖，就没法验证「编辑时不重填密码不会清空密码」这条规则。
 func (m *memDatasources) Update(ctx context.Context, ds *model.Datasource) error {
 	for i := range m.items {
 		if m.items[i].ID == ds.ID {
+			if ds.Password == "" {
+				ds.Password = m.items[i].Password
+			}
 			m.items[i] = *ds
 			return nil
 		}
@@ -100,6 +105,18 @@ func buildRouter(t *testing.T, passwords map[string]string, role string) *gin.En
 		Issuer:      issuer,
 		AuthHandler: &AuthHandler{Users: &memUsers{passwords: passwords, role: role}, Issuer: issuer},
 		Datasource:  &DatasourceHandler{Store: &memDatasources{}},
+		Query:       &QueryHandler{},
+	})
+}
+
+// buildRouterWithStore 与 buildRouter 相同，但允许注入带数据的内存存储。
+func buildRouterWithStore(t *testing.T, ds *memDatasources, role string) *gin.Engine {
+	t.Helper()
+	issuer := auth.NewTokenIssuer("test-secret", time.Hour)
+	return NewRouter(Deps{
+		Issuer:      issuer,
+		AuthHandler: &AuthHandler{Users: &memUsers{passwords: map[string]string{"alice": "correct"}, role: role}, Issuer: issuer},
+		Datasource:  &DatasourceHandler{Store: ds},
 		Query:       &QueryHandler{},
 	})
 }

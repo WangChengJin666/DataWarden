@@ -52,7 +52,22 @@ func (h *QueryHandler) ExecuteMongo(c *gin.Context) {
 	// 既浪费连接资源，也让人可以借报错信息探测目标库是否存在。
 	uid, username, _ := currentUser(c)
 	subject := "u:" + strconv.FormatInt(uid, 10)
-	obj := fmt.Sprintf("ds:%d:%s:%s", req.DatasourceID, req.Database, collection)
+
+	// 集合名可能带库前缀（db.shop.users 形式解析出 "shop.users"）。
+	// 鉴权必须用拆分后的 (库, 集合)，否则 ds:<id>:<库>:<集合> 会少一段，
+	// keyMatch 的匹配范围不对。执行层仍然用原始 collection——
+	// 适配器会自己处理前缀，拆了反而改变实际查询的库。
+	//
+	// 这里与 querysvc.ExecuteMongo 内部那道校验走同一个函数，
+	// 不再维护两份实现（两份实现就等于两条会各自漂移的规则）。
+	authzDB, authzColl, err := querysvc.SplitDBCollection(collection, req.Database)
+	if err != nil {
+		// 拆分失败说明集合名异常（如 "shop." 结尾）。按参数错误返回，
+		// 而不是退化成原值——退化成原值会让鉴权与执行用两套库名。
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid collection: " + err.Error()})
+		return
+	}
+	obj := fmt.Sprintf("ds:%d:%s:%s", req.DatasourceID, authzDB, authzColl)
 	if !h.Service.Enforcer.Enforce(subject, obj, "read") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "no permission on this collection"})
 		return

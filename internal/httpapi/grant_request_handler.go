@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/opensourceprj/datawarden/internal/authz"
 	"github.com/opensourceprj/datawarden/internal/model"
 )
 
@@ -72,7 +73,27 @@ func (h *GrantRequestHandler) Create(c *gin.Context) {
 		})
 		return
 	}
-	if !scopeAllowed(ds.ApplyScopes, req.Scope) {
+	// 整库授权写成 "db:*"，与 Casbin 策略里 ds:<id>:<db>:* 的形态一致。
+	//
+	// 前端提交整库时传的是裸库名 "shop"，若原样入库，
+	// 生成的策略是 ds:<id>:shop（只有三段中的前两段 + 库名），
+	// 而鉴权请求是 ds:<id>:shop:orders——keyMatch("ds:1:shop:orders", "ds:1:shop")
+	// 不匹配，于是「整库授权」实际一条表都查不了。这是个静默失效：
+	// 审批通过、页面显示已授权，但用户查询全是 403。
+	//
+	// NormalizeScope 对畸形输入返回空串（含空库名、多余冒号、
+	// 纯通配 "*"，见其注释），这里必须拒绝而不是继续往下走：
+	// 空 scope 会落库成一条永远匹配不上的授权，
+	// "*" 更会变成「本数据源全库全表」——远超申请一个库的本意。
+	scope := authz.NormalizeScope(req.Scope)
+	if scope == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "申请范围格式不合法：应为「库名」或「库名:表1,表2」",
+		})
+		return
+	}
+
+	if !scopeAllowed(ds.ApplyScopes, scope) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error": "requested scope is not in the allowed list of this datasource",
 		})
@@ -83,7 +104,7 @@ func (h *GrantRequestHandler) Create(c *gin.Context) {
 	id, err := h.Requests.Create(c.Request.Context(), &model.GrantRequest{
 		UserID:       uid,
 		DatasourceID: req.DatasourceID,
-		Scope:        req.Scope,
+		Scope:        scope,
 		Days:         req.Days,
 		Reason:       req.Reason,
 	})
@@ -235,9 +256,13 @@ func (h *GrantRequestHandler) Cancel(c *gin.Context) {
 }
 
 // scopeAllowed 判断申请的 scope 是否命中管理员配置的任一范围。
-// scope 格式 "db" 或 "db:tbl1,tbl2"，与 ApplyScope 的语义对应。
+// scope 格式 "库" 或 "库:tbl1,tbl2"；"库:*" 与 "库" 等价（整库）。
+//
+// 比较前先规范化：管理员配置里整库是 tables 为空，
+// 而申请侧整库可能写成 "shop" 或 "shop:*" 两种形态，必须归一后再比，
+// 否则会出现「管理员开放了整库，用户申请整库却被拒」。
 func scopeAllowed(allowed []model.ApplyScope, scope string) bool {
-	db, tables := splitScope(scope)
+	db, tables := splitScope(authz.NormalizeScope(scope))
 
 	for _, a := range allowed {
 		if a.Database != db {
@@ -261,6 +286,13 @@ func scopeAllowed(allowed []model.ApplyScope, scope string) bool {
 	return false
 }
 
+// splitScope 把 "库" / "库:*" / "库:t1,t2" 拆成库名与表清单。
+//
+// "*" 必须归一成「无非表清单」：
+// 整库授权在内部统一表示成 tables 为空（与 model.ApplyScope.Tables 的语义一致）。
+// 若把 "*" 当成一个表名放进 tables，后续：
+//   - tablesFor 会把它追加进表下拉，界面上多出一项叫 "*"
+//   - scopeAllowed 会去找一张名为 "*" 的表，整库配置永远匹配不上
 func splitScope(scope string) (db string, tables []string) {
 	parts := strings.SplitN(scope, ":", 2)
 	db = strings.TrimSpace(parts[0])
@@ -268,9 +300,12 @@ func splitScope(scope string) (db string, tables []string) {
 		return db, nil
 	}
 	for _, t := range strings.Split(parts[1], ",") {
-		if s := strings.TrimSpace(t); s != "" {
-			tables = append(tables, s)
+		s := strings.TrimSpace(t)
+		// "*" 单独出现表示整库，等价于不写表清单
+		if s == "" || s == "*" {
+			continue
 		}
+		tables = append(tables, s)
 	}
 	return db, tables
 }

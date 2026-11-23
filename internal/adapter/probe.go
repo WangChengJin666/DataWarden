@@ -18,6 +18,11 @@ type ProbeConfig struct {
 	Database string
 	User     string
 	Password string
+	// AuthSource 仅 MongoDB 使用：账号所在的认证库，留空回落 admin。
+	AuthSource string
+	// Options 连接高级参数（MongoDB 的 replicaSet/tls/readPreference 等），
+	// 测试连接必须和正式查询用同一套参数，否则「测通了、用不了」。
+	Options map[string]string
 }
 
 // ProbeResult 是探测结果。
@@ -59,12 +64,14 @@ func Probe(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 		}
 
 		a, err := New(ConnConfig{
-			Type:     cfg.Type,
-			Host:     cfg.Host,
-			Port:     cfg.Port,
-			Database: cfg.Database,
-			User:     cfg.User,
-			Password: cfg.Password,
+			Type:       cfg.Type,
+			Host:       cfg.Host,
+			Port:       cfg.Port,
+			Database:   cfg.Database,
+			User:       cfg.User,
+			Password:   cfg.Password,
+			AuthSource: cfg.AuthSource,
+			Options:    cfg.Options,
 		})
 		if err != nil {
 			return nil, err
@@ -100,7 +107,13 @@ func probeRedis(ctx context.Context, cfg ProbeConfig) error {
 	}
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		Addr: fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		// Redis 6 之前的实例只有 requirepass，填了 password 但没填账号时
+		// 会走 default 用户认证（这一层由服务端处理，客户端传空 Username 即可）。
+		// Redis 6+ 的 ACL 与云厂商托管实例普遍要求用户名，
+		// 之前这里不传 Username，填了账号也会被静默丢掉，
+		// 现象是「测试连接失败，但报错和账号毫无关系」。
+		Username: cfg.User,
 		Password: cfg.Password,
 		DB:       dbIndex,
 	})

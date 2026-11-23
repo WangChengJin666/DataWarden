@@ -42,11 +42,27 @@ func (s *Service) ExecuteMongo(ctx context.Context, req MongoRequest, ad adapter
 	}
 
 	// 2. 鉴权：ds:<id>:<db>:<collection>
-	obj := fmt.Sprintf("ds:%d:%s:%s", req.DatasourceID, req.Database, req.Collection)
+	//
+	// 集合名可能带库前缀（适配器支持 "shop.users" 形式）。鉴权对象是
+	// 用冒号拼接的三段式，必须先把库前缀拆出来，否则拼出来只有两段，
+	// keyMatch 的匹配范围就不再是「某库下的某表」。
+	// service 层自己做这一步，不依赖 handler 先处理好——
+	// 有多条调用路径时，校验放在最靠近数据的地方才不会被绕过。
+	authzDB, authzColl, err := SplitDBCollection(req.Collection, req.Database)
+	if err != nil {
+		s.auditMongo(ctx, req, "mongo.denied", map[string]any{
+			"reason":     "invalid collection",
+			"collection": req.Collection,
+			"error":      err.Error(),
+		})
+		return nil, ErrNoTables
+	}
+	obj := fmt.Sprintf("ds:%d:%s:%s", req.DatasourceID, authzDB, authzColl)
 	if !s.Enforcer.Enforce(req.Subject, obj, "read") {
 		s.auditMongo(ctx, req, "mongo.denied", map[string]any{
 			"reason":     "no grant",
-			"collection": req.Collection,
+			"collection": authzColl,
+			"db":         authzDB,
 		})
 		return nil, ErrForbidden
 	}
@@ -83,6 +99,23 @@ func (s *Service) ExecuteMongo(ctx context.Context, req MongoRequest, ad adapter
 		"elapsed_ms": res.ElapsedMs,
 	})
 	return res, nil
+}
+
+// SplitDBCollection 把集合名拆成 (库, 集合)，供鉴权拼 object 使用。
+//
+// 直接转调 adapter.SplitDBCollection，不在这里再写一份实现：
+// 执行层和鉴权层必须拆出完全相同的结果，两份实现会各自漂移，
+// 一旦不一致就可能「鉴权放行了 A 库、实际查到 B 库」。
+// 保留这个转发函数是为了让 service 层的调用点读起来自洽，
+// 同时把 «adapter 的拆分是唯一事实来源» 这件事写在调用路径上。
+//
+// 错误必须原样上抛，不能吞掉：
+// 早先这里在 err 时退回 (database, collection) 原值，等于给鉴权层
+// 留了一条与执行层不一致的退路——拆分失败时鉴权用一套值、执行用另一套，
+// 正是要消除的问题。调用方已经有空集合校验，走不到这里；
+// 真走到了说明入参异常，宁可整条查询失败。
+func SplitDBCollection(collection, database string) (db, coll string, err error) {
+	return adapter.SplitDBCollection(collection, database)
 }
 
 func (s *Service) auditMongo(ctx context.Context, req MongoRequest, action string, detail map[string]any) {

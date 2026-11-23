@@ -99,3 +99,46 @@ func TestParseMongoQuery_Signature(t *testing.T) {
 		t.Errorf("signature = %q, should contain users.find", q.Signature())
 	}
 }
+
+// 回归测试：Args 必须从「操作名后面的括号」开始，而不是整串里的第一个括号。
+//
+// 曾经用 strings.Index(input, "(") 截取，遇到 db.getCollection("x").find(...)
+// 时把 getCollection 的括号当成了起点，Args 变成 ("x").find(...)，
+// 下游把 "x" 当过滤条件解析并报「不是合法的 JSON」。
+func TestParseMongoQuery_ArgsStartAtOpParen(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{`db.users.find({"a":1})`, `({"a":1})`},
+		{`db.getCollection("users").find({"a":1})`, `({"a":1})`},
+		{`db.getCollection("sys.log").find({})`, `({})`},
+		{`db.getCollection("sys.log").find({}).limit(5)`, `({}).limit(5)`},
+		{`db.shop.users.find({"a":1})`, `({"a":1})`},
+	}
+	for _, c := range cases {
+		q, err := ParseMongoQuery(c.in)
+		if err != nil {
+			t.Errorf("%s: unexpected error %v", c.in, err)
+			continue
+		}
+		if q.Args != c.want {
+			t.Errorf("%s: args = %q, want %q", c.in, q.Args, c.want)
+		}
+	}
+}
+
+// getCollection 形式的过滤条件必须能被真正解析成 bson，而不是止步于正则。
+func TestParseMongoQuery_GetCollectionFilterParses(t *testing.T) {
+	q, err := ParseMongoQuery(`db.getCollection("users").find({"status":"active"})`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filter, _, err := parseMongoCallArgs(q.Args, q.Op)
+	if err != nil {
+		t.Fatalf("filter should parse: %v", err)
+	}
+	if len(filter) != 1 || filter[0].Key != "status" {
+		t.Fatalf("filter = %v, want status key", filter)
+	}
+}

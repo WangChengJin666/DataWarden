@@ -33,9 +33,12 @@ type Client struct {
 }
 
 // NewClient 建立连接并探活。maxKeys 控制模糊查询单次最多返回的 key 数量。
-func NewClient(addr, password string, db, maxKeys int) (*Client, error) {
+func NewClient(addr, username, password string, db, maxKeys int) (*Client, error) {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     addr,
+		Addr: addr,
+		// Redis 6+ 的 ACL 需要用户名。留空时客户端发 AUTH <password>，
+		// 兼容只有 requirepass 的老实例；填了则发 AUTH <user> <password>。
+		Username: username,
 		Password: password,
 		DB:       db,
 	})

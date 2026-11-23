@@ -13,7 +13,7 @@ func setupClient(t *testing.T) *Client {
 	testutil.CleanTestKeys(t, addr)
 	t.Cleanup(func() { testutil.CleanTestKeys(t, addr) })
 
-	c, err := NewClient(addr, testutil.RedisPassword(), testutil.RedisDB(t), 200)
+	c, err := NewClient(addr, "", testutil.RedisPassword(), testutil.RedisDB(t), 200)
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestScan_TruncatesAtLimit(t *testing.T) {
 	pw := testutil.RedisPassword()
 	ctx := context.Background()
 
-	c, err := NewClient(addr, pw, db, 200)
+	c, err := NewClient(addr, "", pw, db, 200)
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestScan_TruncatesAtLimit(t *testing.T) {
 		}
 	}
 
-	limited, err := NewClient(addr, pw, db, 3)
+	limited, err := NewClient(addr, "", pw, db, 3)
 	if err != nil {
 		t.Fatalf("new limited client: %v", err)
 	}

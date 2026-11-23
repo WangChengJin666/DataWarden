@@ -39,6 +39,12 @@ func (s *stubAdapter) Query(ctx context.Context, sql string, limit int) (*adapte
 	return s.result, s.err
 }
 
+// QueryWithArgs 只给元数据接口用，业务查询永远不会走到这里。
+// 实现成同样的行为，保证替身完整实现 adapter.Adapter。
+func (s *stubAdapter) QueryWithArgs(ctx context.Context, sql string, args []any, limit int) (*adapter.QueryResult, error) {
+	return s.Query(ctx, sql, limit)
+}
+
 type recordingEnforcer struct {
 	allowed bool
 	lastObj string

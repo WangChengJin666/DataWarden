@@ -95,6 +95,16 @@ func (s *Service) ExecuteSQL(ctx context.Context, req SQLRequest, ad adapter.Ada
 	}
 
 	// 2. 逐表鉴权：任一表无权限则整条拒绝，且不暴露是哪张表
+	//
+	// req.Database 的非空由 handler 保证（httpapi.sqlQueryRequest 上有
+	// binding:"required"，唯一调用点 query_handler.go），这里不重复判空。
+	//
+	// 但要注意空库名**不是**安全的：拼出的 ds:<id>::<tbl> 会被
+	// keyMatch 的 * 后缀通配命中，即「有整库授权（ds:<id>:*）的用户
+	// 传空库名时鉴权会放行」，而 SQL 实际在连接默认库上执行——
+	// 鉴权对象与执行目标不一致。对表级授权才是 fail-closed。
+	// 因此这里的安全完全依赖上游的必填校验；若将来新增内部调用方
+	// （批处理、CLI），必须自己保证 Database 非空。
 	for _, tbl := range req.Tables {
 		obj := fmt.Sprintf("ds:%d:%s:%s", req.DatasourceID, req.Database, tbl)
 		if !s.Enforcer.Enforce(req.Subject, obj, "read") {

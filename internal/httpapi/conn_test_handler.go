@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -25,6 +26,10 @@ type TestConnConfig struct {
 	Database string
 	User     string
 	Password string
+	// AuthSource 仅 MongoDB 使用：账号所在的认证库，留空回落 admin。
+	AuthSource string
+	// Options 连接高级参数，必须与正式查询用同一套，否则测通了用不了。
+	Options map[string]string
 }
 
 // TestConnResult 是测试连接的结果，回传给前端展示。
@@ -41,6 +46,10 @@ type testConnReq struct {
 	Database string `json:"database"`
 	Username string `json:"username"`
 	Password string `json:"password"`
+	// AuthSource 仅 MongoDB：账号所在的认证库，留空回落 admin。
+	AuthSource string `json:"auth_source"`
+	// Options 连接高级参数（MongoDB 的 replicaSet/tls、PG 的 sslmode 等）。
+	Options map[string]string `json:"options"`
 	// DatasourceID 非 0 时表示编辑现有数据源：
 	// 密码留空则用库里已存的密码来测，不必让用户重新输一遍。
 	DatasourceID int64 `json:"datasource_id"`
@@ -87,12 +96,14 @@ func (h *DatasourceHandler) TestConnection(c *gin.Context) {
 	defer cancel()
 
 	res, err := h.Tester.Test(ctx, TestConnConfig{
-		Type:     req.Type,
-		Host:     req.Host,
-		Port:     req.Port,
-		Database: req.Database,
-		User:     req.Username,
-		Password: password,
+		Type:       req.Type,
+		Host:       req.Host,
+		Port:       req.Port,
+		Database:   req.Database,
+		User:       req.Username,
+		Password:   password,
+		AuthSource: req.AuthSource,
+		Options:    req.Options,
 	})
 
 	detail := map[string]any{
@@ -106,10 +117,18 @@ func (h *DatasourceHandler) TestConnection(c *gin.Context) {
 	}
 	auditEvent(c, uid, username, "datasource.test", 0, detail)
 
+	// 认证库的取值与 adapter 内部保持一致：显式填了就用它，否则回落 admin。
+	// 这里复算一次，只为把「实际按哪个库认证」写进错误提示，
+	// 不参与连接本身（连接由 adapter 决定）。
+	effectiveAuthSource := req.AuthSource
+	if req.Type == "mongodb" && effectiveAuthSource == "" {
+		effectiveAuthSource = "admin"
+	}
+
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"ok":      false,
-			"message": friendlyConnError(err),
+			"message": friendlyConnError(err, req.Type, effectiveAuthSource),
 		})
 		return
 	}
@@ -119,7 +138,12 @@ func (h *DatasourceHandler) TestConnection(c *gin.Context) {
 // friendlyConnError 把驱动错误转成便于用户理解的一句话。
 // 沿用原始错误会泄露内部细节（主机、用户名），但也可能太含糊，
 // 所以这里做分类后附加可读说明。
-func friendlyConnError(err error) string {
+//
+// typ 用于补充类型相关的排查方向（目前只有 MongoDB 需要）；
+// authSource 是该 MongoDB 数据源实际使用的认证库，用于在认证失败时
+// 告诉用户「平台是按哪个库认证的」——否则用户只会看到「账号或密码错」，
+// 而真正的问题往往是账号建在别的库里。
+func friendlyConnError(err error, typ, authSource string) string {
 	msg := err.Error()
 	lower := strings.ToLower(msg)
 
@@ -129,6 +153,11 @@ func friendlyConnError(err error) string {
 	// 分开提示，否则用户会一直去改密码却找不到原因。
 	case strings.Contains(lower, "requires authentication"),
 		strings.Contains(lower, "(unauthorized)"):
+		if typ == "mongodb" {
+			return fmt.Sprintf(
+				"权限不足：账号能登录，但没有读目标库的权限（认证库「%s」）。请给该账号补上目标库的 read 权限",
+				authSource)
+		}
 		return "权限不足：目标库已开启认证，请填写有查询权限的账号"
 	case strings.Contains(lower, "password authentication failed"),
 		strings.Contains(lower, "access denied"),
@@ -136,6 +165,22 @@ func friendlyConnError(err error) string {
 		strings.Contains(lower, "wrongpass"),
 		strings.Contains(lower, "invalid username"),
 		strings.Contains(lower, "noauth"):
+		if typ == "mongodb" {
+			// MongoDB 认证失败有三大常见原因，仅凭报错文本无法区分：
+			//   1. 密码真的错
+			//   2. 认证库选错（账号建在另一个库）
+			//   3. 只有密码没有账号，或账号被 ACL 禁用
+			// 把实际用的认证库写出来，用户对照账号创建时所在的库即可定位。
+			if authSource == "admin" {
+				return "认证失败：账号或密码不正确。" +
+					"当前未指定认证库，平台按默认的 admin 认证（与 mongosh 一致）。" +
+					"若该账号是建在业务库里的专属用户，请把「认证库」填成那个库名"
+			}
+			return fmt.Sprintf(
+				"认证失败：账号或密码不正确，或账号不属于认证库「%s」。"+
+					"请核对密码，并确认账号创建在哪个库",
+				authSource)
+		}
 		return "认证失败，请检查账号和密码"
 	case strings.Contains(lower, "timeout"),
 		strings.Contains(lower, "deadline exceeded"),

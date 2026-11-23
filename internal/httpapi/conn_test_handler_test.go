@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,22 +206,74 @@ func TestTestConnection_RejectsUnknownType(t *testing.T) {
 
 func TestFriendlyConnError(t *testing.T) {
 	cases := []struct {
-		err  string
-		want string
+		err        string
+		typ        string
+		authSource string
+		want       string
 	}{
-		{`failed SASL auth: FATAL: password authentication failed for user "x"`, "认证失败，请检查账号和密码"},
-		{"dial tcp 1.2.3.4:5432: i/o timeout", "连接超时，请检查主机、端口和网络连通性"},
-		{"dial tcp: connect: connection refused", "无法连接到目标主机，请检查主机和端口"},
+		{`failed SASL auth: FATAL: password authentication failed for user "x"`, "postgresql", "", "认证失败，请检查账号和密码"},
+		{"dial tcp 1.2.3.4:5432: i/o timeout", "postgresql", "", "连接超时，请检查主机、端口和网络连通性"},
+		{"dial tcp: connect: connection refused", "postgresql", "", "无法连接到目标主机，请检查主机和端口"},
 		// Windows 的错误文案与 Unix 不同，实测是 "No connection could be made ... actively refused"
-		{"dial error: dial tcp 10.0.0.5:5999: connectex: No connection could be made because the target machine actively refused it.", "无法连接到目标主机，请检查主机和端口"},
-		{"unknown database 'foo'", "库不存在，请检查库名（Redis 请填 db 号）"},
+		{"dial error: dial tcp 10.0.0.5:5999: connectex: No connection could be made because the target machine actively refused it.", "mysql", "", "无法连接到目标主机，请检查主机和端口"},
+		{"unknown database 'foo'", "mysql", "", "库不存在，请检查库名（Redis 请填 db 号）"},
 		// MongoDB 的 Unauthorized 是「连上了但没权限」，与密码错不同，必须分开提示
-		{"mongo permission check: (Unauthorized) command listCollections requires authentication", "权限不足：目标库已开启认证，请填写有查询权限的账号"},
+		{"mongo permission check: (Unauthorized) command listCollections requires authentication", "postgresql", "", "权限不足：目标库已开启认证，请填写有查询权限的账号"},
 	}
 	for _, c := range cases {
-		got := friendlyConnError(errors.New(c.err))
+		got := friendlyConnError(errors.New(c.err), c.typ, c.authSource)
 		if got != c.want {
 			t.Errorf("err %q -> %q, want %q", c.err, got, c.want)
 		}
+	}
+}
+
+// MongoDB 认证失败必须点出「实际按哪个库认证」：
+// 真实的失败原因常常是账号建在别的库里，只说「账号或密码错」会让人一直改密码。
+func TestFriendlyConnError_MongoAuthMentionsAuthSource(t *testing.T) {
+	raw := `mongo ping (authSource=project_cooper): connection() error occurred during connection handshake: ` +
+		`auth error: sasl conversation error: unable to authenticate using mechanism "SCRAM-SHA-1": ` +
+		`(AuthenticationFailed) Authentication failed.`
+
+	got := friendlyConnError(errors.New(raw), "mongodb", "project_cooper")
+
+	if !strings.Contains(got, "project_cooper") {
+		t.Errorf("message should name the auth source, got %q", got)
+	}
+	// 认证库是业务库时，要提示「账号可能建在另一个库」
+	if !strings.Contains(got, "哪个库") {
+		t.Errorf("message should hint at where the account lives, got %q", got)
+	}
+	// 不能把底层的 sasl / SCRAM 报错直接抛给用户
+	if strings.Contains(got, "sasl") || strings.Contains(got, "SCRAM") {
+		t.Errorf("message leaks driver internals: %q", got)
+	}
+}
+
+// 认证库留空时按 admin 处理（与 mongosh 一致），
+// 所以报错里必须写清「默认是 admin」并给出「建在业务库就填那个库」的指引，
+// 否则用户不知道平台到底在按哪个库认证。
+func TestFriendlyConnError_MongoDefaultAuthSourceIsAdmin(t *testing.T) {
+	raw := `mongo ping (authSource=admin): (AuthenticationFailed) Authentication failed.`
+	got := friendlyConnError(errors.New(raw), "mongodb", "admin")
+
+	if !strings.Contains(got, "admin") {
+		t.Errorf("message should name the default auth source, got %q", got)
+	}
+	if !strings.Contains(got, "认证库") {
+		t.Errorf("message should tell user to fill auth source, got %q", got)
+	}
+}
+
+// MongoDB 的权限不足提示也要带上认证库，便于定位是「认证库对但权限不够」。
+func TestFriendlyConnError_MongoUnauthorizedMentionsAuthSource(t *testing.T) {
+	raw := "mongo permission check: (Unauthorized) command listCollections requires authentication"
+	got := friendlyConnError(errors.New(raw), "mongodb", "admin")
+
+	if !strings.Contains(got, "admin") {
+		t.Errorf("message should name the auth source, got %q", got)
+	}
+	if !strings.Contains(got, "权限") {
+		t.Errorf("message should stay a permission error, got %q", got)
 	}
 }
