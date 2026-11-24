@@ -63,13 +63,12 @@ function splitZSetItem(item: string): { member: string; score?: string } {
 }
 
 /**
- * Redis 集合弹窗：把 list / set / zset 的元素从「挤在表格一格」改成
- * 「可搜索、可分页、可复制的独立视图」。
- * - list 是有序的，带下标；
- * - zset 按分数升序（后端 ZRANGE 即此顺序），单独展示 score 列；
- * - set 无序，沿用后端返回顺序。
+ * Redis 值详情弹窗。同一个入口承载两类内容，二者都不适合塞进表格一格：
+ *   - 集合（list / set / zset）：元素可能上百条，需要搜索与分页；
+ *   - 二进制（bitmap / HyperLogLog / 其他）：十六进制串很长，需要完整视图。
+ * 内容形态由 key 自身决定——同一 key 不会既展示集合又展示二进制。
  */
-function RedisCollectionModal({
+function RedisValueModal({
   open,
   kv,
   onClose,
@@ -80,6 +79,8 @@ function RedisCollectionModal({
 }) {
   const [keyword, setKeyword] = useState('')
 
+  const isCollection = kv ? REDIS_COLLECTION_TYPES.has(kv.type) : false
+  const isBinary = kv?.encoding === 'binary' || kv?.encoding === 'hyperloglog'
   const items = useMemo(() => kv?.items ?? [], [kv])
   const isZSet = kv?.type === 'zset'
 
@@ -97,100 +98,169 @@ function RedisCollectionModal({
 
   const allText = rows.map((r) => r.raw).join('\n')
 
+  // 二进制视图的内容与可复制文本
+  const hex = kv?.hex ?? ''
+  const setBitList = (kv?.set_bits ?? '').split(',').filter(Boolean)
+
+  const title = (
+    <Space direction="vertical" size={2} style={{ maxWidth: 620 }}>
+      <Space>
+        <Tag>{kv?.type}</Tag>
+        {isBinary ? (
+          <Tag color={kv?.encoding === 'hyperloglog' ? 'purple' : 'orange'}>
+            {kv?.encoding === 'hyperloglog' ? 'HyperLogLog' : '二进制'}
+          </Tag>
+        ) : null}
+        <Text strong>
+          {isCollection ? `${items.length} 项` : isBinary ? `${kv?.size ?? 0} 字节` : ''}
+        </Text>
+      </Space>
+      <Text code style={{ fontSize: 12, wordBreak: 'break-all' }}>
+        {kv?.key}
+      </Text>
+    </Space>
+  )
+
   return (
     <Modal
       open={open}
       onCancel={onClose}
       width={720}
-      title={
-        <Space direction="vertical" size={2} style={{ maxWidth: 620 }}>
-          <Space>
-            <Tag>{kv?.type}</Tag>
-            <Text strong>{items.length} 项</Text>
-          </Space>
-          <Text code style={{ fontSize: 12, wordBreak: 'break-all' }}>
-            {kv?.key}
-          </Text>
-        </Space>
-      }
+      title={title}
       footer={[
         <Button
           key="copy"
           icon={<CopyOutlined />}
-          onClick={() => void copyText(allText).then(() => message.success(`已复制 ${rows.length} 项`))}
-          disabled={rows.length === 0}
+          onClick={() =>
+            void copyText(isBinary ? hex : allText).then(() =>
+              message.success(`已复制${isBinary ? '十六进制内容' : '内容'}`),
+            )
+          }
+          disabled={isBinary ? !hex : rows.length === 0}
         >
-          复制{keyword ? '筛选结果' : '全部'}
+          {isBinary ? '复制十六进制' : `复制${keyword ? '筛选结果' : '全部'}`}
         </Button>,
         <Button key="close" type="primary" onClick={onClose}>
           关闭
         </Button>,
       ]}
     >
-      <Space direction="vertical" size={12} style={{ width: '100%' }}>
-        <Space style={{ width: '100%' }} wrap>
-          <Input.Search
-            allowClear
-            placeholder="筛选元素（支持子串匹配）"
-            onChange={(e) => setKeyword(e.target.value)}
-            style={{ width: 320 }}
+      {isBinary ? (
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Alert
+            type={kv?.encoding === 'hyperloglog' ? 'info' : 'warning'}
+            showIcon
+            message={
+              kv?.encoding === 'hyperloglog'
+                ? '这个 key 的类型是 string，但内容是一个 HyperLogLog 结构（以 HYLL 开头），不是可读文本。'
+                : '这个 key 的类型是 string，但内容是二进制，按文本显示只会得到乱码，因此这里给出十六进制。'
+            }
+            description={
+              kv?.encoding === 'hyperloglog'
+                ? 'HyperLogLog 用于基数估算，原始字节无法直接解读。需要估算结果请在应用侧用 PFCOUNT 读取。'
+                : '常见来源：SETBIT 位图、序列化后的 protobuf / msgpack、压缩或加密数据。'
+            }
           />
-          {keyword ? (
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              匹配 {rows.length} / {items.length} 项
-            </Text>
+          {kv?.bit_count !== undefined && kv.bit_count > 0 && setBitList.length > 0 ? (
+            <Space direction="vertical" size={4} style={{ width: '100%' }}>
+              <Text style={{ fontSize: 13 }}>
+                若这是位图：共 <Text strong>{kv.bit_count}</Text> 个置位
+              </Text>
+              <Text code style={{ fontSize: 12, wordBreak: 'break-all' }}>
+                {setBitList.join(', ')}
+                {setBitList.length >= 64 ? ' …' : ''}
+              </Text>
+            </Space>
           ) : null}
-          {isZSet ? (
+          <div>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              按分数升序排列，元素格式为 member（分数）
+              十六进制（每字节两位，空格分隔，最多显示前 256 字节）
             </Text>
-          ) : null}
+            <Paragraph
+              copyable={false}
+              style={{
+                marginTop: 6,
+                marginBottom: 0,
+                maxHeight: 360,
+                overflow: 'auto',
+                background: '#fafafa',
+                border: '1px solid #f0f0f0',
+                borderRadius: 4,
+                padding: 12,
+              }}
+            >
+              <Text code style={{ fontSize: 12, wordBreak: 'break-all', whiteSpace: 'pre-wrap' }}>
+                {hex || '（空内容）'}
+              </Text>
+            </Paragraph>
+          </div>
         </Space>
-        <Table
-          size="small"
-          rowKey={(r) => `${r.index}-${r.raw}`}
-          dataSource={rows}
-          locale={{ emptyText: <Empty description={items.length === 0 ? '空集合' : '没有匹配的元素'} /> }}
-          pagination={rows.length > 50 ? { pageSize: 50, showSizeChanger: false } : false}
-          scroll={{ y: 420 }}
-          columns={[
-            {
-              title: '#',
-              dataIndex: 'index',
-              width: 70,
-              render: (v: number) => <Text type="secondary">{v}</Text>,
-            },
-            {
-              title: isZSet ? 'member' : '元素',
-              dataIndex: 'member',
-              ellipsis: true,
-              render: (v: string) => (
-                <Space size={4}>
-                  <Text code style={{ fontSize: 12 }}>
-                    {v}
-                  </Text>
-                  <Tooltip title="复制">
-                    <CopyOutlined
-                      style={{ color: '#bfbfbf', cursor: 'pointer', fontSize: 12 }}
-                      onClick={() => void copyText(v).then(() => message.success('已复制'))}
-                    />
-                  </Tooltip>
-                </Space>
-              ),
-            },
-            ...(isZSet
-              ? [
-                  {
-                    title: 'score',
-                    dataIndex: 'score',
-                    width: 140,
-                    render: (v?: string) => <Text type="secondary">{v ?? ''}</Text>,
-                  },
-                ]
-              : []),
-          ]}
-        />
-      </Space>
+      ) : (
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Space style={{ width: '100%' }} wrap>
+            <Input.Search
+              allowClear
+              placeholder="筛选元素（支持子串匹配）"
+              onChange={(e) => setKeyword(e.target.value)}
+              style={{ width: 320 }}
+            />
+            {keyword ? (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                匹配 {rows.length} / {items.length} 项
+              </Text>
+            ) : null}
+            {isZSet ? (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                按分数升序排列，元素格式为 member（分数）
+              </Text>
+            ) : null}
+          </Space>
+          <Table
+            size="small"
+            rowKey={(r) => `${r.index}-${r.raw}`}
+            dataSource={rows}
+            locale={{ emptyText: <Empty description={items.length === 0 ? '空集合' : '没有匹配的元素'} /> }}
+            pagination={rows.length > 50 ? { pageSize: 50, showSizeChanger: false } : false}
+            scroll={{ y: 420 }}
+            columns={[
+              {
+                title: '#',
+                dataIndex: 'index',
+                width: 70,
+                render: (v: number) => <Text type="secondary">{v}</Text>,
+              },
+              {
+                title: isZSet ? 'member' : '元素',
+                dataIndex: 'member',
+                ellipsis: true,
+                render: (v: string) => (
+                  <Space size={4}>
+                    <Text code style={{ fontSize: 12 }}>
+                      {v}
+                    </Text>
+                    <Tooltip title="复制">
+                      <CopyOutlined
+                        style={{ color: '#bfbfbf', cursor: 'pointer', fontSize: 12 }}
+                        onClick={() => void copyText(v).then(() => message.success('已复制'))}
+                      />
+                    </Tooltip>
+                  </Space>
+                ),
+              },
+              ...(isZSet
+                ? [
+                    {
+                      title: 'score',
+                      dataIndex: 'score',
+                      width: 140,
+                      render: (v?: string) => <Text type="secondary">{v ?? ''}</Text>,
+                    },
+                  ]
+                : []),
+            ]}
+          />
+        </Space>
+      )}
     </Modal>
   )
 }
@@ -230,7 +300,32 @@ function RedisCollectionCell({ kv, onOpen }: { kv: RedisKeyValue; onOpen: () => 
   )
 }
 
-function renderRedisValue(kv: RedisKeyValue, onOpenCollection: (kv: RedisKeyValue) => void) {
+/** 表格里的二进制摘要：标明形态 + 字节数 + 十六进制开头，详细内容看弹窗。 */
+function RedisBinaryCell({ kv, onOpen }: { kv: RedisKeyValue; onOpen: () => void }) {
+  const isHLL = kv.encoding === 'hyperloglog'
+  const head = (kv.hex ?? '').split(' ').slice(0, 8).join(' ')
+  return (
+    <Space size={4} wrap>
+      <Tag color={isHLL ? 'purple' : 'orange'} style={{ marginInlineEnd: 0 }}>
+        {isHLL ? 'HyperLogLog' : '二进制'}
+      </Tag>
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        {kv.size ?? 0} 字节
+      </Text>
+      {head ? (
+        <Text code style={{ fontSize: 12 }} title="十六进制预览">
+          {head}
+          {(kv.hex ?? '').split(' ').length > 8 || (kv.size ?? 0) > 256 ? ' …' : ''}
+        </Text>
+      ) : null}
+      <Button type="link" size="small" style={{ padding: 0, height: 'auto' }} onClick={onOpen}>
+        查看
+      </Button>
+    </Space>
+  )
+}
+
+function renderRedisValue(kv: RedisKeyValue, onOpen: (kv: RedisKeyValue) => void) {
   if (kv.fields) {
     return (
       <Text style={{ fontSize: 13 }}>
@@ -241,10 +336,14 @@ function renderRedisValue(kv: RedisKeyValue, onOpenCollection: (kv: RedisKeyValu
     )
   }
   if (REDIS_COLLECTION_TYPES.has(kv.type)) {
-    return <RedisCollectionCell kv={kv} onOpen={() => onOpenCollection(kv)} />
+    return <RedisCollectionCell kv={kv} onOpen={() => onOpen(kv)} />
   }
   if (kv.type === 'none') {
     return <Text type="secondary" style={{ fontSize: 13 }}>（key 不存在）</Text>
+  }
+  // string 但内容不是文本：bitmap / HyperLogLog / 其他二进制
+  if (kv.encoding === 'binary' || kv.encoding === 'hyperloglog') {
+    return <RedisBinaryCell kv={kv} onOpen={() => onOpen(kv)} />
   }
   return <Text style={{ fontSize: 13 }}>{kv.value ?? ''}</Text>
 }
@@ -327,8 +426,9 @@ export default function QueryPage() {
   const [redisMode, setRedisMode] = useState<'exact' | 'scan'>('exact')
   const [redisKey, setRedisKey] = useState('')
   const [redisResult, setRedisResult] = useState<RedisQueryResult | null>(null)
-  // 集合类型（list/set/zset）的详情弹窗：存被点开的那一条，null 表示关闭
-  const [redisCollection, setRedisCollection] = useState<RedisKeyValue | null>(null)
+  // Redis 值详情弹窗：集合（list/set/zset）与二进制（bitmap/HLL）共用，
+  // 存被点开的那一条，null 表示关闭
+  const [redisDetail, setRedisDetail] = useState<RedisKeyValue | null>(null)
 
   // Mongo 两种输入模式：集合+过滤条件 / 原生命令
   const [mongoMode, setMongoMode] = useState<'collection' | 'command'>('collection')
@@ -646,8 +746,8 @@ export default function QueryPage() {
     setLoading(true)
     setResult(null)
     setRedisResult(null)
-    // 关掉可能还开着的集合详情弹窗：它指向的是上一次查询的结果
-    setRedisCollection(null)
+    // 关掉可能还开着的值详情弹窗：它指向的是上一次查询的结果
+    setRedisDetail(null)
     try {
       if (isRedis) {
         const payload =
@@ -814,7 +914,7 @@ export default function QueryPage() {
             // 不加 ellipsis：这一列里放的是「N 项 / 预览 / 查看」组合控件，
             // 裁切会把按钮吃掉。元素本身已在预览里限长，不会撑爆列宽。
             width: 420,
-            render: (_, r) => renderRedisValue(r, setRedisCollection),
+            render: (_, r) => renderRedisValue(r, setRedisDetail),
           },
           {
             title: 'TTL',
@@ -828,12 +928,13 @@ export default function QueryPage() {
         pagination={{ pageSize: 50, showSizeChanger: false }}
       />
       <Text type="secondary" style={{ fontSize: 12 }}>
-        提示：Redis 结果不做脱敏（值是二进制安全的原始内容），授权范围本身已限制可见的 key 前缀。
+        提示：Redis 结果不做脱敏。bitmap、HyperLogLog 等二进制内容的类型也是 string，
+        这类 key 会标注形态并以十六进制展示，而不是当作文本渲染。
       </Text>
-      <RedisCollectionModal
-        open={redisCollection !== null}
-        kv={redisCollection}
-        onClose={() => setRedisCollection(null)}
+      <RedisValueModal
+        open={redisDetail !== null}
+        kv={redisDetail}
+        onClose={() => setRedisDetail(null)}
       />
     </Space>
   ) : null

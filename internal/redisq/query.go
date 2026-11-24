@@ -17,6 +17,19 @@ type KeyValue struct {
 	Fields map[string]string `json:"fields,omitempty"`
 	Items  []string          `json:"items,omitempty"`
 	TTL    int64             `json:"ttl"`
+
+	// Encoding 仅对 string 类型有意义，标明内容是真文本还是二进制。
+	// 缺省（空串）等价于 text，兼容老版本前端的调用。
+	Encoding Encoding `json:"encoding,omitempty"`
+	// Hex 是二进制内容的十六进制预览，仅 Encoding=binary 时填充。
+	Hex string `json:"hex,omitempty"`
+	// Size 是二进制内容的原始字节数，用于提示「已截断」。
+	Size int `json:"size,omitempty"`
+	// BitCount / SetBits 是「疑似位图」的参考信息：置位总数与前若干个置位下标。
+	// 位图与普通二进制无法可靠区分，所以这两个值只在长度较短时给出，
+	// 由用户自行判断这段二进制是不是 SETBIT 写出来的。
+	BitCount int    `json:"bit_count,omitempty"`
+	SetBits  string `json:"set_bits,omitempty"`
 }
 
 // maxItemsPerCollection 限制 list/set/zset 单次返回的元素数，防止大集合撑爆响应。
@@ -83,11 +96,28 @@ func (c *Client) Fetch(ctx context.Context, key string) (*KeyValue, error) {
 
 	switch typ {
 	case "string":
-		v, err := c.rdb.Get(ctx, key).Result()
+		// 用 Bytes 而不是 String：JSON 序列化会替换非法 UTF-8 序列，
+		// bitmap / HLL 这类二进制内容走 String 会变成 \ufffd 乱码且无法还原。
+		raw, err := c.rdb.Get(ctx, key).Bytes()
 		if err != nil && err != redis.Nil {
 			return nil, fmt.Errorf("get %s: %w", key, err)
 		}
-		kv.Value = v
+		kv.Encoding = detectStringEncoding(raw)
+		if kv.Encoding == EncodingText {
+			kv.Value = string(raw)
+			break
+		}
+		// 二进制：不返回原始内容（前端无法展示，还会污染响应体），
+		// 改给十六进制预览与长度，前端据此渲染可读视图。
+		kv.Size = len(raw)
+		kv.Hex, _ = FormatBytes(raw, 256)
+		// 位图参考值只给「未知二进制」：HLL 的字节是内部编码结构，
+		// 把它按位统计出来只会误导用户以为这是位图。
+		if kv.Encoding == EncodingBinary && len(raw) <= 32 {
+			count, positions := bitmapSetBits(raw, 64)
+			kv.BitCount = count
+			kv.SetBits = joinInts(positions)
+		}
 	case "hash":
 		v, err := c.rdb.HGetAll(ctx, key).Result()
 		if err != nil {

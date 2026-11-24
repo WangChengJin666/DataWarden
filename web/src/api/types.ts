@@ -140,10 +140,14 @@ export interface LoginResponse {
   role: Role
 }
 
-// Redis 查询结果。与 SQL 结果结构不同：Redis 是键值对，按类型分三种承载字段：
+// Redis 值的展示形态由类型决定，三种承载字段互斥：
 //   string        -> value
 //   hash          -> fields
-//   list/set/zset -> items（zset 的元素形如 "member:score"）
+//   list/set/zset -> items
+//
+// 注意：Redis 的 TYPE 只有 string 一种，bitmap / HyperLogLog / Geo 索引在类型上
+// 都算 string。这类 key 的内容是二进制，后端不会塞进 value（JSON 会把非法
+// UTF-8 换成 \ufffd，等于丢数据），而是给 encoding + hex 让前端换个方式展示。
 export interface RedisKeyValue {
   key: string
   type: string
@@ -151,6 +155,16 @@ export interface RedisKeyValue {
   fields?: Record<string, string>
   items?: string[]
   ttl: number
+  /** 仅 string 类型：text / binary / hyperloglog。缺省等价于 text */
+  encoding?: 'text' | 'binary' | 'hyperloglog'
+  /** 二进制内容的十六进制预览 */
+  hex?: string
+  /** 二进制内容的原始字节数 */
+  size?: number
+  /** 疑似位图时置位的总数 */
+  bit_count?: number
+  /** 疑似位图时前若干个置位下标，形如 "0,3,8" */
+  set_bits?: string
 }
 
 export interface RedisQueryResult {
