@@ -4,9 +4,11 @@ import {
   AutoComplete,
   Button,
   Card,
+  Empty,
   Input,
   InputNumber,
   message,
+  Modal,
   Popover,
   Select,
   Space,
@@ -47,6 +49,9 @@ const { Text, Paragraph } = Typography
 // 表现为「list、zset 查出来有 key 但值是空的」。
 const REDIS_COLLECTION_TYPES = new Set(['list', 'set', 'zset'])
 
+/** 表格内每个集合 key 只铺这么多元素做预览，完整内容在弹窗里看。 */
+const REDIS_PREVIEW_ITEMS = 3
+
 /**
  * 拆分 zset 元素。后端固定输出 `member:score`，而 member 自身可能含冒号，
  * 因此必须按**最后一个**冒号切分；万一没有冒号就整体当 member。
@@ -57,53 +62,185 @@ function splitZSetItem(item: string): { member: string; score?: string } {
   return { member: item.slice(0, idx), score: item.slice(idx + 1) }
 }
 
-function renderRedisValue(r: RedisKeyValue) {
-  if (r.fields) {
+/**
+ * Redis 集合弹窗：把 list / set / zset 的元素从「挤在表格一格」改成
+ * 「可搜索、可分页、可复制的独立视图」。
+ * - list 是有序的，带下标；
+ * - zset 按分数升序（后端 ZRANGE 即此顺序），单独展示 score 列；
+ * - set 无序，沿用后端返回顺序。
+ */
+function RedisCollectionModal({
+  open,
+  kv,
+  onClose,
+}: {
+  open: boolean
+  kv: RedisKeyValue | null
+  onClose: () => void
+}) {
+  const [keyword, setKeyword] = useState('')
+
+  const items = useMemo(() => kv?.items ?? [], [kv])
+  const isZSet = kv?.type === 'zset'
+
+  // 过滤在弹窗内做。元素量级受后端 maxItemsPerCollection（1000）约束，
+  // 前端全量过滤足够，不需要再分页拉取。
+  const rows = useMemo(() => {
+    const kw = keyword.trim().toLowerCase()
+    return items
+      .map((item, index) => {
+        const { member, score } = isZSet ? splitZSetItem(item) : { member: item, score: undefined }
+        return { index, member, score, raw: item }
+      })
+      .filter((r) => (kw ? r.member.toLowerCase().includes(kw) : true))
+  }, [items, keyword, isZSet])
+
+  const allText = rows.map((r) => r.raw).join('\n')
+
+  return (
+    <Modal
+      open={open}
+      onCancel={onClose}
+      width={720}
+      title={
+        <Space direction="vertical" size={2} style={{ maxWidth: 620 }}>
+          <Space>
+            <Tag>{kv?.type}</Tag>
+            <Text strong>{items.length} 项</Text>
+          </Space>
+          <Text code style={{ fontSize: 12, wordBreak: 'break-all' }}>
+            {kv?.key}
+          </Text>
+        </Space>
+      }
+      footer={[
+        <Button
+          key="copy"
+          icon={<CopyOutlined />}
+          onClick={() => void copyText(allText).then(() => message.success(`已复制 ${rows.length} 项`))}
+          disabled={rows.length === 0}
+        >
+          复制{keyword ? '筛选结果' : '全部'}
+        </Button>,
+        <Button key="close" type="primary" onClick={onClose}>
+          关闭
+        </Button>,
+      ]}
+    >
+      <Space direction="vertical" size={12} style={{ width: '100%' }}>
+        <Space style={{ width: '100%' }} wrap>
+          <Input.Search
+            allowClear
+            placeholder="筛选元素（支持子串匹配）"
+            onChange={(e) => setKeyword(e.target.value)}
+            style={{ width: 320 }}
+          />
+          {keyword ? (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              匹配 {rows.length} / {items.length} 项
+            </Text>
+          ) : null}
+          {isZSet ? (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              按分数升序排列，元素格式为 member（分数）
+            </Text>
+          ) : null}
+        </Space>
+        <Table
+          size="small"
+          rowKey={(r) => `${r.index}-${r.raw}`}
+          dataSource={rows}
+          locale={{ emptyText: <Empty description={items.length === 0 ? '空集合' : '没有匹配的元素'} /> }}
+          pagination={rows.length > 50 ? { pageSize: 50, showSizeChanger: false } : false}
+          scroll={{ y: 420 }}
+          columns={[
+            {
+              title: '#',
+              dataIndex: 'index',
+              width: 70,
+              render: (v: number) => <Text type="secondary">{v}</Text>,
+            },
+            {
+              title: isZSet ? 'member' : '元素',
+              dataIndex: 'member',
+              ellipsis: true,
+              render: (v: string) => (
+                <Space size={4}>
+                  <Text code style={{ fontSize: 12 }}>
+                    {v}
+                  </Text>
+                  <Tooltip title="复制">
+                    <CopyOutlined
+                      style={{ color: '#bfbfbf', cursor: 'pointer', fontSize: 12 }}
+                      onClick={() => void copyText(v).then(() => message.success('已复制'))}
+                    />
+                  </Tooltip>
+                </Space>
+              ),
+            },
+            ...(isZSet
+              ? [
+                  {
+                    title: 'score',
+                    dataIndex: 'score',
+                    width: 140,
+                    render: (v?: string) => <Text type="secondary">{v ?? ''}</Text>,
+                  },
+                ]
+              : []),
+          ]}
+        />
+      </Space>
+    </Modal>
+  )
+}
+
+/** 表格里的集合摘要：类型说明 + 少量预览 + 「查看全部」入口。 */
+function RedisCollectionCell({ kv, onOpen }: { kv: RedisKeyValue; onOpen: () => void }) {
+  const items = kv.items ?? []
+  if (items.length === 0) {
+    return <Text type="secondary" style={{ fontSize: 13 }}>（空集合）</Text>
+  }
+  const preview = items.slice(0, REDIS_PREVIEW_ITEMS)
+  return (
+    <Space size={4} wrap>
+      <Tag color="default" style={{ marginInlineEnd: 0 }}>
+        {items.length} 项
+      </Tag>
+      {preview.map((item, i) => {
+        const raw = kv.type === 'zset' ? splitZSetItem(item).member : item
+        // 预览只截断显示，完整值仍在弹窗里（弹窗按列展示且可复制）
+        const label = raw.length > 28 ? `${raw.slice(0, 28)}…` : raw
+        return (
+          <Text key={i} code style={{ fontSize: 12 }} title={raw}>
+            {label}
+          </Text>
+        )
+      })}
+      <Button type="link" size="small" style={{ padding: 0, height: 'auto' }} onClick={onOpen}>
+        {items.length > preview.length ? '查看全部' : '展开'}
+      </Button>
+    </Space>
+  )
+}
+
+function renderRedisValue(kv: RedisKeyValue, onOpenCollection: (kv: RedisKeyValue) => void) {
+  if (kv.fields) {
     return (
       <Text style={{ fontSize: 13 }}>
-        {Object.entries(r.fields)
+        {Object.entries(kv.fields)
           .map(([k, val]) => `${k}=${val}`)
           .join(', ')}
       </Text>
     )
   }
-  if (r.items && r.items.length > 0) {
-    // 集合元素可能很多，默认只铺前 20 个，其余折叠成计数，避免单行过长
-    const shown = r.items.slice(0, 20)
-    const rest = r.items.length - shown.length
-    return (
-      <Space size={4} wrap>
-        <Tag color="default" style={{ marginInlineEnd: 0 }}>
-          {r.items.length} 项
-        </Tag>
-        {shown.map((item, i) => {
-          if (r.type !== 'zset') {
-            return (
-              <Text key={i} code style={{ fontSize: 12 }}>
-                {item}
-              </Text>
-            )
-          }
-          const { member, score } = splitZSetItem(item)
-          return (
-            <Text key={i} code style={{ fontSize: 12 }}>
-              {member}
-              {score !== undefined ? <Text type="secondary" style={{ fontSize: 11 }}>{` (${score})`}</Text> : null}
-            </Text>
-          )
-        })}
-        {rest > 0 ? <Text type="secondary" style={{ fontSize: 12 }}>… 另有 {rest} 项</Text> : null}
-      </Space>
-    )
+  if (REDIS_COLLECTION_TYPES.has(kv.type)) {
+    return <RedisCollectionCell kv={kv} onOpen={() => onOpenCollection(kv)} />
   }
-  if (REDIS_COLLECTION_TYPES.has(r.type)) {
-    // 空集合：明确写出「空」，避免与「渲染失败」混淆
-    return <Text type="secondary" style={{ fontSize: 13 }}>（空集合）</Text>
-  }
-  if (r.type === 'none') {
+  if (kv.type === 'none') {
     return <Text type="secondary" style={{ fontSize: 13 }}>（key 不存在）</Text>
   }
-  return <Text style={{ fontSize: 13 }}>{r.value ?? ''}</Text>
+  return <Text style={{ fontSize: 13 }}>{kv.value ?? ''}</Text>
 }
 
 /** 管理角色不需要授权即可查询全部数据源（与后端 model.Role.IsPrivileged 对应）。 */
@@ -184,6 +321,8 @@ export default function QueryPage() {
   const [redisMode, setRedisMode] = useState<'exact' | 'scan'>('exact')
   const [redisKey, setRedisKey] = useState('')
   const [redisResult, setRedisResult] = useState<RedisQueryResult | null>(null)
+  // 集合类型（list/set/zset）的详情弹窗：存被点开的那一条，null 表示关闭
+  const [redisCollection, setRedisCollection] = useState<RedisKeyValue | null>(null)
 
   // Mongo 两种输入模式：集合+过滤条件 / 原生命令
   const [mongoMode, setMongoMode] = useState<'collection' | 'command'>('collection')
@@ -501,6 +640,8 @@ export default function QueryPage() {
     setLoading(true)
     setResult(null)
     setRedisResult(null)
+    // 关掉可能还开着的集合详情弹窗：它指向的是上一次查询的结果
+    setRedisCollection(null)
     try {
       if (isRedis) {
         const payload =
@@ -664,8 +805,10 @@ export default function QueryPage() {
           },
           {
             title: '值',
-            ellipsis: true,
-            render: (_, r) => renderRedisValue(r),
+            // 不加 ellipsis：这一列里放的是「N 项 / 预览 / 查看全部」组合控件，
+            // 裁切会把按钮吃掉。元素本身已在预览里限长，不会撑爆列宽。
+            width: 420,
+            render: (_, r) => renderRedisValue(r, setRedisCollection),
           },
           {
             title: 'TTL',
@@ -681,6 +824,11 @@ export default function QueryPage() {
       <Text type="secondary" style={{ fontSize: 12 }}>
         提示：Redis 结果不做脱敏（值是二进制安全的原始内容），授权范围本身已限制可见的 key 前缀。
       </Text>
+      <RedisCollectionModal
+        open={redisCollection !== null}
+        kv={redisCollection}
+        onClose={() => setRedisCollection(null)}
+      />
     </Space>
   ) : null
 
