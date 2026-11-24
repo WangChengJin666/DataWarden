@@ -123,12 +123,17 @@ func (s *Service) ExecuteSQL(ctx context.Context, req SQLRequest, ad adapter.Ada
 	}
 
 	// 4. 带超时执行
+	//
+	// 有库名就用 QueryInDatabase：MySQL 的连接串只带数据源配置的默认库，
+	// 用户在查询页选的库从未参与连接，SQL 里写裸表名（补全会主动省掉
+	// 库前缀）时直接报 Error 1046 No database selected。其它类型不实现
+	// 该方法，走原来的 Query——它们的库名要么在连接串里，要么随命令传。
 	limit := s.rowLimit(req.RowLimit)
 	execCtx, cancel := context.WithTimeout(ctx, s.executeTimeout())
 	defer cancel()
 
 	start := time.Now()
-	res, err := ad.Query(execCtx, req.SQL, limit)
+	res, err := queryInDatabase(execCtx, ad, req.Database, req.SQL, limit)
 	if err != nil {
 		s.audit(ctx, req, "query.failed", map[string]any{
 			"error":      err.Error(),
@@ -147,6 +152,17 @@ func (s *Service) ExecuteSQL(ctx context.Context, req SQLRequest, ad adapter.Ada
 		"elapsed_ms": res.ElapsedMs,
 	})
 	return res, nil
+}
+
+// queryInDatabase 在 req 声明的库下执行查询，适配器不支持时退回默认连接。
+//
+// 这里只做「怎么执行」，不做任何权限判断：库名已经在上一步按
+// ds:<id>:<库>:<表> 鉴过权，能走到这里的库名都是用户有权访问的。
+func queryInDatabase(ctx context.Context, ad adapter.Adapter, db, sqlText string, limit int) (*adapter.QueryResult, error) {
+	if q, ok := ad.(adapter.DatabaseQuerier); ok && db != "" {
+		return q.QueryInDatabase(ctx, db, sqlText, limit)
+	}
+	return ad.Query(ctx, sqlText, limit)
 }
 
 // audit 写入审计事件。审计失败只记录日志，不阻断业务

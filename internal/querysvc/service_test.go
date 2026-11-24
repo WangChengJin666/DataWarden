@@ -153,6 +153,76 @@ func TestExecuteSQL_RejectsWriteStatement(t *testing.T) {
 	}
 }
 
+// databaseAwareAdapter 实现 DatabaseQuerier，记录被调用时拿到的库名。
+//
+// 这是 No database selected 的回归测试用的替身：MySQL 的连接串只带
+// 数据源默认库，用户在查询页选的库必须通过 QueryInDatabase 传下去，
+// 否则裸表名查询永远报 1046。
+type databaseAwareAdapter struct {
+	stubAdapter
+	gotDB       string
+	dbQueryCall int
+}
+
+// 不内嵌 stubAdapter 的 Query：内嵌后 QueryInDatabase 里调 a.Query
+// 会走回这个计数方法，测出来的「调用了普通 Query」是假象。
+func (a *databaseAwareAdapter) QueryInDatabase(ctx context.Context, db, sql string, limit int) (*adapter.QueryResult, error) {
+	a.dbQueryCall++
+	a.gotDB = db
+	return a.stubAdapter.Query(ctx, sql, limit)
+}
+
+// 若这条路被走到，说明 querysvc 没有选 QueryInDatabase。
+func (a *databaseAwareAdapter) Query(ctx context.Context, sql string, limit int) (*adapter.QueryResult, error) {
+	return nil, errors.New("plain Query must not be used for database-aware adapters")
+}
+
+// 请求里声明的库必须传导到适配器，而不是被连接串里的默认库顶掉。
+func TestExecuteSQL_PassesDatabaseToAdapter(t *testing.T) {
+	svc := &Service{Enforcer: &recordingEnforcer{allowed: true}, Auditor: &recordingAuditor{}}
+	ad := &databaseAwareAdapter{stubAdapter: stubAdapter{result: &adapter.QueryResult{}}}
+
+	_, err := svc.ExecuteSQL(context.Background(), SQLRequest{
+		Subject:      "u:1",
+		DatasourceID: 7,
+		Database:     "shop",
+		Tables:       []string{"orders"},
+		SQL:          "SELECT * FROM orders",
+	}, ad)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ad.dbQueryCall != 1 {
+		t.Fatalf("QueryInDatabase called %d times, want 1", ad.dbQueryCall)
+	}
+	if ad.gotDB != "shop" {
+		t.Errorf("database passed to adapter = %q, want shop", ad.gotDB)
+	}
+}
+
+// 不支持 QueryInDatabase 的适配器（PG / Mongo / 测试替身）走原路径，
+// 不能被这次改动带崩。
+func TestExecuteSQL_FallsBackToPlainQuery(t *testing.T) {
+	svc := &Service{Enforcer: &recordingEnforcer{allowed: true}, Auditor: &recordingAuditor{}}
+	stub := &stubAdapter{result: &adapter.QueryResult{}}
+
+	_, err := svc.ExecuteSQL(context.Background(), SQLRequest{
+		Subject:      "u:1",
+		DatasourceID: 7,
+		Database:     "public",
+		Tables:       []string{"orders"},
+		SQL:          "SELECT 1",
+	}, stub)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stub.called {
+		t.Error("plain Query should be used when adapter has no QueryInDatabase")
+	}
+}
+
 func TestExecuteSQL_SuccessPathMasksAndAudits(t *testing.T) {
 	enforcer := &recordingEnforcer{allowed: true}
 	auditor := &recordingAuditor{}

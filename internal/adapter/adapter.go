@@ -73,6 +73,21 @@ type Adapter interface {
 	Close() error
 }
 
+// DatabaseQuerier 是「能在调用方指定的库下执行」的 Adapter。
+//
+// 为什么单独定义而不加进 Adapter：库名落在哪儿因数据库而异。
+// MongoDB 的库随每条命令一起传，PostgreSQL 的库由连接串决定（连上后
+// 切库需要新连接），MySQL 的库是会话级 schema——只有 MySQL 在
+// 「用户在下拉里选了库」和「SQL 实际在哪执行」之间存在断层：
+// 连接串里带的是数据源配置的默认库，用户选的库根本没参与连接。
+//
+// 因此由 MySQL 实现这个可选接口，querysvc 用类型断言决定走不走它。
+// 用可选接口而不是给 Adapter 加方法：后者会让所有适配器（含测试替身）
+// 都得实现一个对 PG / Mongo 毫无意义的方法。
+type DatabaseQuerier interface {
+	QueryInDatabase(ctx context.Context, db, sql string, rowLimit int) (*QueryResult, error)
+}
+
 // readOnlyKeywords 是允许的语句起始关键字白名单。
 var readOnlyKeywords = []string{"SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN", "WITH"}
 

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 type mysqlAdapter struct {
@@ -37,8 +37,22 @@ func newMySQL(cfg ConnConfig) (*mysqlAdapter, error) {
 		return nil, fmt.Errorf("MySQL 密码不能包含 @ 或 /，请为该数据源单独建一个不含这两个字符的只读账号")
 	}
 
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&timeout=5s&readTimeout=30s&charset=utf8mb4%s",
-		cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Database, tlsParam)
+	// DSN 里**不写库名**，这是有意的。
+	//
+	// 查询页的「库」来自 SHOW DATABASES 下拉，与数据源配置里的 db_name
+	// 通常是两个不同的库：配置填的是连上后兜底用的默认库（甚至可能是空的）。
+	// 之前把 cfg.Database 拼进 DSN，于是「用户在下拉里选了 shop」这件事
+	// 从未传达给 MySQL——连接默认库还是配置里那个，SQL 里写裸表名
+	// （SELECT * FROM orders，补全还会帮用户省掉库前缀）就会报
+	// Error 1046 (3D000): No database selected。
+	//
+	// 改成连接不带库、执行前按请求里的库建一条专用连接（见 withDedicatedConn），
+	// 语义变成「执行哪条 SQL 就切到它声明的库」。
+	//
+	// 副作用：连接不再绑定库，需要库名的场景必须自己带上——
+	// LIST_DATABASES / ListTables 走 information_schema，天然满足。
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/?parseTime=true&timeout=5s&readTimeout=30s&charset=utf8mb4%s",
+		cfg.User, cfg.Password, cfg.Host, cfg.Port, tlsParam)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open mysql: %w", err)
@@ -99,6 +113,102 @@ func (a *mysqlAdapter) QueryWithArgs(ctx context.Context, sqlText string, args [
 	return a.query(ctx, sqlText, args, rowLimit)
 }
 
+// QueryInDatabase 在指定库下执行查询，库名由 SQL 的发起方（查询页下拉）决定。
+//
+// 为什么需要单独一个方法：mysqlAdapter 是适配器层，按约定不做权限判断，
+// 但它必须知道「在哪条连接上执行」。库名是数据库自身的 schema 概念，
+// 而 pgx / mongo 的库名要么在连接串里、要么随命令一起传，所以只有 MySQL
+// 需要在这里做一次会话级的 USE。
+//
+// 实现上的两个要点：
+//
+//   - 用 driver.Connector 建一条**专用连接**再 USE，而不是在连接池里
+//     执行 "USE x"。池化连接的会话状态没有隔离：同时有两个人分别查
+//     shop 和 pay 时，池里可能是同一条连接，互相把库切走，现象是
+//     偶发「表不存在」——最难查的那类 bug。
+//
+//   - USE 的库名不能用参数占位符（MySQL 的 USE 不接受 prepared 参数），
+//     只能拼字符串。因此这里必须做标识符校验，否则一个形如
+//     `shop; DROP DATABASE x` 的库名就能变成第二条语句。
+func (a *mysqlAdapter) QueryInDatabase(ctx context.Context, db, sqlText string, rowLimit int) (*QueryResult, error) {
+	// 空库名回落到「不带库执行」：抛 1046 让用户看到明确的
+	// 「没选库」而不是被 adapter 悄悄换成别的库。
+	if db == "" {
+		return a.Query(ctx, sqlText, rowLimit)
+	}
+	stmt := EnsureRowLimit(sqlText, rowLimit+1)
+
+	db2, err := a.withDedicatedConn(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	defer db2.Close()
+
+	start := time.Now()
+	rows, err := db2.QueryContext(ctx, stmt)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	defer rows.Close()
+	return scanRows(rows, rowLimit, start)
+}
+
+// withDedicatedConn 建一条已 USE 到 db 的专用连接（池大小 1）。
+//
+// 调用方负责 Close：连接一旦回收进池，下一个人拿到的就是「库已经被切过」
+// 的连接，这正是要避免的状态。
+func (a *mysqlAdapter) withDedicatedConn(ctx context.Context, db string) (*sql.DB, error) {
+	if !isSafeIdentifier(db) {
+		return nil, fmt.Errorf("invalid database name %q", db)
+	}
+
+	cfg := mysql.NewConfig()
+	cfg.User = a.cfg.User
+	cfg.Passwd = a.cfg.Password
+	cfg.Net = "tcp"
+	cfg.Addr = fmt.Sprintf("%s:%d", a.cfg.Host, a.cfg.Port)
+	cfg.DBName = db
+	cfg.ParseTime = true
+	cfg.Timeout = 5 * time.Second
+	cfg.ReadTimeout = 30 * time.Second
+	cfg.Params = map[string]string{"charset": "utf8mb4"}
+	if a.cfg.Options["tls"] == "true" {
+		// 与 newMySQL 的 DSN 保持一致：只接受 true，具体证书校验
+		// 交给驱动的默认 tls 配置（与 DSN 里 tls=true 等价）。
+		cfg.TLSConfig = "true"
+	}
+
+	connector, err := mysql.NewConnector(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build mysql connector for %q: %w", db, err)
+	}
+	db2 := sql.OpenDB(connector)
+	// 只放一条连接：这条池子只服务当前这一次查询，多放连接没有意义。
+	db2.SetMaxOpenConns(1)
+	db2.SetMaxIdleConns(1)
+	return db2, nil
+}
+
+// isSafeIdentifier 只允许 MySQL 库名里合法的字符。
+//
+// USE 不能参数化，库名只能拼进 SQL，所以这里必须自己把关。
+// 白名单刻意收得很紧（字母数字 + _ $ -）：库名真的带反引号或空格时，
+// 由用户改库名或直接用全限定名 `库名.表名` 查询，比放开白名单安全。
+func isSafeIdentifier(s string) bool {
+	if s == "" || len(s) > 64 { // MySQL 标识符上限 64 字符
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_' || r == '-' || r == '$':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (a *mysqlAdapter) query(ctx context.Context, sqlText string, args []any, rowLimit int) (*QueryResult, error) {
 	start := time.Now()
 	stmt := sqlText
@@ -113,7 +223,16 @@ func (a *mysqlAdapter) query(ctx context.Context, sqlText string, args []any, ro
 		return nil, fmt.Errorf("query: %w", err)
 	}
 	defer rows.Close()
+	return scanRows(rows, rowLimit, start)
+}
 
+func (a *mysqlAdapter) Close() error { return a.db.Close() }
+
+// scanRows 把 *sql.Rows 收敛成 QueryResult。
+//
+// 抽出来是因为现在有两条执行路径（默认连接 / 指定库的专用连接），
+// 行扫描逻辑完全一样，复制一份迟早会走岔（比如只给其中一条加脱敏相关字段）。
+func scanRows(rows *sql.Rows, rowLimit int, start time.Time) (*QueryResult, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, fmt.Errorf("columns: %w", err)
@@ -142,5 +261,3 @@ func (a *mysqlAdapter) query(ctx context.Context, sqlText string, args []any, ro
 	res.ElapsedMs = elapsed(start)
 	return res, nil
 }
-
-func (a *mysqlAdapter) Close() error { return a.db.Close() }
