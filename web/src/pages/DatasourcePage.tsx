@@ -709,7 +709,15 @@ export default function DatasourcePage() {
             </Form.Item>
           </Space>
 
-          <Space size="middle" style={{ display: 'flex' }}>
+          {/* 连接信息分两行排：
+              「主机 + 端口」一行，「数据库名」独占下一行。
+              原来三个字段挤在同一行，而这一行的各个 Form.Item 宽度
+              都是自动计算的：数据库名的 label 和 extra 提示都长，
+              label 可能被折成两行，栏位宽度也被撑开，
+              结果主机/端口那一栏比数据库名低了一截，看起来像错位。
+              拆行后每行的顶边都在同一条基线上，也不再依赖
+              label 是否折行这种不可控因素。 */}
+          <Space size="middle" style={{ display: 'flex', alignItems: 'flex-start' }}>
             <Form.Item
               name="host"
               label="主机"
@@ -735,30 +743,33 @@ export default function DatasourcePage() {
             >
               <InputNumber min={1} max={65535} style={{ width: '100%' }} />
             </Form.Item>
-            <Form.Item
-              name="database"
-              label={dbPolicy.label}
-              // hint 之前定义了却没渲染，是死字段。这里接上 extra，
-              // 让「PG 下填的是 database 名、不是 schema」这句话能真正显示出来。
-              extra={dbPolicy.hint || undefined}
-              rules={
-                dbPolicy.required
-                  ? [
-                      {
-                        required: true,
-                        message:
-                          currentType === 'mongodb'
-                            ? 'MongoDB 必须填写默认库，否则无法确定要查哪个库'
-                            : 'PostgreSQL 必须填写数据库名',
-                      },
-                    ]
-                  : []
-              }
-              style={{ flex: 1 }}
-            >
-              <Input placeholder={dbPolicy.placeholder} />
-            </Form.Item>
           </Space>
+
+          {/* 数据库名独占一行：label 和 extra 提示都比较长，
+              放在「主机/端口」旁边时会把两栏挤成不等高、看起来错位。
+              这里沿用账号/密码那一行的排版方式（左对齐、顶部对齐）。 */}
+          <Form.Item
+            name="database"
+            label={dbPolicy.label}
+            // hint 之前定义了却没渲染，是死字段。这里接上 extra，
+            // 让「PG 下填的是 database 名、不是 schema」这句话能真正显示出来。
+            extra={dbPolicy.hint || undefined}
+            rules={
+              dbPolicy.required
+                ? [
+                    {
+                      required: true,
+                      message:
+                        currentType === 'mongodb'
+                          ? 'MongoDB 必须填写默认库，否则无法确定要查哪个库'
+                          : 'PostgreSQL 必须填写数据库名',
+                    },
+                  ]
+                : []
+            }
+          >
+            <Input placeholder={dbPolicy.placeholder} />
+          </Form.Item>
 
           <Space size="middle" style={{ display: 'flex', alignItems: 'flex-start' }}>
             <Form.Item
