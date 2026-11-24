@@ -475,16 +475,126 @@ func parseMongoCallArgs(args string, op string) (bson.D, bson.D, error) {
 	parts := splitTopLevelArgs(inner)
 	var filter, projection bson.D
 	if len(parts) > 0 && strings.TrimSpace(parts[0]) != "" {
-		if err := bson.UnmarshalExtJSON([]byte(parts[0]), false, &filter); err != nil {
+		doc, err := mongoDocArg(parts[0])
+		if err != nil {
 			return nil, nil, fmt.Errorf("过滤条件不是合法的 JSON/BSON：%w", err)
 		}
+		filter = doc
 	}
 	if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-		if err := bson.UnmarshalExtJSON([]byte(parts[1]), false, &projection); err != nil {
+		doc, err := mongoDocArg(parts[1])
+		if err != nil {
 			return nil, nil, fmt.Errorf("投影条件不是合法的 JSON/BSON：%w", err)
 		}
+		projection = doc
 	}
 	return filter, projection, nil
+}
+
+// mongoDocArg 解析一个文档参数，先把 shell 字面量转成扩展 JSON。
+//
+// 复用 shellExtJSON 而不是直接 UnmarshalExtJSON：find({"projectId":NumberLong("...")})
+// 是 mongosh 里最常见的写法，不转换就会报「invalid JSON input」，
+// 而报错位置指向的字符往往让人摸不着头脑。
+func mongoDocArg(s string) (bson.D, error) {
+	extJSON, err := shellExtJSON(strings.TrimSpace(s))
+	if err != nil {
+		return nil, err
+	}
+	extJSON, err = quoteBareKeys(extJSON)
+	if err != nil {
+		return nil, err
+	}
+	var doc bson.D
+	if err := bson.UnmarshalExtJSON([]byte(extJSON), false, &doc); err != nil {
+		return nil, err
+	}
+	return doc, nil
+}
+
+// quoteBareKeys 给不带引号的键名补上双引号，并把单引号字符串改成双引号。
+//
+// mongosh 用的是 JS 字面量，{ $match: { a: 1 } } 是正常写法，
+// 而 UnmarshalExtJSON 只接受严格的 JSON/扩展 JSON，遇到裸键直接报
+// 「invalid JSON input. Position: 3. Character: $」——报错位置指向 $，
+// 看不出是「键名没加引号」，用户很难自己纠正。
+//
+// 只处理「键」的位置：{ 或 , 之后、冒号之前的那段 token。
+// 值的位置不碰，字符串常量原样透传，所以 'abc' 这类单引号值会被转成 "abc"，
+// 但不改变内容。
+func quoteBareKeys(s string) (string, error) {
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+
+	inStr := false
+	var quote byte
+	// expectKey 表示下一个 token 处于键的位置
+	expectKey := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+
+		if inStr {
+			if c == '\\' && i+1 < len(s) {
+				b.WriteByte(c)
+				b.WriteByte(s[i+1])
+				i++
+				continue
+			}
+			if c == quote {
+				b.WriteByte('"')
+				inStr = false
+				continue
+			}
+			b.WriteByte(c)
+			continue
+		}
+
+		switch c {
+		case '"', '\'':
+			inStr = true
+			quote = c
+			b.WriteByte('"')
+			if expectKey {
+				expectKey = false
+			}
+		case '{':
+			b.WriteByte('{')
+			expectKey = true
+		case ',':
+			b.WriteByte(',')
+			expectKey = true
+		case ':':
+			b.WriteByte(':')
+			expectKey = false
+		case '}', ']', '[', ' ', '\t', '\r', '\n':
+			b.WriteByte(c)
+		default:
+			if expectKey {
+				// 读出一个裸键 token 并加引号。
+				// 键名允许含点（_id.status 这类嵌套路径是字段名的一部分），
+				// 所以用 isBareKeyChar 而不是 isJSIdentChar。
+				j := i
+				for j < len(s) && isBareKeyChar(s[j]) {
+					j++
+				}
+				if j == i {
+					return "", fmt.Errorf("无法识别的字符 %q", string(c))
+				}
+				b.WriteByte('"')
+				b.WriteString(s[i:j])
+				b.WriteByte('"')
+				i = j - 1
+				expectKey = false
+				continue
+			}
+			b.WriteByte(c)
+		}
+	}
+	if inStr {
+		return "", fmt.Errorf("字符串未闭合")
+	}
+	return b.String(), nil
 }
 
 // splitTopLevelArgs 按顶层逗号切分参数，忽略 JSON 对象/数组/字符串里的逗号。
@@ -622,9 +732,11 @@ func QueryMongo(ctx context.Context, ad Adapter, req MongoQueryRequest) (*QueryR
 		field = strings.Trim(field, `"'`)
 		var filter bson.D
 		if len(parts) > 1 {
-			if err := bson.UnmarshalExtJSON([]byte(parts[1]), false, &filter); err != nil {
+			doc, err := mongoDocArg(parts[1])
+			if err != nil {
 				return nil, fmt.Errorf("过滤条件不是合法的 JSON：%w", err)
 			}
+			filter = doc
 		}
 		var values []interface{}
 		if err := coll.Distinct(ctx, field, filter).Decode(&values); err != nil {
@@ -676,16 +788,34 @@ func QueryMongo(ctx context.Context, ad Adapter, req MongoQueryRequest) (*QueryR
 // parseMongoPipeline 解析 aggregate 的管道数组。
 // 额外再校验一次 $out / $merge，防止绕过 ParseMongoQuery 直接调用适配器。
 func parseMongoPipeline(args string) (mongo.Pipeline, error) {
-	inner := strings.TrimSpace(args)
-	if strings.HasPrefix(inner, "(") {
-		inner = strings.TrimPrefix(inner, "(")
-	}
-	if i := strings.LastIndex(inner, ")"); i >= 0 {
-		inner = inner[:i]
+	// 截取管道数组：从第一个 [ 到与之配对的 ]。
+	//
+	// 不能像 find 那样「去掉末尾的 )」：管道后面还可能跟 options
+	// （aggregate([...], {allowDiskUse:true})），截到 ) 会把 options 也带进去；
+	// 也不能用 LastIndex("]")，字符串常量里可能有 ]。
+	inner := args
+	if start := strings.Index(inner, "["); start >= 0 {
+		if end := matchBracket(inner, start); end > start {
+			inner = inner[start : end+1]
+		}
 	}
 	inner = strings.TrimSpace(inner)
+	if !strings.HasPrefix(inner, "[") {
+		return nil, fmt.Errorf("聚合管道必须是数组，形如 db.<集合>.aggregate([{\"$match\":{}}])")
+	}
 
-	lower := strings.ToLower(inner)
+	// 先把 shell 字面量（NumberLong("...") 等）转成扩展 JSON，再解析。
+	// 转换失败要能定位到具体字面量，所以放在关键字扫描之前。
+	extJSON, err := shellExtJSON(inner)
+	if err != nil {
+		return nil, fmt.Errorf("聚合管道不是合法的 JSON/BSON：%w", err)
+	}
+	extJSON, err = quoteBareKeys(extJSON)
+	if err != nil {
+		return nil, fmt.Errorf("聚合管道不是合法的 JSON/BSON：%w", err)
+	}
+
+	lower := strings.ToLower(extJSON)
 	for _, marker := range mongoWriteMarkers {
 		if strings.Contains(lower, strings.ToLower(marker)) {
 			return nil, fmt.Errorf("不允许的聚合阶段 %s：它会写入数据", marker)
@@ -693,7 +823,7 @@ func parseMongoPipeline(args string) (mongo.Pipeline, error) {
 	}
 
 	var stages []bson.D
-	if err := bson.UnmarshalExtJSON([]byte(inner), false, &stages); err != nil {
+	if err := bson.UnmarshalExtJSON([]byte(extJSON), false, &stages); err != nil {
 		return nil, fmt.Errorf("聚合管道不是合法 JSON：%w", err)
 	}
 
@@ -702,6 +832,251 @@ func parseMongoPipeline(args string) (mongo.Pipeline, error) {
 		pipeline = append(pipeline, s)
 	}
 	return pipeline, nil
+}
+
+// matchBracket 返回 s[open] 处 '[' 配对的 ']' 下标，找不到返回 -1。
+// 跳过字符串常量内部的括号并处理反斜杠转义。
+func matchBracket(s string, open int) int {
+	depth := 0
+	inStr := false
+	for i := open; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if c == '\\' {
+				i++
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// matchParen 返回 s[open] 处 '(' 配对的 ')' 下标，找不到返回 -1。
+func matchParen(s string, open int) int {
+	depth := 0
+	inStr := false
+	for i := open; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if c == '\\' {
+				i++
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// shellExtJSON 把 mongo shell 里常见的字面量调用转成扩展 JSON 字符串。
+//
+// 为什么需要：平台收到的是 mongosh 里能原样跑的命令，用户自然会写
+// NumberLong("...")、ObjectId("...")、ISODate("...")；而底层用
+// UnmarshalExtJSON 解析，这些调用既不是严格 JSON 也不是扩展 JSON，
+// 报出来的却是「invalid JSON input. Position: 6. Character: $」——
+// 位置指向管道里的 $match，真正的问题在那之前的 NumberLong，很容易误判。
+//
+// 支持的替代（其它形如 Foo(...) 的调用原样保留，交给解析器报错，
+// 不擅自猜测语义）：
+//
+//	NumberLong("123") / NumberLong(123)   → {"$numberLong":"123"}
+//	NumberInt(1)                          → {"$numberInt":"1"}
+//	NumberDecimal("1.5")                  → {"$numberDecimal":"1.5"}
+//	ObjectId("...") / ObjectID("...")     → {"$oid":"..."}
+//	ISODate("...")                        → {"$date":"..."}
+//	new Date("...") / new Date(毫秒)       → {"$date":...}
+//
+// 只替换字符串常量之外的调用，字符串里的 NumberLong 字样保持原样。
+func shellExtJSON(s string) (string, error) {
+	var b strings.Builder
+	b.Grow(len(s) + 32)
+
+	for i := 0; i < len(s); {
+		c := s[i]
+
+		// 字符串常量原样透传
+		if c == '"' {
+			j := i + 1
+			for j < len(s) {
+				if s[j] == '\\' {
+					j += 2
+					continue
+				}
+				if s[j] == '"' {
+					j++
+					break
+				}
+				j++
+			}
+			if j > len(s) {
+				j = len(s)
+			}
+			b.WriteString(s[i:j])
+			i = j
+			continue
+		}
+
+		// 标识符左边界：避免把 MyNumberLong( 当成 NumberLong(
+		if isJSIdentStart(c) && (i == 0 || !isJSIdentChar(s[i-1])) {
+			lit, next, ok, err := matchShellLiteral(s, i)
+			if err != nil {
+				return "", err
+			}
+			if ok {
+				b.WriteString(lit)
+				i = next
+				continue
+			}
+		}
+
+		b.WriteByte(c)
+		i++
+	}
+	return b.String(), nil
+}
+
+// isJSIdentStart 判断字节能否作为 JS 标识符首字符（含 $）。
+// 不复用 adapter.go 的 isIdentChar：那里不含 $，而这里的字面量
+// 与聚合字段名都可能带 $。
+func isJSIdentStart(c byte) bool {
+	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isJSIdentChar(c byte) bool {
+	return isJSIdentStart(c) || (c >= '0' && c <= '9')
+}
+
+// isBareKeyChar 判断字节能否出现在裸键名里：标识符字符加点号。
+// 点号必须算进去，否则 {"_id.status":1} 会被切成 "_id" + ".status"。
+func isBareKeyChar(c byte) bool {
+	return isJSIdentChar(c) || c == '.'
+}
+
+// matchShellLiteral 尝试从 s[i] 起匹配一个已知的 shell 字面量调用，
+// 返回替换文本与调用结束后的下标。
+func matchShellLiteral(s string, i int) (lit string, next int, ok bool, err error) {
+	type conv struct {
+		fn  string
+		gen func(string) (string, error)
+	}
+	convs := []conv{
+		{"NumberLong", func(a string) (string, error) { return jsonNumber("$numberLong", a) }},
+		{"NumberInt", func(a string) (string, error) { return jsonNumber("$numberInt", a) }},
+		{"NumberDecimal", func(a string) (string, error) { return jsonString("$numberDecimal", a, "数字") }},
+		{"ObjectId", func(a string) (string, error) { return jsonString("$oid", a, "ObjectId") }},
+		{"ObjectID", func(a string) (string, error) { return jsonString("$oid", a, "ObjectId") }},
+		{"ISODate", func(a string) (string, error) { return jsonString("$date", a, "日期") }},
+		{"Date", matchDate},
+	}
+
+	rest := s[i:]
+	// new Date(...) 的标识符起点在 new 之后
+	nameStart := 0
+	if strings.HasPrefix(rest, "new ") {
+		nameStart = 4
+	}
+
+	for _, c := range convs {
+		name := rest[nameStart:]
+		if !strings.HasPrefix(name, c.fn) {
+			continue
+		}
+		if after := nameStart + len(c.fn); after < len(rest) && isJSIdentChar(rest[after]) {
+			continue
+		}
+		k := nameStart + len(c.fn)
+		for k < len(rest) && (rest[k] == ' ' || rest[k] == '\t' || rest[k] == '\r' || rest[k] == '\n') {
+			k++
+		}
+		if k >= len(rest) || rest[k] != '(' {
+			continue
+		}
+		close := matchParen(rest, k)
+		if close < 0 {
+			return "", 0, false, fmt.Errorf("%s( 的括号未闭合", c.fn)
+		}
+		out, cerr := c.gen(strings.TrimSpace(rest[k+1 : close]))
+		if cerr != nil {
+			return "", 0, false, cerr
+		}
+		return out, i + close + 1, true, nil
+	}
+	return "", 0, false, nil
+}
+
+// jsonNumber 生成 {"$key":"<整数>"}，兼容 NumberLong("1") 与 NumberLong(1)。
+func jsonNumber(key, arg string) (string, error) {
+	v := strings.Trim(arg, `"'`)
+	if v == "" {
+		return "", fmt.Errorf("%s 的参数为空", key)
+	}
+	for _, r := range v {
+		if (r < '0' || r > '9') && r != '-' {
+			return "", fmt.Errorf("%s 的参数 %q 不是整数", key, v)
+		}
+	}
+	return `{"` + key + `":"` + v + `"}`, nil
+}
+
+// jsonString 生成 {"$key":"<字符串>"}，参数已带引号时去掉。
+func jsonString(key, arg, what string) (string, error) {
+	v := strings.TrimSpace(arg)
+	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+		v = v[1 : len(v)-1]
+	}
+	if v == "" {
+		return "", fmt.Errorf("%s 的参数不是合法的%s", key, what)
+	}
+	return `{"` + key + `":"` + v + `"}`, nil
+}
+
+// matchDate 处理 Date(...) / new Date(...)：空参按当前时间，数字按毫秒时间戳，
+// 带引号按 ISO 字符串。多参数写法（年, 月, 日…）语义依赖时区，不猜，直接报错。
+func matchDate(arg string) (string, error) {
+	v := strings.TrimSpace(arg)
+	switch {
+	case v == "":
+		return `{"$date":{"$numberLong":"§now§"}}`, nil
+	case strings.Contains(v, ","):
+		return "", fmt.Errorf(`不支持多参数的 Date(...)，请改用 ISODate("2024-01-01T00:00:00Z")`)
+	case len(v) >= 2 && (v[0] == '"' || v[0] == '\''):
+		return jsonString("$date", v, "日期")
+	}
+	for _, r := range v {
+		if (r < '0' || r > '9') && r != '-' {
+			return "", fmt.Errorf("Date(%s) 的参数无法识别，请改用 ISODate 或毫秒时间戳", v)
+		}
+	}
+	return `{"$date":{"$numberLong":"` + v + `"}}`, nil
 }
 
 // mongoDocsToResult 把文档列表转成表格形态。

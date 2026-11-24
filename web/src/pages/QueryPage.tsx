@@ -1233,7 +1233,7 @@ export default function QueryPage() {
                       />
                       <Input.TextArea
                         rows={5}
-                        placeholder='过滤条件（JSON），如 {"status":"active"}。留空查全部'
+                        placeholder='过滤条件，如 {"status":"active"} 或 {"projectId":NumberLong("14759057188135424")}。留空查全部'
                         value={mongoFilter}
                         onChange={(e) => setMongoFilter(e.target.value)}
                         style={{ fontFamily: 'Menlo, Consolas, monospace', fontSize: 13 }}
@@ -1259,6 +1259,8 @@ export default function QueryPage() {
                       <Text type="secondary" style={{ fontSize: 12 }}>
                         支持 find / findOne / countDocuments / distinct / aggregate，
                         也支持 db.getCollection("名字").find(...) 写法。
+                        可以直接粘贴 mongosh 里的写法：NumberLong("...")、ObjectId("...")、
+                        ISODate("...")、裸键名（{'{ $match: {...} }'}）都能识别。
                         写操作（insert / update / delete / drop）以及会写库的聚合阶段（$out、$merge）一律拒绝。
                       </Text>
                     </Space>
