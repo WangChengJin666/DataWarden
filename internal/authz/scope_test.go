@@ -339,6 +339,15 @@ func TestNormalizeScope_RejectsMalformed(t *testing.T) {
 // 若它归一失败，所有新申请审批通过后都是一条空授权（查不了任何东西，
 // 且界面显示已授权）；若它拼成 ds:<id>:* 少一段，同样永远匹配不上。
 func TestNormalizeScope_AllDatabases(t *testing.T) {
+	// 先钉死常量本身的值：下游（前端 isAllDatabasesScope、迁移脚本、
+	// 审计明细）都按字面量 "*" / "*:*" 判断，常量一改就会全线错位。
+	// 用字面量断言而不是常量比较，否则常量被改错时测试会跟着错。
+	if ScopeAllDatabases != "*" {
+		t.Fatalf("ScopeAllDatabases = %q, want \"*\"", ScopeAllDatabases)
+	}
+	if ScopeDatabaseAll != "*:*" {
+		t.Fatalf("ScopeDatabaseAll = %q, want \"*:*\"", ScopeDatabaseAll)
+	}
 	if got := NormalizeScope(ScopeAllDatabases); got != ScopeDatabaseAll {
 		t.Fatalf("NormalizeScope(%q) = %q, want %q",
 			ScopeAllDatabases, got, ScopeDatabaseAll)

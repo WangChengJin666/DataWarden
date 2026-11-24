@@ -11,7 +11,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/opensourceprj/datawarden/internal/adapter"
-	"github.com/opensourceprj/datawarden/internal/authz"
 	"github.com/opensourceprj/datawarden/internal/model"
 )
 
@@ -290,6 +289,12 @@ func (h *MetadataHandler) databasesFor(ctx context.Context, ds *model.Datasource
 }
 
 // tablesFor 返回用户在指定库下可见的表名。
+//
+// 整数据源授权（`ds:<id>:*:*`）不需要在这里特殊处理：
+// 它命中库级通配判定 `h.allowed(uid, dsID, db, "*")`（keyMatch 前缀匹配），
+// 直接走 listAllTables。曾在此处加过一条 isAllDatabasesScope 分支，
+// 但它永远不可达——不可达的「防护」只会让人误以为这里已经考虑过整源授权，
+// 反而掩盖真正的判定位置（Casbin 策略表）。
 func (h *MetadataHandler) tablesFor(ctx context.Context, ds *model.Datasource, uid int64, db string) ([]string, error) {
 	// 整库通配授权（db:*）：可以直接列全部表
 	if !h.allowed(uid, ds.ID, db, "*") {
@@ -306,17 +311,6 @@ func (h *MetadataHandler) tablesFor(ctx context.Context, ds *model.Datasource, u
 		scopes, err := lister.GrantScopes(ctx, uid, ds.ID)
 		if err != nil {
 			return nil, err
-		}
-		// scope 里若带整数据源授权（authz.ScopeAllDatabases），
-		// 说明该数据源下任意库任意表都已放行，直接列全表即可。
-		//
-		// 必须单独判断：整源授权的 splitScope 返回库名 "*"，
-		// 与真实库名永不相等，不特判的话这条分支会返回空列表——
-		// 现象是「审批通过了，但表清单和编辑器补全全是空的」。
-		for _, sc := range scopes {
-			if isAllDatabasesScope(sc) {
-				return h.listAllTables(ctx, ds, db)
-			}
 		}
 		out := []string{}
 		for _, sc := range scopes {
@@ -348,15 +342,6 @@ func (h *MetadataHandler) listAllTables(ctx context.Context, ds *model.Datasourc
 	}
 	sort.Strings(names)
 	return names, nil
-}
-
-// isAllDatabasesScope 判断 scope 是否是「整个数据源」授权。
-//
-// 用 authz.NormalizeScope 归一后比对，而不是直接拼字符串：
-// 库里可能存着历史写法（裸 "*"、已废弃的库+表形态），
-// 比对归一结果才不会出现「新写法认、旧写法不认」的分叉。
-func isAllDatabasesScope(scope string) bool {
-	return authz.NormalizeScope(scope) == authz.ScopeDatabaseAll
 }
 
 // columnsFor 按类型取字段名。

@@ -115,11 +115,17 @@ docs/superpowers/         # plans / specs，内部设计资料
 - **申请粒度是数据源，不是库**：申请页不选库，落库 scope 固定为
   `authz.ScopeAllDatabases`（`"*"`），NormalizeScope 归一成 `*:*`，
   生成策略 `ds:<id>:*:*`。因此**不要**再把裸 `*` 当成非法输入拦掉
-  （那是新的正规写法），非法的是 `**` / `*:*` 这类重复写法。
+  （那是新的正规写法）。`**` 与 `*:*` 仍被 NormalizeScope 拒绝；
+  其中 `*:*` 在展示层（`store.normalizeForDisplay`、前端 `isAllDatabasesScope`）
+  额外认作整源，因为它可能由手工改库写入、语义无歧义，但**鉴权侧会跳过它**
+  （不生成策略），属于「能显示、不生效」的脏数据。
   存量库级授权 `<库>:*` 仍然兼容。
-- **`splitScope` 遇到整源 scope 会返回库名 `"*"`**：它与真实库名永不相等，
-  所以 `metadata.tablesFor` 必须先判 `isAllDatabasesScope` 再走「列全表」，
-  漏了这步的现象是「审批通过但表清单/补全全空」。
+- **`metadata.tablesFor` 不需要判断整源授权**：`ds:<id>:*:*` 会经 keyMatch
+  命中库级通配判定 `allowed(uid, dsID, db, "*")`，直接走 `listAllTables`。
+  曾在这里加过 `isAllDatabasesScope` 分支，实测不可达（已删除）——
+  不可达的「防护」会让人误以为判定写在这里，而真实判定在 Casbin 策略表。
+  顺带注意 `splitScope("*")` 返回的库名是 `"*"`，与真实库名永不相等；
+  整源授权不会走到按 scope 裁剪的分支，所以这不会造成漏表。
 - **Redis 鉴权的 `KeyCandidates` 末尾那个 `"*"` 不能删**：整源授权对 Redis
   生效完全依赖它拼出 `ds:<id>:<db>:*`。
 - **Redis 前缀授权向下覆盖**：对目标 key 逐级向上生成候选，任一命中即放行；`redisq/safety_test.go`

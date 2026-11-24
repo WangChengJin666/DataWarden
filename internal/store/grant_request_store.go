@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opensourceprj/datawarden/internal/authz"
 	"github.com/opensourceprj/datawarden/internal/model"
 )
 
@@ -127,6 +128,12 @@ func (s *GrantRequestStore) ListByUser(ctx context.Context, userID int64, limit 
 
 // Approve 审批通过：在同一事务内创建 grant_record 并回填申请单。
 // 使用条件更新保证只有一个审批者能生效（避免并发重复审批）。
+//
+// scope 不直接复制申请单里的值，而是强制落成 authz.ScopeAllDatabases：
+// 申请粒度就是数据源（见 httpapi.GrantRequestHandler.Create），申请单上的
+// scope 只用于留痕。历史 pending 单或手工插入的库级 scope 若被原样带进
+// grant_record，就会绕过新口径产出一条只覆盖单库的授权，
+// 而界面上它和整源授权看起来没有区别——这种静默偏差最难排查。
 func (s *GrantRequestStore) Approve(ctx context.Context, reqID, reviewerID int64, comment string) (*model.Grant, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -136,14 +143,13 @@ func (s *GrantRequestStore) Approve(ctx context.Context, reqID, reviewerID int64
 
 	var (
 		userID, dsID int64
-		scope        string
 		days         int
 		status       string
 	)
 	err = tx.QueryRow(ctx,
-		`SELECT user_id, datasource_id, scope, days, status
+		`SELECT user_id, datasource_id, days, status
 		 FROM grant_request WHERE id = $1 FOR UPDATE`, reqID,
-	).Scan(&userID, &dsID, &scope, &days, &status)
+	).Scan(&userID, &dsID, &days, &status)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, fmt.Errorf("grant request %d not found", reqID)
@@ -157,7 +163,7 @@ func (s *GrantRequestStore) Approve(ctx context.Context, reqID, reviewerID int64
 	g := &model.Grant{
 		UserID:       userID,
 		DatasourceID: dsID,
-		Scope:        scope,
+		Scope:        authz.ScopeAllDatabases,
 		Action:       "read",
 		ExpiresAt:    time.Now().AddDate(0, 0, days),
 	}

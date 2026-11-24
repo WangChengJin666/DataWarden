@@ -2,6 +2,7 @@ package querysvc
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -62,8 +63,11 @@ func TestExecuteSQL_EndToEndWithRealPostgres(t *testing.T) {
 
 	auditor := &recordingAuditor{}
 	svc := &Service{
+		// 鉴权粒度是「数据源 + 库」：执行时只判 ds:<id>:<库>:* 一次，
+		// 不再逐表判定（见 Service.ExecuteSQL）。这里必须按库级对象放行，
+		// 若仍写表级 ds:1:public:dw_e2e_probe，会直接 ERR_FORBIDDEN。
 		Enforcer: &realEnforcer{allow: map[string]bool{
-			"ds:1:public:dw_e2e_probe": true,
+			"ds:1:public:*": true,
 		}},
 		Auditor: auditor,
 		Rules:   DefaultRules(),
@@ -94,16 +98,36 @@ func TestExecuteSQL_EndToEndWithRealPostgres(t *testing.T) {
 		t.Errorf("audit not recorded properly: %+v", auditor.events)
 	}
 
-	// 越权表必须被拒绝
+	// 越权边界：授权粒度是库，所以「同库内换一张表」是允许的，
+	// 真正被拒绝的是**换库**。表清单不参与鉴权（只进审计），
+	// 原先这里断言「带上 pg_shadow 就要被拒」已不成立——
+	// 那条断言属于逐表鉴权时代，留着会让测试锁死一个已经被移除的语义。
+	//
+	// 用 errors.Is 而不是「err != nil」：换一个不存在的库时，
+	// 若鉴权被错误地放行，执行阶段同样会因「库不存在」失败。
+	// 只判 err != nil 就成了假阳性，测不出鉴权是否真的拦住了。
+	// 这里要求错误链里必须有 ErrForbidden，才能证明是鉴权拦下的。
+	_, err = svc.ExecuteSQL(ctx, SQLRequest{
+		Subject:      "u:1",
+		DatasourceID: 1,
+		Database:     "no_such_granted_db",
+		Tables:       []string{"dw_e2e_probe"},
+		SQL:          "SELECT 1",
+	}, ad)
+	if !errors.Is(err, ErrForbidden) {
+		t.Errorf("未授权的库必须被鉴权拒绝（ErrForbidden），got %v", err)
+	}
+	// 反向确认：同库换成另一张不存在的表，必须能穿过鉴权、
+	// 由数据库报「表不存在」——证明拦的是库不是表。
 	_, err = svc.ExecuteSQL(ctx, SQLRequest{
 		Subject:      "u:1",
 		DatasourceID: 1,
 		Database:     "public",
-		Tables:       []string{"dw_e2e_probe", "pg_shadow"},
-		SQL:          "SELECT 1",
+		Tables:       []string{"no_such_table"},
+		SQL:          "SELECT 1 FROM no_such_table",
 	}, ad)
-	if err == nil {
-		t.Error("query including an unauthorized table must be rejected")
+	if errors.Is(err, ErrForbidden) {
+		t.Error("同库内换表不应被鉴权拒绝：授权粒度是库，表清单不参与鉴权")
 	}
 }
 

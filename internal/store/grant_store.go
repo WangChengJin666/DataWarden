@@ -180,11 +180,35 @@ func (s *GrantStore) AllDatasources(ctx context.Context) ([]model.DatasourceBrie
 	return out, rows.Err()
 }
 
+// normalizeForDisplay 是展示用的归一：在 authz.NormalizeScope 之上
+// 额外接受 "*:*" 这种写法。
+//
+// 为什么需要这一层：NormalizeScope 只接受 "*"（它得保证写进 Casbin 的
+// 策略形态唯一），所以 "*:*" 经它处理会变成空串被当成畸形数据丢弃。
+// 但 "*:*" 在库里确实可能存在（手工改库、外部脚本、早期实验版本），
+// 而它的语义毫无歧义——就是整个数据源。直接丢弃的后果是权限页上
+// 凭空少一条记录，用户看到「我明明有授权」却查不到，比保留更糟。
+//
+// 反过来必须说清楚：这只是**展示**层放宽。鉴权侧 SyncGrants 仍然
+// 跳过 "*:*"（不生成策略），所以这类记录是「显示得对、实际不生效」，
+// 保留它正是为了让它在界面上可见、能被发现和清理。
+func normalizeForDisplay(scope string) string {
+	if strings.TrimSpace(scope) == authz.ScopeDatabaseAll {
+		return authz.ScopeDatabaseAll
+	}
+	return authz.NormalizeScope(scope)
+}
+
 // parseScopes 把授权 scope 字符串拆成结构化形态。
-// 归一规则与 authz.NormalizeScope / httpapi.splitScope 保持一致：
-//   - "*"                 → {Database: "*", Tables: nil}（整个数据源）
+// 两种整数据源写法都收成同一档：
+//   - "*"                 → {Database: "*", Tables: nil}
+//   - "*:*"               → 同上（NormalizeScope 拒绝它，见 normalizeForDisplay）
 //   - "shop" 或 "shop:*"  → {Database: "shop", Tables: nil}（整库）
 //   - "shop:orders,users" → {Database: "shop", Tables: [orders, users]}
+//
+// 注意 Database 对外统一是 "*"（authz.ScopeAllDatabases），不是 "*:*"：
+// 前端 isAllDatabasesScope 两种都认，但内部只用一个值，
+// 免得同一档权限在两个地方比较出不同结果。
 //
 // 不能把 "*" 当成一个表名塞进 Tables，否则前端会渲染出一张叫 * 的表，
 // 也让「整库」和「全表清单」两种语义混在一起。
@@ -195,14 +219,12 @@ func (s *GrantStore) AllDatasources(ctx context.Context) ([]model.DatasourceBrie
 // 用户无法判断自己的权限边界到底在哪。
 //
 // 两件事分开做：
-//  1. 用 authz.NormalizeScope 做**校验与归一**（畸形返回空串，一律丢弃）
+//  1. 归一（畸形返回空串，一律丢弃，见 normalizeForDisplay）
 //  2. 再把合法的 "库:表,表" 拆成结构
 //
-// 为什么不自己解析：入口（申请）只落服务端生成的 scope，但库里可能存在
-// 历史脏数据（早期版本写入的、或手工改库的）。若这里自己宽松解析，
-// "shop:*:*" 会变成 {shop, ["*:*"]} 显示到界面上，
-// 用户看到一条语义不明的权限却无从自查。复用同一个函数，
-// 保证「能存进去的」和「能显示的」永远是同一套规则。
+// 为什么不自己解析：库里可能存在历史脏数据（早期版本写入的、或手工改库的）。
+// 若这里自己宽松解析，"shop:*:*" 会变成 {shop, ["*:*"]} 显示到界面上，
+// 用户看到一条语义不明的权限却无从自查。
 func parseScopes(raw []string) []model.ScopeView {
 	if len(raw) == 0 {
 		return []model.ScopeView{}
@@ -212,7 +234,7 @@ func parseScopes(raw []string) []model.ScopeView {
 	allIdx := -1             // 整数据源授权在 out 里的下标
 
 	for _, sc := range raw {
-		norm := authz.NormalizeScope(sc)
+		norm := normalizeForDisplay(sc)
 		if norm == "" {
 			// 非法/畸形 scope 不展示：它要么永远匹配不上（无意义），
 			// 要么语义不明（误导）。跳过比显示一条看不懂的权限更好。
@@ -254,8 +276,15 @@ func parseScopes(raw []string) []model.ScopeView {
 
 	// 有整源授权时，库级明细全是冗余：权限已经被整源覆盖，
 	// 留着只会让前端显示得比实际更窄。
-	if allIdx == 0 {
-		return out[:1]
+	//
+	// 判断用 allIdx >= 0 而不是 == 0：整源授权不一定排在第一项
+	// （scopes 是按 SQL 的 ORDER BY 或 array_agg 顺序来的，"*" 排在
+	// "shop:*" 之后就得到下标 1）。只判断 == 0 会让 ["shop:*", "*"]
+	// 同时返回两档，前端显示出两个互不相容的权限等级。
+	// 命中时不直接返回 out[:allIdx+1]，而是重建只含该项的切片，
+	// 避免把前面已收集的库级明细一起带出去。
+	if allIdx >= 0 {
+		return []model.ScopeView{out[allIdx]}
 	}
 
 	// 合并后去重（同一张表可能被多条授权覆盖）

@@ -19,6 +19,7 @@ import {
   listRequests,
   rejectRequest,
 } from '@/api/client'
+import { isAllDatabasesScope } from '@/api/scope'
 import type { GrantRequest, GrantRequestStatus } from '@/api/types'
 
 const { Text } = Typography
@@ -90,11 +91,11 @@ export default function ReviewPage() {
       title: '授权范围',
       dataIndex: 'scope',
       width: 150,
-      // 申请粒度是数据源，落库 scope 固定为 "*"（整个数据源）。
+      // 申请粒度是数据源，审批通过的授权固定落 "*"（整个数据源）。
       // 直接显示 * 会被读成「通配符/全部数据源」，所以翻成人话；
       // 历史单据里可能还有库级 scope，按原文展示便于对照。
       render: (v: string) =>
-        v === '*' ? <Tag color="blue">整个数据源</Tag> : <Text code>{v}</Text>,
+        isAllDatabasesScope(v) ? <Tag color="blue">整个数据源</Tag> : <Text code>{v}</Text>,
     },
     { title: '天数', dataIndex: 'days', width: 60 },
     {
@@ -208,7 +209,7 @@ export default function ReviewPage() {
             <Text>
               申请人 <Text strong>{target.req.username}</Text> 申请
               <Text strong> {target.req.datasource_name} </Text>
-              {target.req.scope === '*' ? (
+              {isAllDatabasesScope(target.req.scope) ? (
                 <Text strong>整个数据源（所有库和表）</Text>
               ) : (
                 <>
@@ -218,6 +219,16 @@ export default function ReviewPage() {
               的查询权限，共 {target.req.days} 天。
             </Text>
             <Text type="secondary">理由：{target.req.reason}</Text>
+            {/* 历史遗留的待审批单可能只申请了单个库（改口径前提交）。
+                审批通过时授权一律落成整个数据源，与申请人当初写的不一致，
+                所以必须在这里提前讲清，避免 DBA 批完才发现范围变大了。 */}
+            {target.action === 'approve' && !isAllDatabasesScope(target.req.scope) ? (
+              <Text type="warning">
+                该申请提交于授权口径变更之前（原范围 {target.req.scope}）。
+                通过后将按现行口径授予<Text strong>整个数据源</Text>的查询权限，
+                请确认范围可接受。
+              </Text>
+            ) : null}
             <Input.TextArea
               rows={3}
               placeholder={target.action === 'reject' ? '请填写驳回原因（必填）' : '审批意见（可选）'}

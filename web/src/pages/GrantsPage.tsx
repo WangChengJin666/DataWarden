@@ -13,6 +13,7 @@ import { ReloadOutlined, StopOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import dayjs from 'dayjs'
 import { getCurrentUser, listActiveGrants, revokeGrant } from '@/api/client'
+import { isAllDatabasesScope } from '@/api/scope'
 import type { GrantView } from '@/api/types'
 
 const { Text } = Typography
@@ -71,11 +72,14 @@ export default function GrantsPage() {
       title: '授权范围',
       dataIndex: 'scope',
       width: 220,
-      // scope = "*" 表示整个数据源（申请审批通过后落的就是它）。
       // 原样显示一个 * 会被误读成「所有数据源」，所以翻成人话；
       // 改口径前审批的库级授权（"shop:*"）保持原文，便于对照。
       render: (v: string) =>
-        v === '*' ? <Tag color="blue">整个数据源（所有库和表）</Tag> : <Text code>{v}</Text>,
+        isAllDatabasesScope(v) ? (
+          <Tag color="blue">整个数据源（所有库和表）</Tag>
+        ) : (
+          <Text code>{v}</Text>
+        ),
     },
     {
       title: '到期时间',

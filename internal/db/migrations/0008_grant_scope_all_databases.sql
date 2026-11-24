@@ -18,6 +18,12 @@
 -- 改它们没有意义，还会让历史审计记录与当时的实际权限对不上。
 --
 -- 幂等脚本，可重复执行。
+--
+-- 注意这不是一次性的数据修复：db.Migrate 没有版本表，每次启动都会重跑
+-- 全部脚本（见 internal/db/pool.go）。所以下面这条 UPDATE 的实际语义是
+-- 「永远不存在生效中的库级授权」——它每次启动都会把任何库级 scope 收成 *。
+-- 这正是想要的：授权口径只有一档。若将来重新支持单库授权，
+-- 必须同步删掉这条语句，否则新写入的单库授权会在下次重启时被悄悄放大。
 
 UPDATE grant_record
    SET scope = '*'
@@ -25,15 +31,16 @@ UPDATE grant_record
    AND revoked_at IS NULL
    AND expires_at > now();
 
--- 申请单同理，但只改待审批的：已通过 / 已驳回 / 已撤销的单据是历史记录，
--- 同一个用户在同一数据源上的新授权已由上面的 grant_record 更新覆盖，
--- 改动历史单据只会破坏「当时批的是哪个范围」的留痕。
-UPDATE grant_request
-   SET scope = '*'
- WHERE scope <> '*'
-   AND status = 'pending';
+-- 申请单不动：Approve 已强制把 scope 落成 '*'，改动在途单据的 scope
+-- 只会破坏「申请人当时报的是什么范围」的留痕。已通过 / 已驳回 / 已撤销的
+-- 单据更是历史记录，同一个用户在同一数据源上的新授权已由上面的
+-- grant_record 更新覆盖。
+--
+-- 不加 UPDATE grant_request：这一点曾经写成「把 pending 也改成 *」，
+-- 但那会让审批页把一条申请了单库的历史单据显示成「整个数据源」，
+-- DBA 据此审批就会误判自己批的范围。
 
 COMMENT ON COLUMN grant_record.scope IS
     '授权范围：* 表示整个数据源（所有库与表）；<库>:* 是改口径前的库级授权，鉴权仍兼容。';
 COMMENT ON COLUMN grant_request.scope IS
-    '申请范围：申请粒度是数据源，落库固定为 *。';
+    '申请范围：留痕用。审批通过时授权一律落 *（整个数据源），不复制此列。';

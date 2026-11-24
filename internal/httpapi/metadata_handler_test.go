@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/opensourceprj/datawarden/internal/adapter"
+	"github.com/opensourceprj/datawarden/internal/authz"
 	"github.com/opensourceprj/datawarden/internal/model"
 )
 
@@ -250,22 +251,37 @@ func (p partialAuthz) Enforce(subject, obj, action string) bool { return obj == 
 
 // 整数据源授权（scope = "*"）的用户必须能列出表。
 //
-// 这是「申请不再选库」上线后最容易踩的坑：scope "*" 的 NormalizeScope
-// 结果是 "*:*"，splitScope 拆出的库名是 "*"，跟真实库名永远不相等——
-// 若 tablesFor 只按库名比对会返回空列表，现象是「审批通过了，
-// 但表清单和编辑器补全全是空的」，而鉴权本身是通的，排查时极易误判。
+// 这条用**真实 Casbin**（而不用 allowAll / denyAll 替身）来验证，
+// 因为整源授权能列出表，靠的不是 tablesFor 里的某个特判分支，
+// 而是 `ds:<id>:*:*` 策略经 keyMatch 命中 `ds:<id>:<库>:*` 判定。
+// 用替身伪造「只放行库级通配」会让测试歪打正着地通过，
+// 却掩盖了真实的判定路径——第一版测试就是这样写错的：
+// 它配 denyAll + scopes=["*"]，走的是后来被确认不可达的死分支。
+//
+// 若将来有人把策略拼错（例如落成 `ds:<id>:*` 少一段），
+// 这里会直接失败。
 func TestMetadata_ListTables_AllDatabasesScopeListsTables(t *testing.T) {
+	enforcer, err := authz.NewEnforcer()
+	if err != nil {
+		t.Fatalf("new enforcer: %v", err)
+	}
+	// 与 SyncGrants 对 ScopeAllDatabases 的处理保持一致：拼成 ds:<id>:*:*
+	if err := enforcer.SyncGrants([]authz.GrantPolicy{
+		{UserID: 1, DatasourceID: 1, Scope: authz.ScopeAllDatabases, Action: "read"},
+	}); err != nil {
+		t.Fatalf("sync grants: %v", err)
+	}
+
 	store := &grantStorer{
 		memDatasources: seedDS(),
-		scopes:         []string{"*"},
+		scopes:         []string{authz.ScopeAllDatabases},
 	}
 	h := &MetadataHandler{
 		Store: store,
 		Factory: func(id int64) (adapter.Adapter, error) {
 			return &okAdapter{tables: []string{"users", "orders"}}, nil
 		},
-		// 拒绝库级通配，强制走 scope 分支
-		Enforcer: denyAll{},
+		Enforcer: enforcer,
 	}
 	r := newMetadataRouter(t, h)
 
@@ -278,6 +294,71 @@ func TestMetadata_ListTables_AllDatabasesScopeListsTables(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, "orders") || !strings.Contains(body, "users") {
 		t.Errorf("整数据源授权应能列出全部表，body=%s", body)
+	}
+}
+
+// 整源授权下，换成另一个库也必须能列出表——这是「所有库」的实际含义。
+func TestMetadata_ListTables_AllDatabasesScopeCoversEveryDatabase(t *testing.T) {
+	enforcer, err := authz.NewEnforcer()
+	if err != nil {
+		t.Fatalf("new enforcer: %v", err)
+	}
+	if err := enforcer.SyncGrants([]authz.GrantPolicy{
+		{UserID: 1, DatasourceID: 1, Scope: authz.ScopeAllDatabases, Action: "read"},
+	}); err != nil {
+		t.Fatalf("sync grants: %v", err)
+	}
+	h := &MetadataHandler{
+		Store: &grantStorer{
+			memDatasources: seedDS(),
+			scopes:         []string{authz.ScopeAllDatabases},
+		},
+		Factory: func(id int64) (adapter.Adapter, error) {
+			return &okAdapter{tables: []string{"trades"}}, nil
+		},
+		Enforcer: enforcer,
+	}
+	r := newMetadataRouter(t, h)
+
+	// payment 库从未出现在任何 scope 里，整源授权下同样可列
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/datasources/1/tables?db=payment", nil))
+
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "trades") {
+		t.Fatalf("整数据源授权应覆盖任意库，status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// 别的数据源不能被整源授权覆盖：核对策略里数据源 ID 是钉死的。
+func TestMetadata_ListTables_AllDatabasesScopeIsPerDatasource(t *testing.T) {
+	enforcer, err := authz.NewEnforcer()
+	if err != nil {
+		t.Fatalf("new enforcer: %v", err)
+	}
+	if err := enforcer.SyncGrants([]authz.GrantPolicy{
+		{UserID: 1, DatasourceID: 1, Scope: authz.ScopeAllDatabases, Action: "read"},
+	}); err != nil {
+		t.Fatalf("sync grants: %v", err)
+	}
+	h := &MetadataHandler{
+		Store: &grantStorer{
+			memDatasources: &memDatasources{items: []model.Datasource{
+				{ID: 2, Name: "other", Type: model.TypePostgreSQL, Database: "shop"},
+			}},
+			scopes: []string{authz.ScopeAllDatabases},
+		},
+		Factory: func(id int64) (adapter.Adapter, error) {
+			return &okAdapter{tables: []string{"should_not_leak"}}, nil
+		},
+		Enforcer: enforcer,
+	}
+	r := newMetadataRouter(t, h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/datasources/2/tables?db=shop", nil))
+
+	if strings.Contains(w.Body.String(), "should_not_leak") {
+		t.Errorf("数据源 1 的整源授权不能覆盖数据源 2，body=%s", w.Body.String())
 	}
 }
 

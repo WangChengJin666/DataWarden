@@ -90,6 +90,43 @@ func TestCreateGrantRequest_LandsAllDatabasesScope(t *testing.T) {
 	}
 }
 
+// 天数与理由必须原样落库。
+//
+// 这两个字段没有校验逻辑可依赖，全靠一行赋值，所以最容易在重构
+// （尤其是本次移除 scope 字段）时被顺手删掉而无人发现：
+// Days 决定授权到期时间，丢了会落成 0 天，审批通过即过期；
+// Reason 是审批人唯一的判断依据。
+func TestCreateGrantRequest_PersistsDaysAndReason(t *testing.T) {
+	store := &captureRequests{}
+	h := &GrantRequestHandler{
+		Requests: store,
+		Datasrc: &applyableStub{items: []model.Datasource{{
+			ID: 1, Name: "shop", Type: model.TypePostgreSQL,
+			ApplyEnabled: true, MaxApplyDays: 14,
+		}}},
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"datasource_id": 1, "days": 5, "reason": "排查订单超时，需要看近 3 天数据",
+	})
+	if w := doCreate(t, h, raw); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body=%s", w.Code, w.Body.String())
+	}
+	if len(store.got) != 1 {
+		t.Fatalf("应当创建 1 条申请，实际 %d 条", len(store.got))
+	}
+	got := store.got[0]
+	if got.Days != 5 {
+		t.Errorf("落库 days = %d, want 5（该值决定授权到期时间）", got.Days)
+	}
+	if got.Reason != "排查订单超时，需要看近 3 天数据" {
+		t.Errorf("落库 reason = %q，与请求不一致", got.Reason)
+	}
+	if got.DatasourceID != 1 || got.UserID != 7 {
+		t.Errorf("落库 datasource_id=%d user_id=%d，want 1 / 7",
+			got.DatasourceID, got.UserID)
+	}
+}
+
 // 未开放申请的数据源、天数越界仍然必须拒绝——放开的是「范围」，不是审核门槛。
 func TestCreateGrantRequest_StillValidatesApplyGate(t *testing.T) {
 	newHandler := func(enabled bool, maxDays int) (*GrantRequestHandler, *captureRequests) {
