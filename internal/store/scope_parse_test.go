@@ -117,6 +117,28 @@ func TestParseScopes_DottedDatabaseName(t *testing.T) {
 	}
 }
 
+// 整数据源授权（"*"）是独立的一档，不是「库名叫 * 的整库」。
+//
+// 查询页要据此提示「整个数据源的所有库表」。若它被当成普通的库，
+// 前端会显示「库 * 下所有表」，用户看不懂这指的是什么范围；
+// 若它与历史库级授权并存且都返回，同一数据源下会显示出两个互不相容的
+// 授权等级，用户无法判断自己的边界。
+func TestParseScopes_AllDatabases(t *testing.T) {
+	got := parseScopes([]string{"*"})
+	if len(got) != 1 {
+		t.Fatalf("want 1 scope, got %+v", got)
+	}
+	if got[0].Database != "*" || got[0].Tables != nil {
+		t.Errorf("整源授权应表示为 {Database:*, Tables:nil}，got %+v", got[0])
+	}
+
+	// 与历史库级授权并存时，只保留整源这一档
+	got = parseScopes([]string{"*", "shop:*", "pay:orders"})
+	if len(got) != 1 || got[0].Database != "*" {
+		t.Errorf("有整源授权时应只返回整源一档，got %+v", got)
+	}
+}
+
 // 畸形 scope 不得出现在界面上。
 //
 // 入口（申请）已由 authz.NormalizeScope 拦截，但库里可能有历史脏数据。
@@ -144,8 +166,8 @@ func TestParseScopes_DropsMalformed(t *testing.T) {
 			want: []model.ScopeView{},
 		},
 		{
-			name: "纯通配被丢弃",
-			in:   []string{"*"},
+			name: "整数据源的重复写法被丢弃",
+			in:   []string{"*:*"},
 			want: []model.ScopeView{},
 		},
 		{

@@ -54,8 +54,28 @@ type Enforcer struct {
 // reAddBuiltinPolicies 一处。
 const BuiltinPolicyObject = "ds:*:*:*"
 
-// PrivilegedPolicySubjects 是需要全量查询权限的内置角色。
+// ScopeAllDatabases 是「授权申请落库」时的数据源级 scope。
 //
+// 产品口径：申请授权时只需要选数据源，审批通过即拥有该数据源下所有库、
+// 所有表的查询权限，所以申请单不再收库名。这一档在授权模型里必须有个
+// 明确写法，否则只能靠猜——而猜错的表现是「审批通过却查不了」。
+//
+// 与 BuiltinPolicyObject 同名同值是有意的：普通用户的这一档授权
+// 生成的对象就是 ds:<id>:*:*，与管理角色内置的 ds:*:*:* 结构一致，
+// 只是数据源 ID 被钉死。这样只有一条规则决定「什么算整个数据源」，
+// 不需要为「用户的整源授权」和「管理员的整源策略」各维护一套通配语法。
+//
+// 不要把它写成 "*"：NormalizeScope 会补成两段再拼进 object，
+// 而任何依赖 scope 段数或前缀的判断（例如 Redis 的 key 候选）都会跟着错。
+const ScopeAllDatabases = "*"
+
+// ScopeDatabaseAll 是整数据源 scope 拼进 Casbin object 后的库段。
+//
+// 单独列一个常量是为了让「*:*」这两段不要散落在各处手写：
+// 它既是 NormalizeScope 的返回值，也是前端展示时要识别出来的形态。
+const ScopeDatabaseAll = "*:*"
+
+// PrivilegedPolicySubjects 是需要全量查询权限的内置角色。
 // 用切片而不是硬编码两行 AddPolicy：新增管理角色（审计员、只读运维）时
 // 只改这里，不用去翻调用点。导出给测试与启动装配共用同一份清单。
 var PrivilegedPolicySubjects = []string{
@@ -130,6 +150,7 @@ func (e *Enforcer) Enforce(subject, object, action string) bool {
 //
 // 鉴权对象是 ds:<数据源ID>:<库>:<表>，因此 scope 必须恰好是 <库>:<表>：
 //
+//	"*"                 → "*:*"          整数据源（审批通过时写入的形态）
 //	"shop"              → "shop:*"       整库
 //	"shop:*"            → "shop:*"       已是整库，不变
 //	"shop:orders,users" → 原样             表级清单
@@ -148,12 +169,21 @@ func (e *Enforcer) Enforce(subject, object, action string) bool {
 //   - 空串、纯空白
 //   - 库名为空（":orders"）
 //   - 多余的冒号（"a:b:c"）——鉴权对象里表名不允许含冒号
-//   - 整段通配（"*"）——它会被拼成 ds:<id>:*:*，等于本数据源全库全表，
-//     远超「申请某个库」的本意，必须显式走 DBA 角色而不是申请流程
 //   - 任一段含 * ?  [ 等通配符（"shop:ord*" 会意外匹配 orders2）
+//
+// 关于整段通配：只有 ScopeAllDatabases 被接受，因为它是授权模型里
+// 真实存在的一档（申请通过 = 该数据源下所有库表）。裸 "*" 仍然拒绝，
+// 避免出现 "*" 与 "*:*" 两种写法各生成一套策略；要授予整个数据源
+// 就写 ScopeAllDatabases。
 func NormalizeScope(scope string) string {
 	s := strings.TrimSpace(scope)
-	if s == "" || s == "*" {
+	// 整数据源授权：归一成两段 "*:*"，拼出的策略是 ds:<id>:*:*，
+	// 与 ds:<id>:*:* 内置管理策略同构，也能命中任意库与表。
+	if s == ScopeAllDatabases {
+		return ScopeDatabaseAll
+	}
+	// 其它整段通配（"**"、"*:*"）拒绝：唯一入口是 ScopeAllDatabases。
+	if s == "" || strings.HasPrefix(s, "*") || strings.Contains(s, "*:") {
 		return ""
 	}
 
@@ -236,6 +266,10 @@ func validScopeSegment(s string, isDB bool) bool {
 // 整个「先清空再重建」必须在同一把写锁内完成：
 // 中途解锁会让其他 goroutine 看到「策略为空」的中间状态，
 // 表现为短暂的全员无权限（fail-closed 下就是一片 403）。
+//
+// scope 为 ScopeAllDatabases 的记录生成 ds:<id>:*:*，
+// 覆盖该数据源下任意库与表（keyMatch 的 * 不跨段，但 ds 段之后
+// 还剩两段，正好对上 <库>:<表>）。
 func (e *Enforcer) SyncGrants(grants []GrantPolicy) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -263,8 +297,7 @@ func (e *Enforcer) SyncGrants(grants []GrantPolicy) error {
 			// 非法 scope 直接跳过，绝不能拼进策略：
 			//   - 空串会拼出 ds:<id>:（两段），匹配不到任何四段对象，
 			//     等于一条永远无效的授权；
-			//   - "*" 会拼出 ds:<id>:*:*，等于本数据源全库全表，
-			//     远超「申请一个库」的本意。
+			//   - 畸形通配（"**"、"*:*"）同理。
 			// 跳过而不是报错：一条脏数据不该让整个策略重建失败、
 			// 进而导致所有用户都没权限。跳过是 fail-closed 的安全方向。
 			skipped++

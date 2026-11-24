@@ -130,11 +130,15 @@ func (d Datasource) WithPlainPassword() Datasource {
 }
 
 // Grant 是生效中的数据源查询授权。Casbin 策略由此表重新生成。
+//
+// Scope 现取值两种：authz.ScopeAllDatabases（"*"，整个数据源，
+// 申请审批通过后落这种）以及历史的 "<库>:*"（改口径前审批产生的）。
+// 两者都能被 NormalizeScope 归一，鉴权侧不需要感知差异。
 type Grant struct {
 	ID           int64      `json:"id"`
 	UserID       int64      `json:"user_id"`
 	DatasourceID int64      `json:"datasource_id"`
-	Scope        string     `json:"scope"`  // 形如 "db:*" 或 "db:tbl1,db:tbl2"
+	Scope        string     `json:"scope"`
 	Action       string     `json:"action"` // 目前只支持 read
 	ExpiresAt    time.Time  `json:"expires_at"`
 	RevokedAt    *time.Time `json:"revoked_at,omitempty"`
@@ -161,11 +165,13 @@ type GrantView struct {
 // ScopeView 是授权范围的结构化形态，供前端直接渲染权限提示。
 //
 // 为什么不在 DatasourceBrief 里直接放原始 scope 字符串：
-// 原始形态有 "shop"、"shop:*"、"shop:orders,users" 三种写法，
-// 前端要自己解析才能显示出「整个 shop 库 / 指定表」——
+// 原始形态有 "*"、"shop"、"shop:*"、"shop:orders,users" 几种写法，
+// 前端要自己解析才能显示出「整个数据源 / 整个 shop 库 / 指定表」——
 // 一旦解析逻辑写错，就会重演「整库授权显示成一张叫 * 的表」那类问题。
 // 后端已经知道语义，就在这里一次性拆好。
 type ScopeView struct {
+	// Database 为 "*" 表示**整个数据源**（所有库、所有表），
+	// 对应审批通过时落的 scope。其它取值都是具体的库名。
 	Database string `json:"database"`
 	// Tables 为 nil（或空数组）表示**整库授权**，与 "shop"、"shop:*" 两种写法等价。
 	//
@@ -219,6 +225,9 @@ const (
 
 // GrantRequest 是开发者提交的数据源授权申请。
 // 审批通过后生成一条 Grant（生效授权），并在本记录上回填 grant_id。
+//
+// Scope 不再由申请人填写：申请粒度就是数据源本身，
+// 落库固定为 authz.ScopeAllDatabases（整个数据源的库与表）。
 type GrantRequest struct {
 	ID             int64              `json:"id"`
 	UserID         int64              `json:"user_id"`

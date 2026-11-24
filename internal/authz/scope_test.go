@@ -300,20 +300,24 @@ func ExampleNormalizeScope() {
 	// shop:orders
 }
 
-// --- 畸形 scope 必须被拒绝，不能「尽力修复」 ---
+// 畸形 scope 必须被拒绝，不能「尽力修复」。
 //
-// 这些输入若被放行去拼策略，会产生永远匹配不上、或远超本意的授权：
+// 这些输入若被放行去拼策略，会产生永远匹配不上、或语义重复的授权：
 //   ":orders"  → ds:1::orders（库名为空，四段里有一段是空）
 //   "a:b:c"    → ds:1:a:b:c（五段，永远不匹配四段对象）
-//   "*"        → ds:1:*:*，等于本数据源全库全表
+//   "**"/"*:*" → 整源授权的另一种写法，与 ScopeAllDatabases 重复
 //   "shop:ord*"→ 通配符进入策略，会意外匹配 orders2
+//
+// 注意 "*" 不在此列：它现在是「整个数据源」的正规写法，
+// 由 TestNormalizeScope_AllDatabases 单独覆盖。
 func TestNormalizeScope_RejectsMalformed(t *testing.T) {
 	bad := []struct{ in, why string }{
 		{"", "空串"},
 		{"   ", "纯空白"},
 		{":orders", "库名为空"},
 		{":", "只有冒号"},
-		{"*", "整段通配 = 本数据源全库全表"},
+		{"**", "整段通配只认 * 一种写法"},
+		{"*:*", "整源授权只认 * 一种写法"},
 		{"a:b:c", "多余的冒号，拼出来是五段"},
 		{"shop:ord*", "表名含通配符"},
 		{"shop:orders?", "表名含 ?"},
@@ -326,6 +330,61 @@ func TestNormalizeScope_RejectsMalformed(t *testing.T) {
 		if got := NormalizeScope(c.in); got != "" {
 			t.Errorf("NormalizeScope(%q) = %q, want \"\" (%s)", c.in, got, c.why)
 		}
+	}
+}
+
+// ScopeAllDatabases 必须归一成两段 "*:*"，并且真的覆盖该数据源下全部库表。
+//
+// 这是「申请不再选库」的核心前提：申请落库的 scope 就是它。
+// 若它归一失败，所有新申请审批通过后都是一条空授权（查不了任何东西，
+// 且界面显示已授权）；若它拼成 ds:<id>:* 少一段，同样永远匹配不上。
+func TestNormalizeScope_AllDatabases(t *testing.T) {
+	if got := NormalizeScope(ScopeAllDatabases); got != ScopeDatabaseAll {
+		t.Fatalf("NormalizeScope(%q) = %q, want %q",
+			ScopeAllDatabases, got, ScopeDatabaseAll)
+	}
+
+	e, err := NewEnforcer()
+	if err != nil {
+		t.Fatalf("new enforcer: %v", err)
+	}
+	// 模拟审批通过后的落库值 → 重建策略
+	if err := e.SyncGrants([]GrantPolicy{
+		{UserID: 1, DatasourceID: 1, Scope: ScopeAllDatabases, Action: "read"},
+	}); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	// 覆盖三种数据源的对象形态：SQL 的库/表、Redis 的数字 db、Mongo 的集合
+	allow := []string{
+		"ds:1:shop:orders",
+		"ds:1:shop:users",
+		"ds:1:payment:trades",   // 换个库也要放行
+		"ds:1:37:user:1001:name", // Redis：db 号 + 多段 key
+		"ds:1:project_cooper:users",
+	}
+	for _, obj := range allow {
+		if !e.Enforce("u:1", obj, "read") {
+			t.Errorf("%s 应当放行（整数据源授权）", obj)
+		}
+	}
+
+	// 不能越出本数据源
+	for _, obj := range []string{
+		"ds:2:shop:orders", // 别的数据源
+		"ds:11:shop:orders",
+	} {
+		if e.Enforce("u:1", obj, "read") {
+			t.Errorf("%s 不应放行（授权只覆盖数据源 1）", obj)
+		}
+	}
+	// 写操作仍然拒绝
+	if e.Enforce("u:1", "ds:1:shop:orders", "write") {
+		t.Error("整数据源授权只应包含 read")
+	}
+	// 其他用户不受影响
+	if e.Enforce("u:2", "ds:1:shop:orders", "read") {
+		t.Error("授权不能外溢到其他用户")
 	}
 }
 
@@ -358,19 +417,19 @@ func TestSyncGrants_SkipsMalformedScope(t *testing.T) {
 		t.Fatalf("new enforcer: %v", err)
 	}
 	if err := e.SyncGrants([]GrantPolicy{
-		{UserID: 1, DatasourceID: 1, Scope: "*", Action: "read"},      // 不能变成全源
+		{UserID: 1, DatasourceID: 1, Scope: "**", Action: "read"},     // 畸形
 		{UserID: 2, DatasourceID: 1, Scope: ":orders", Action: "read"}, // 畸形
 		{UserID: 3, DatasourceID: 1, Scope: "shop", Action: "read"},    // 合法
 	}); err != nil {
 		t.Fatalf("sync 不应因脏数据失败: %v", err)
 	}
 
-	// u:1 的 "*" 必须没有生成任何可用策略
+	// u:1 的畸形 scope 必须没有生成任何可用策略
 	if e.Enforce("u:1", "ds:1:other:orders", "read") {
-		t.Error("裸 * 授权绝不能扩大成本数据源全库权限")
+		t.Error("畸形 scope 绝不能扩大成大范围授权")
 	}
 	if e.Enforce("u:1", "ds:1:shop:orders", "read") {
-		t.Error("裸 * 授权应被完全跳过")
+		t.Error("畸形 scope 应被完全跳过")
 	}
 	// u:2 的畸形 scope 同样无效
 	if e.Enforce("u:2", "ds:1::orders", "read") {

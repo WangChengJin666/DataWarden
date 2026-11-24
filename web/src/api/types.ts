@@ -70,12 +70,16 @@ export interface DatasourceInput {
 export type GrantRequestStatus = 'pending' | 'approved' | 'rejected' | 'canceled'
 
 /** 已生效的授权。与 GrantRequest 不同：这是「现在真的能查」的记录。 */
-export interface GrantView {  id: number
+export interface GrantView {
+  id: number
   user_id: number
   username: string
   datasource_id: number
   datasource_name: string
-  /** 形如 "db:*" 或 "db:tbl1,db:tbl2" */
+  /**
+   * 授权范围。"*" 表示整个数据源（所有库和表）；
+   * "<库>:*" 是改口径前审批的库级授权，仍可能出现在存量记录里。
+   */
   scope: string
   action: string
   expires_at: string
@@ -84,10 +88,11 @@ export interface GrantView {  id: number
 
 /**
  * 授权范围的结构化形态。
- * 后端已经把 "shop" / "shop:*" / "shop:orders,users" 三种写法归一，
+ * 后端已经把 "<库>" / "<库>:*" / "<库>:订单,用户>" 三种写法归一，
  * 前端不需要再解析字符串。
  */
 export interface ScopeView {
+  /** "*" 表示整个数据源（所有库和表） */
   database: string
   /** 空数组表示整库授权（对应后端的 "shop" 或 "shop:*"） */
   tables: string[]
@@ -116,6 +121,7 @@ export interface GrantRequest {
   username?: string
   datasource_id: number
   datasource_name?: string
+  /** 申请范围由后端固化："*" 即整个数据源 */
   scope: string
   days: number
   reason: string

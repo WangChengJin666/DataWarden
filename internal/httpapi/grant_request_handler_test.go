@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/opensourceprj/datawarden/internal/authz"
 	"github.com/opensourceprj/datawarden/internal/model"
 )
 
@@ -38,115 +39,25 @@ func (c *captureRequests) Reject(ctx context.Context, reqID, reviewerID int64, c
 }
 func (c *captureRequests) Cancel(ctx context.Context, reqID, userID int64) error { return nil }
 
-// TestCreateGrantRequest_NormalizesBareDatabaseScope 是「整库授权失效」的入口回归测试。
+// TestCreateGrantRequest_LandsAllDatabasesScope 锁住「申请粒度是数据源」这一口径。
 //
-// 前端提交整库时传裸库名 "shop"。若不在此处归一成 "shop:*"，
-// 落库的 scope 只有库名，生成策略 ds:1:shop（两段），
-// 而鉴权请求是 ds:1:shop:orders（四段），keyMatch 永不匹配——
-// 用户走完申请→审批后一条表都查不了，且没有任何报错。
+// 申请页已不再收库名，审批通过即拥有该数据源下所有库表。
+// 落库形态必须是 authz.ScopeAllDatabases，生成策略 ds:<id>:*:*；
+// 若退回成某个库的 scope，用户会「审批通过但换个库就 403」，
+// 而界面上看不出差别。
 //
-// 出口（SyncGrants）也有兜底，但那条兜底掩盖了这个入口的回归：
-// 即使删掉 Create 里的 NormalizeScope，查询依然能用，
-// 只是库里存的是脏形态。所以必须有这条测试锁住「落库形态」。
-func TestCreateGrantRequest_NormalizesBareDatabaseScope(t *testing.T) {
-	store := &captureRequests{}
-	h := &GrantRequestHandler{
-		Requests: store,
-		Datasrc: &applyableStub{items: []model.Datasource{{
-			ID: 1, Name: "shop", Type: model.TypePostgreSQL,
-			ApplyEnabled: true, MaxApplyDays: 7,
-			ApplyScopes:  []model.ApplyScope{{Database: "shop"}}, // 整库开放
-		}}},
-	}
-
-	body, _ := json.Marshal(map[string]any{
-		"datasource_id": 1,
-		"scope":         "shop", // 前端传的是裸库名
-		"days":          3,
-		"reason":        "排查线上问题",
-	})
-	if w := doCreate(t, h, body); w.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201, body=%s", w.Code, w.Body.String())
-	}
-
-	if len(store.got) != 1 {
-		t.Fatalf("应当创建 1 条申请，实际 %d 条", len(store.got))
-	}
-	if got := store.got[0].Scope; got != "shop:*" {
-		t.Errorf("落库 scope = %q，want %q（裸库名必须归一成 整库形态，"+
-			"否则生成的策略是两段、永远匹配不上四段鉴权请求）", got, "shop:*")
-	}
-}
-
-// 畸形 scope 必须在入口被拒绝，不能落库。
-//
-// 尤其 "*"：若放行，NormalizeScope 的防护被绕过后会拼出
-// ds:<id>:*:*，等于本数据源全库全表。
-func TestCreateGrantRequest_RejectsMalformedScope(t *testing.T) {
-	cases := []struct{ scope, why string }{
-		{"*", "纯通配 = 全数据源"},
-		{":orders", "库名为空"},
-		{"a:b:c", "多余冒号"},
-		{"shop:ord*", "表名含通配符"},
-		{"", "空 scope"},
-	}
-	for _, c := range cases {
-		t.Run(c.scope, func(t *testing.T) {
-			store := &captureRequests{}
-			h := &GrantRequestHandler{
-				Requests: store,
-				Datasrc: &applyableStub{items: []model.Datasource{{
-					ID: 1, Name: "shop", Type: model.TypePostgreSQL,
-					ApplyEnabled: true, MaxApplyDays: 7,
-					ApplyScopes:  []model.ApplyScope{{Database: "shop"}},
-				}}},
-			}
-			body, _ := json.Marshal(map[string]any{
-				"datasource_id": 1, "scope": c.scope, "days": 3, "reason": "x",
-			})
-			w := doCreate(t, h, body)
-			if w.Code == http.StatusCreated {
-				t.Fatalf("scope=%q 不应被接受（%s）", c.scope, c.why)
-			}
-			if len(store.got) != 0 {
-				t.Errorf("非法 scope 不应落库，实际落了 %d 条", len(store.got))
-			}
-		})
-	}
-}
-
-// 表级 scope 应原样保留，不被归一整库。
-func TestCreateGrantRequest_KeepsTableLevelScope(t *testing.T) {
-	store := &captureRequests{}
-	h := &GrantRequestHandler{
-		Requests: store,
-		Datasrc: &applyableStub{items: []model.Datasource{{
-			ID: 1, Name: "shop", Type: model.TypePostgreSQL,
-			ApplyEnabled: true, MaxApplyDays: 7,
-			ApplyScopes:  []model.ApplyScope{{Database: "shop", Tables: []string{"orders", "users"}}},
-		}}},
-	}
-	body, _ := json.Marshal(map[string]any{
-		"datasource_id": 1, "scope": "shop:orders", "days": 3, "reason": "x",
-	})
-	if w := doCreate(t, h, body); w.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201, body=%s", w.Code, w.Body.String())
-	}
-	if got := store.got[0].Scope; got != "shop:orders" {
-		t.Errorf("落库 scope = %q，want shop:orders", got)
-	}
-}
-
-// 数据源没配任何「允许申请的库表范围」时，申请也必须能提交成功。
-//
-// 这是产品口径：新增数据源时不需要填写范围，有该数据源的权限即可
-// 申请其下任意库。之前的实现会在 apply_scopes 为空时一律拒绝，
-// 结果是「数据源已开放申请，但没人能提交申请」——正是这个 bug 的现场。
-func TestCreateGrantRequest_NoScopeConfigAllowsAnyDatabase(t *testing.T) {
-	cases := []struct{ name, reqScope, wantScope string }{
-		{"裸库名", "shop", "shop:*"},
-		{"整库写法", "shop:*", "shop:*"},
-		{"任意库", "pay", "pay:*"},
+// 同时验证旧客户端仍然会传的 scope 字段被忽略：
+// 客户端自述的范围不能决定权限，否则一个改了前端的旧版本
+// 就能绕过新口径继续申请单库。
+func TestCreateGrantRequest_LandsAllDatabasesScope(t *testing.T) {
+	cases := []struct {
+		name     string
+		reqScope any // 不传 / 传库名 / 传通配
+	}{
+		{"不传 scope", nil},
+		{"传库名（旧客户端）", "shop"},
+		{"传整库写法", "shop:*"},
+		{"传整数据源", "*"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -156,25 +67,67 @@ func TestCreateGrantRequest_NoScopeConfigAllowsAnyDatabase(t *testing.T) {
 				Datasrc: &applyableStub{items: []model.Datasource{{
 					ID: 1, Name: "shop", Type: model.TypePostgreSQL,
 					ApplyEnabled: true, MaxApplyDays: 7,
-					// 不配范围 = 全部可申请
 				}}},
 			}
-			body, _ := json.Marshal(map[string]any{
-				"datasource_id": 1, "scope": c.reqScope, "days": 3, "reason": "排查线上问题",
-			})
-			w := doCreate(t, h, body)
-			if w.Code != http.StatusCreated {
-				t.Fatalf("scope=%q 应当被接受，status=%d body=%s",
-					c.reqScope, w.Code, w.Body.String())
+			body := map[string]any{
+				"datasource_id": 1, "days": 3, "reason": "排查线上问题",
+			}
+			if c.reqScope != nil {
+				body["scope"] = c.reqScope
+			}
+			raw, _ := json.Marshal(body)
+			if w := doCreate(t, h, raw); w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201, body=%s", w.Code, w.Body.String())
 			}
 			if len(store.got) != 1 {
 				t.Fatalf("应当创建 1 条申请，实际 %d 条", len(store.got))
 			}
-			if got := store.got[0].Scope; got != c.wantScope {
-				t.Errorf("落库 scope = %q，want %q", got, c.wantScope)
+			if got := store.got[0].Scope; got != authz.ScopeAllDatabases {
+				t.Errorf("落库 scope = %q，want %q（申请粒度是数据源，"+
+					"客户端传什么都不能改变这一点）", got, authz.ScopeAllDatabases)
 			}
 		})
 	}
+}
+
+// 未开放申请的数据源、天数越界仍然必须拒绝——放开的是「范围」，不是审核门槛。
+func TestCreateGrantRequest_StillValidatesApplyGate(t *testing.T) {
+	newHandler := func(enabled bool, maxDays int) (*GrantRequestHandler, *captureRequests) {
+		store := &captureRequests{}
+		return &GrantRequestHandler{
+			Requests: store,
+			Datasrc: &applyableStub{items: []model.Datasource{{
+				ID: 1, Name: "shop", Type: model.TypePostgreSQL,
+				ApplyEnabled: enabled, MaxApplyDays: maxDays,
+			}}},
+		}, store
+	}
+
+	t.Run("未开放申请", func(t *testing.T) {
+		h, store := newHandler(false, 7)
+		raw, _ := json.Marshal(map[string]any{
+			"datasource_id": 1, "days": 3, "reason": "x",
+		})
+		if w := doCreate(t, h, raw); w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403, body=%s", w.Code, w.Body.String())
+		}
+		if len(store.got) != 0 {
+			t.Error("未开放申请的数据源不应落库")
+		}
+	})
+
+	t.Run("天数超上限", func(t *testing.T) {
+		h, store := newHandler(true, 7)
+		raw, _ := json.Marshal(map[string]any{
+			"datasource_id": 1, "days": 8, "reason": "x",
+		})
+		if w := doCreate(t, h, raw); w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400, body=%s", w.Code, w.Body.String())
+		}
+		if len(store.got) != 0 {
+			t.Error("天数越界不应落库")
+		}
+	})
 }
 
 // applyableStub 提供 ListApplyable / Get。

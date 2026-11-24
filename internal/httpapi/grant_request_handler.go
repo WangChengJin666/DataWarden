@@ -34,10 +34,13 @@ type GrantRequestHandler struct {
 }
 
 type createGrantRequestReq struct {
-	DatasourceID int64  `json:"datasource_id" binding:"required"`
-	Scope        string `json:"scope" binding:"required"`
-	Days         int    `json:"days" binding:"required"`
-	Reason       string `json:"reason" binding:"required"`
+	DatasourceID int64 `json:"datasource_id" binding:"required"`
+	// Scope 已不再要求前端提交：申请粒度是「数据源」，审批通过即拥有
+	// 该数据源下所有库表的查询权限。字段保留是为了兼容旧客户端
+	// （它们仍会传库名），非空时会被忽略——见 Create。
+	Scope  string `json:"scope"`
+	Days   int    `json:"days" binding:"required"`
+	Reason string `json:"reason" binding:"required"`
 }
 
 // ListApplyable 返回开发者可申请的数据源。
@@ -50,12 +53,18 @@ func (h *GrantRequestHandler) ListApplyable(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
-// Create 提交申请。数据源开放申请即可申请其下任意库。
+// Create 提交申请。粒度是数据源：审批通过即拥有该数据源下所有库表的查询权限。
 //
-// 不再比对「允许申请的库表范围」：数据源登记时不填范围就是全部可申请，
-// 有该数据源的权限即可访问其下的库和表。范围白名单本身也拦不住越权——
-// 真正的判定在 querysvc，粒度是库（ds:<id>:<库>:*），表名由请求体自述、
-// 不参与鉴权（见 querysvc.ExecuteSQL 的说明）。
+// 为什么不再收「申请哪个库」：
+//   - 授权模型本来就是「数据源 + 库」，一库一申请等于让人为了查两个库
+//     跑两遍审批，而库里有什么表由数据库决定，用户填的库名还可能拼错，
+//     拼错的表现是审批通过后用不了，双方都看不出来；
+//   - 范围白名单也拦不住任何东西——真正的判定在 querysvc，
+//     库级鉴权（ds:<id>:<库>:*），表名不参与鉴权。
+//
+// 落库的 scope 固定为 authz.ScopeAllDatabases，生成策略 ds:<id>:*:*。
+// 不校验「库是否存在」：那要求申请时就连接目标库，既慢又会因账号/网络
+// 问题把「提交申请」这个动作变成不可用。
 func (h *GrantRequestHandler) Create(c *gin.Context) {
 	var req createGrantRequestReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -78,33 +87,18 @@ func (h *GrantRequestHandler) Create(c *gin.Context) {
 		})
 		return
 	}
-	// 整库授权写成 "db:*"，与 Casbin 策略里 ds:<id>:<db>:* 的形态一致。
-	//
-	// 前端提交整库时传的是裸库名 "shop"，若原样入库，
-	// 生成的策略是 ds:<id>:shop（只有三段中的前两段 + 库名），
-	// 而鉴权请求是 ds:<id>:shop:orders——keyMatch("ds:1:shop:orders", "ds:1:shop")
-	// 不匹配，于是「整库授权」实际一条表都查不了。这是个静默失效：
-	// 审批通过、页面显示已授权，但用户查询全是 403。
-	//
-	// NormalizeScope 对畸形输入返回空串（含空库名、多余冒号、
-	// 纯通配 "*"，见其注释），这里必须拒绝而不是继续往下走：
-	// 空 scope 会落库成一条永远匹配不上的授权，
-	// "*" 更会变成「本数据源全库全表」——远超申请一个库的本意。
-	scope := authz.NormalizeScope(req.Scope)
-	if scope == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "申请范围格式不合法：应为库名，不能为空或含通配符",
-		})
-		return
-	}
 
 	uid, _, _ := currentUser(c)
 	id, err := h.Requests.Create(c.Request.Context(), &model.GrantRequest{
 		UserID:       uid,
 		DatasourceID: req.DatasourceID,
-		Scope:        scope,
-		Days:         req.Days,
-		Reason:       req.Reason,
+		// 服务端决定，不接受客户端指定：
+		// 若照抄请求里的 scope，旧客户端传的 "shop" 会落成一条只覆盖
+		// 单个库的授权，与新口径（整个数据源）不一致，
+		// 而界面上两者看起来都是「已授权」。
+		Scope:  authz.ScopeAllDatabases,
+		Days:   req.Days,
+		Reason: req.Reason,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -260,6 +254,11 @@ func (h *GrantRequestHandler) Cancel(c *gin.Context) {
 // 若把 "*" 当成一个表名放进 tables，后续：
 //   - tablesFor 会把它追加进表下拉，界面上多出一项叫 "*"
 //   - 元数据接口会去找一张名为 "*" 的表，整库配置永远匹配不上
+//
+// scope = "*"（authz.ScopeAllDatabases，即整个数据源）返回库名为 "*"：
+// 调用方 tablesFor 拿它跟真实库名比，永远不相等，于是走「去库列表里
+// 取授权范围」那条分支——这正好是对的，整源授权的用户能看到哪些库
+// 本来就要由 ListDatabases 的逐库鉴权决定，不能在这里凭空生成。
 func splitScope(scope string) (db string, tables []string) {
 	parts := strings.SplitN(scope, ":", 2)
 	db = strings.TrimSpace(parts[0])

@@ -110,9 +110,18 @@ docs/superpowers/         # plans / specs，内部设计资料
   SQL 请求的 `tables` 是**选填**，只进审计明细，**不参与鉴权**——SQL 实际访问哪些表由数据库决定，
   按请求体里的表名鉴权等于允许用户少报一张表绕过。缺库返回 `ErrNoDatabase`（fail-closed），缺表不是错误。
   Mongo 同理：`ds:<id>:<库>:*`，集合名只用于定位查询目标。
-- **数据源不配置「可申请范围」**：`apply_enabled` 打开即可申请其下任意库，
-  `datasource.apply_scopes` 列已废弃（迁移 `0007`，读取侧忽略）。申请单 scope 统一落 `<库>:*`，
-  不要重新引入库表白名单或按表鉴权。
+- **数据源不配置「可申请范围」**：`apply_enabled` 打开即可申请，
+  `datasource.apply_scopes` 列已废弃（迁移 `0007`，读取侧忽略）。
+- **申请粒度是数据源，不是库**：申请页不选库，落库 scope 固定为
+  `authz.ScopeAllDatabases`（`"*"`），NormalizeScope 归一成 `*:*`，
+  生成策略 `ds:<id>:*:*`。因此**不要**再把裸 `*` 当成非法输入拦掉
+  （那是新的正规写法），非法的是 `**` / `*:*` 这类重复写法。
+  存量库级授权 `<库>:*` 仍然兼容。
+- **`splitScope` 遇到整源 scope 会返回库名 `"*"`**：它与真实库名永不相等，
+  所以 `metadata.tablesFor` 必须先判 `isAllDatabasesScope` 再走「列全表」，
+  漏了这步的现象是「审批通过但表清单/补全全空」。
+- **Redis 鉴权的 `KeyCandidates` 末尾那个 `"*"` 不能删**：整源授权对 Redis
+  生效完全依赖它拼出 `ds:<id>:<db>:*`。
 - **Redis 前缀授权向下覆盖**：对目标 key 逐级向上生成候选，任一命中即放行；`redisq/safety_test.go`
   通过解析源码强制"不使用 `KEYS`"，有人写了会直接测试失败。
 - **MongoDB 用白名单而非黑名单**校验命令，`$out`/`$merge` 在解析阶段拒绝。

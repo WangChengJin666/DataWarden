@@ -40,6 +40,13 @@ type redisQueryReq struct {
 // 鉴权粒度：Redis 没有表的概念，用 ds:<id>:<db>:<key/pattern> 作为 object。
 // 由于授权通常给的是某个前缀（如 user:1001），而实际 key 会比它长
 // （user:1001:name），因此鉴权时逐级向上取候选，任意一个命中即放行。
+//
+// db 段固定写数据源自己配置的 db 号，而新口径下申请通过拿到的是
+// 整数据源授权（ds:<id>:*:*）。这两者要对上，只能靠候选里那一项
+// "*"——它拼出的对象是 ds:<id>:<db>:*，覆盖任意 db 下的任意 key。
+// 因此 KeyCandidates 末尾的 "*" 不能去掉，否则整源授权对 Redis
+// 完全无效（SQL / Mongo 走的是 ds:<id>:<库>:*，不受影响，症状会显得
+// 很奇怪：「别的数据源能用，Redis 一律 403」）。
 func (h *RedisHandler) Query(c *gin.Context) {
 	if h.Factory == nil || h.Enforcer == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "redis query not configured"})
@@ -133,7 +140,11 @@ func (h *RedisHandler) EnforceKey(user string, dsID int64, db int, subject strin
 //	user:1001
 //	user:*
 //	user
-//	*                       库级授权
+//	*                       整个 db（授权 ds:<id>:<db>:*）
+//
+// 最后那一项 "*" 是整数据源授权（ds:<id>:*:*）对 Redis 生效的唯一途径：
+// 它拼出 ds:<id>:<db>:*，命中后即放行。删掉它，整源授权的用户
+// 查 Redis 会一律 403。
 //
 // 若 subject 本身含通配符（如 "order:1:*"），先截取其字面前缀再展开，
 // 避免把 * 当成层级的一部分。

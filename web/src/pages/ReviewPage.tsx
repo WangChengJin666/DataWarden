@@ -87,10 +87,14 @@ export default function ReviewPage() {
     { title: '申请人', dataIndex: 'username', width: 90 },
     { title: '数据源', dataIndex: 'datasource_name', width: 120 },
     {
-      title: '申请范围',
+      title: '授权范围',
       dataIndex: 'scope',
       width: 150,
-      render: (v: string) => <Text code>{v}</Text>,
+      // 申请粒度是数据源，落库 scope 固定为 "*"（整个数据源）。
+      // 直接显示 * 会被读成「通配符/全部数据源」，所以翻成人话；
+      // 历史单据里可能还有库级 scope，按原文展示便于对照。
+      render: (v: string) =>
+        v === '*' ? <Tag color="blue">整个数据源</Tag> : <Text code>{v}</Text>,
     },
     { title: '天数', dataIndex: 'days', width: 60 },
     {
@@ -204,7 +208,14 @@ export default function ReviewPage() {
             <Text>
               申请人 <Text strong>{target.req.username}</Text> 申请
               <Text strong> {target.req.datasource_name} </Text>
-              的 <Text code>{target.req.scope}</Text> 查询权限，共 {target.req.days} 天。
+              {target.req.scope === '*' ? (
+                <Text strong>整个数据源（所有库和表）</Text>
+              ) : (
+                <>
+                  的 <Text code>{target.req.scope}</Text>
+                </>
+              )}
+              的查询权限，共 {target.req.days} 天。
             </Text>
             <Text type="secondary">理由：{target.req.reason}</Text>
             <Input.TextArea

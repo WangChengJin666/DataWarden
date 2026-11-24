@@ -182,19 +182,25 @@ func (s *GrantStore) AllDatasources(ctx context.Context) ([]model.DatasourceBrie
 
 // parseScopes 把授权 scope 字符串拆成结构化形态。
 // 归一规则与 authz.NormalizeScope / httpapi.splitScope 保持一致：
+//   - "*"                 → {Database: "*", Tables: nil}（整个数据源）
 //   - "shop" 或 "shop:*"  → {Database: "shop", Tables: nil}（整库）
 //   - "shop:orders,users" → {Database: "shop", Tables: [orders, users]}
 //
 // 不能把 "*" 当成一个表名塞进 Tables，否则前端会渲染出一张叫 * 的表，
 // 也让「整库」和「全表清单」两种语义混在一起。
 //
+// 「整个数据源」是一档独立的等级，不是库名恰好叫 "*"：
+// 同一数据源上既有整源授权又有历史库级授权时（改口径之前审批的记录），
+// 只保留整源那一条——否则查询页会同时显示「所有库表」和「某个库」，
+// 用户无法判断自己的权限边界到底在哪。
+//
 // 两件事分开做：
 //  1. 用 authz.NormalizeScope 做**校验与归一**（畸形返回空串，一律丢弃）
 //  2. 再把合法的 "库:表,表" 拆成结构
 //
-// 为什么不自己解析：入口（申请）已经用 NormalizeScope 拦过畸形输入，
-// 但库里可能存在历史脏数据（早期版本写入的、或手工改库的）。
-// 若这里自己宽松解析，"shop:*:*" 会变成 {shop, ["*:*"]} 显示到界面上，
+// 为什么不自己解析：入口（申请）只落服务端生成的 scope，但库里可能存在
+// 历史脏数据（早期版本写入的、或手工改库的）。若这里自己宽松解析，
+// "shop:*:*" 会变成 {shop, ["*:*"]} 显示到界面上，
 // 用户看到一条语义不明的权限却无从自查。复用同一个函数，
 // 保证「能存进去的」和「能显示的」永远是同一套规则。
 func parseScopes(raw []string) []model.ScopeView {
@@ -203,12 +209,21 @@ func parseScopes(raw []string) []model.ScopeView {
 	}
 	out := make([]model.ScopeView, 0, len(raw))
 	seen := map[string]int{} // 库名 → out 下标，用于合并同一个库的多条授权
+	allIdx := -1             // 整数据源授权在 out 里的下标
 
 	for _, sc := range raw {
 		norm := authz.NormalizeScope(sc)
 		if norm == "" {
 			// 非法/畸形 scope 不展示：它要么永远匹配不上（无意义），
 			// 要么语义不明（误导）。跳过比显示一条看不懂的权限更好。
+			continue
+		}
+		// 整数据源授权：单独一档，且一旦出现就是最高等级
+		if norm == authz.ScopeDatabaseAll {
+			if allIdx < 0 {
+				allIdx = len(out)
+				out = append(out, model.ScopeView{Database: authz.ScopeAllDatabases, Tables: nil})
+			}
 			continue
 		}
 		db, rest, _ := strings.Cut(norm, ":")
@@ -235,6 +250,12 @@ func parseScopes(raw []string) []model.ScopeView {
 		}
 		seen[db] = len(out)
 		out = append(out, model.ScopeView{Database: db, Tables: tables})
+	}
+
+	// 有整源授权时，库级明细全是冗余：权限已经被整源覆盖，
+	// 留着只会让前端显示得比实际更窄。
+	if allIdx == 0 {
+		return out[:1]
 	}
 
 	// 合并后去重（同一张表可能被多条授权覆盖）

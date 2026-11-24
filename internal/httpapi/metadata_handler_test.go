@@ -248,6 +248,67 @@ type partialAuthz struct{ allowObj string }
 
 func (p partialAuthz) Enforce(subject, obj, action string) bool { return obj == p.allowObj }
 
+// 整数据源授权（scope = "*"）的用户必须能列出表。
+//
+// 这是「申请不再选库」上线后最容易踩的坑：scope "*" 的 NormalizeScope
+// 结果是 "*:*"，splitScope 拆出的库名是 "*"，跟真实库名永远不相等——
+// 若 tablesFor 只按库名比对会返回空列表，现象是「审批通过了，
+// 但表清单和编辑器补全全是空的」，而鉴权本身是通的，排查时极易误判。
+func TestMetadata_ListTables_AllDatabasesScopeListsTables(t *testing.T) {
+	store := &grantStorer{
+		memDatasources: seedDS(),
+		scopes:         []string{"*"},
+	}
+	h := &MetadataHandler{
+		Store: store,
+		Factory: func(id int64) (adapter.Adapter, error) {
+			return &okAdapter{tables: []string{"users", "orders"}}, nil
+		},
+		// 拒绝库级通配，强制走 scope 分支
+		Enforcer: denyAll{},
+	}
+	r := newMetadataRouter(t, h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/datasources/1/tables?db=shop", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "orders") || !strings.Contains(body, "users") {
+		t.Errorf("整数据源授权应能列出全部表，body=%s", body)
+	}
+}
+
+// 只授了部分表、且没有整源授权时，仍然只列授权表（不能因为放宽口径
+// 就把所有有库权限的人当成本库全表可见）。
+func TestMetadata_ListTables_PartialScopeStillFiltered(t *testing.T) {
+	store := &grantStorer{
+		memDatasources: seedDS(),
+		scopes:         []string{"shop:orders"},
+	}
+	h := &MetadataHandler{
+		Store: store,
+		Factory: func(id int64) (adapter.Adapter, error) {
+			return &okAdapter{tables: []string{"orders", "users", "secrets"}}, nil
+		},
+		Enforcer: denyAll{},
+	}
+	r := newMetadataRouter(t, h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/datasources/1/tables?db=shop", nil))
+
+	body := w.Body.String()
+	if !strings.Contains(body, "orders") {
+		t.Errorf("应包含受权的 orders，body=%s", body)
+	}
+	if strings.Contains(body, "secrets") {
+		t.Errorf("不应包含未受权的 secrets，body=%s", body)
+	}
+}
+
 // scopeLister 断言失败必须报错而不是返回空数组：
 // Store 没实现 GrantScopes 说明装配漏了，是部署缺陷。
 func TestMetadata_ListTables_MissingScopeListerIs502(t *testing.T) {

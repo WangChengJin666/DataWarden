@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
+  Alert,
   Button,
   Card,
   Descriptions,
@@ -62,9 +63,6 @@ export default function ApplyPage() {
     form.resetFields()
     form.setFieldsValue({
       days: Math.min(7, ds.max_apply_days),
-      // 数据源配了默认库就直接预填，省掉用户去记库名；
-      // 仍可改成其它库——有该数据源的权限就能申请它下面的任意库。
-      scope: ds.database || undefined,
     })
     setModalOpen(true)
   }
@@ -75,7 +73,6 @@ export default function ApplyPage() {
       const values = await form.validateFields()
       await createGrantRequest({
         datasource_id: selected.id,
-        scope: values.scope,
         days: values.days,
         reason: values.reason,
       })
@@ -100,13 +97,7 @@ export default function ApplyPage() {
 
   const columns: ColumnsType<GrantRequest> = [
     { title: 'ID', dataIndex: 'id', width: 70 },
-    { title: '数据源', dataIndex: 'datasource_name', width: 140 },
-    {
-      title: '申请范围',
-      dataIndex: 'scope',
-      width: 200,
-      render: (v: string) => <Text code>{v}</Text>,
-    },
+    { title: '数据源', dataIndex: 'datasource_name', width: 160 },
     { title: '天数', dataIndex: 'days', width: 70 },
     {
       title: '状态',
@@ -144,7 +135,7 @@ export default function ApplyPage() {
       <Card title="可申请的数据源" loading={loading}>
         {applyable.length === 0 ? (
           <Text type="secondary">
-            暂无开放申请的数据源。请联系 DBA 在「数据源管理」中开启申请并配置可申请范围。
+            暂无开放申请的数据源。请联系 DBA 在「数据源管理」中开启申请。
           </Text>
         ) : (
           <Space direction="vertical" size="middle" style={{ width: '100%' }}>
@@ -168,9 +159,9 @@ export default function ApplyPage() {
                       <Descriptions.Item label="最长可申请">
                         {ds.max_apply_days} 天
                       </Descriptions.Item>
-                      <Descriptions.Item label="可申请范围">
+                      <Descriptions.Item label="授权范围">
                         <Text type="secondary">
-                          该数据源下的任意库，有授权即可查询库下所有表
+                          该数据源下的全部库与表（申请时无需选择库）
                         </Text>
                       </Descriptions.Item>
                     </Descriptions>
@@ -204,22 +195,18 @@ export default function ApplyPage() {
         destroyOnClose
       >
         <Form form={form} layout="vertical" preserve={false}>
-          <Form.Item
-            name="scope"
-            label="申请库"
-            rules={[
-              { required: true, message: '请填写库名' },
-              {
-                // 后端用 NormalizeScope 校验，畸形输入会被拒（400）。
-                // 这里先挡一道，用户不用等一次往返才知道写错了。
-                pattern: /^[^\s:*?[\]]+$/,
-                message: '只能填库名，不要带通配符或冒号',
-              },
-            ]}
-            extra="授权粒度是库：拿到该库的权限就能查询库下所有表，不需要逐表申请"
-          >
-            <Input placeholder="例如 shop" />
-          </Form.Item>
+          {/* 申请不再选库：一次申请覆盖整个数据源。
+              之前这里的「申请库」输入框要求用户记住库名并手打，
+              拼错一个字母就得等审批通过后自己发现——而权限模型里
+              本来就没有「一库一申请」的必要（审批通过即拥有该数据源
+              全部库表），留着只会增加一次出错机会。 */}
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="审批通过后，可查询该数据源下所有库和表"
+            description="无需逐库或逐表申请，也无需填写库名。"
+          />
           <Form.Item
             name="days"
             label="申请天数"

@@ -107,9 +107,14 @@ export async function listApplyable(): Promise<Datasource[]> {
   return data.items ?? []
 }
 
+/**
+ * 提交授权申请。
+ *
+ * 不再传 scope：申请粒度就是数据源本身，审批通过即拥有该数据源下
+ * 所有库表的查询权限，范围由后端固化，客户端自述的范围会被忽略。
+ */
 export async function createGrantRequest(payload: {
   datasource_id: number
-  scope: string
   days: number
   reason: string
 }): Promise<number> {
