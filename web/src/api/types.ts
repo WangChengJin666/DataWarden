@@ -45,6 +45,17 @@ export interface Datasource {
   description: string
 }
 
+/**
+ * 「可申请的数据源」列表的一行。
+ *
+ * 就是 Datasource 加上一个 applied：当前用户在这个数据源上是否还有
+ * 待审批的申请。有的话前端把操作列显示成「已申请」并禁用，
+ * 不能让用户对同一数据源反复排队（后端也会以 409 拒绝）。
+ */
+export interface ApplyableDatasource extends Datasource {
+  applied: boolean
+}
+
 export interface DatasourceInput {
   name: string
   type: DatasourceType

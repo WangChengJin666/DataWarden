@@ -102,6 +102,38 @@ func (s *GrantRequestStore) ListByStatus(ctx context.Context, status string, lim
 	return out, rows.Err()
 }
 
+// PendingDatasourceIDs 返回某用户当前仍有待审批申请单的数据源 ID 集合。
+//
+// 申请页用它把「已经申请过、还没审完」的数据源标成不可再申请：
+// 同一数据源重复提交 pending 单，审批人看到两条一模一样的申请，
+// 批了一条另一条还在，用户又会以为自己没申请成功——纯噪音。
+//
+// 只算 pending，不算任何已出结论的状态：
+//   - approved：批过的数据源若授权已经到期，用户理应能再申请一次续期；
+//   - rejected：被驳回的可以补理由重提；
+//   - canceled：自己撤回的也要能重来。
+//
+// 用 IN 一次查完，不要在 Go 里对每个数据源查一遍（N+1）。
+func (s *GrantRequestStore) PendingDatasourceIDs(ctx context.Context, userID int64) (map[int64]bool, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT datasource_id FROM grant_request
+		 WHERE user_id = $1 AND status = 'pending'`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("query pending grant requests: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan pending datasource id: %w", err)
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
 // ListByUser 列出某个用户自己的申请单。
 func (s *GrantRequestStore) ListByUser(ctx context.Context, userID int64, limit int) ([]model.GrantRequest, error) {
 	if limit <= 0 || limit > 200 {

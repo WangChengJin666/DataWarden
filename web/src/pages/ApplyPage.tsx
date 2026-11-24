@@ -11,6 +11,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
@@ -21,7 +22,12 @@ import {
   listApplyable,
   listMyRequests,
 } from '@/api/client'
-import type { Datasource, GrantRequest, GrantRequestStatus } from '@/api/types'
+import type {
+  ApplyableDatasource,
+  Datasource,
+  GrantRequest,
+  GrantRequestStatus,
+} from '@/api/types'
 
 const { Text } = Typography
 
@@ -33,7 +39,7 @@ const statusMeta: Record<GrantRequestStatus, { color: string; label: string }> =
 }
 
 export default function ApplyPage() {
-  const [applyable, setApplyable] = useState<Datasource[]>([])
+  const [applyable, setApplyable] = useState<ApplyableDatasource[]>([])
   const [mine, setMine] = useState<GrantRequest[]>([])
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
@@ -97,7 +103,11 @@ export default function ApplyPage() {
   // 可申请数据源用表格分页呈现。之前一个数据源一张小卡片，卡片里还有两块
   // Descriptions，稍有十几个数据源就把「我的申请」挤到屏幕外，要点申请还得
   // 来回滚动找。表格把连接信息和最长天数收进列里，一屏能看一页。
-  const applyColumns: ColumnsType<Datasource> = [
+  //
+  // 已有待审批申请的行，操作列换成禁用的「已申请」：
+  // 同一数据源重复提交只会让审批队列里堆一串同样的单子，
+  // 批掉一条另一条还挂着，用户反而以为没申请成功。
+  const applyColumns: ColumnsType<ApplyableDatasource> = [
     {
       title: '数据源',
       dataIndex: 'name',
@@ -133,11 +143,18 @@ export default function ApplyPage() {
       title: '操作',
       width: 110,
       align: 'right',
-      render: (_, r) => (
-        <Button type="primary" size="small" onClick={() => openApply(r)}>
-          申请授权
-        </Button>
-      ),
+      render: (_, r) =>
+        r.applied ? (
+          <Tooltip title="已有待审批的申请，可在下方「我的申请」里撤销">
+            <Button size="small" disabled>
+              已申请
+            </Button>
+          </Tooltip>
+        ) : (
+          <Button type="primary" size="small" onClick={() => openApply(r)}>
+            申请授权
+          </Button>
+        ),
     },
   ]
 
@@ -197,7 +214,8 @@ export default function ApplyPage() {
           }}
         />
         <Text type="secondary" style={{ fontSize: 12 }}>
-          审批通过后即可查询该数据源下的全部库与表，申请时无需选择库。
+          审批通过后即可查询该数据源下的全部库与表，申请时无需选择库；
+          已有待审批申请的数据源需等审批结果（或先撤销）才能再次申请。
         </Text>
       </Card>
 

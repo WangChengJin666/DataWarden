@@ -1,5 +1,6 @@
 import axios, { AxiosError } from 'axios'
 import type {
+  ApplyableDatasource,
   Datasource,
   DatasourceBrief,
   DatasourceInput,
@@ -102,8 +103,8 @@ export async function deleteDatasource(id: number): Promise<void> {
 
 // ---------- 授权申请 ----------
 
-export async function listApplyable(): Promise<Datasource[]> {
-  const { data } = await http.get<{ items: Datasource[] }>('/grant/applyable')
+export async function listApplyable(): Promise<ApplyableDatasource[]> {
+  const { data } = await http.get<{ items: ApplyableDatasource[] }>('/grant/applyable')
   return data.items ?? []
 }
 

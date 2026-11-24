@@ -16,6 +16,9 @@ type GrantRequestStore interface {
 	Get(ctx context.Context, id int64) (*model.GrantRequest, error)
 	ListByStatus(ctx context.Context, status string, limit int) ([]model.GrantRequest, error)
 	ListByUser(ctx context.Context, userID int64, limit int) ([]model.GrantRequest, error)
+	// PendingDatasourceIDs 返回该用户仍有待审批申请单的数据源。
+	// 申请页据此把「已申请」的数据源标灰，避免同一数据源重复排队。
+	PendingDatasourceIDs(ctx context.Context, userID int64) (map[int64]bool, error)
 	Approve(ctx context.Context, reqID, reviewerID int64, comment string) (*model.Grant, error)
 	Reject(ctx context.Context, reqID, reviewerID int64, comment string) error
 	Cancel(ctx context.Context, reqID, userID int64) error
@@ -43,14 +46,42 @@ type createGrantRequestReq struct {
 	Reason string `json:"reason" binding:"required"`
 }
 
-// ListApplyable 返回开发者可申请的数据源。
+// applyableItem 是「可申请的数据源」列表的一行。
+//
+// 内嵌完整的数据源结构而不是另建精简视图：这个接口只给已登录用户看，
+// 而 Datasource 的 JSON 里本来就不含密码（只有详情接口回显），
+// 所以沿用原字段即可，前端不必改已有的读取代码。
+//
+// Applied 是「当前用户在这个数据源上是否还挂着待审批的申请」：
+// 有了它，前端才能把已申请的那几行标成不可再点——否则同一数据源
+// 可以反复提交，审批队列里堆一串一模一样的单子。
+type applyableItem struct {
+	model.Datasource
+	Applied bool `json:"applied"`
+}
+
+// ListApplyable 返回开发者可申请的数据源，并标注哪些已经申请过。
 func (h *GrantRequestHandler) ListApplyable(c *gin.Context) {
 	items, err := h.Datasrc.ListApplyable(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+
+	uid, _, _ := currentUser(c)
+	// 查待审批集合失败不该让整个申请页打不开：此时最多是「已申请」
+	// 标记缺失，用户多点一次申请会在 Create(409) 被挡回来。
+	// 比起让人看不到任何数据源，这个降级方向更安全。
+	pending, err := h.Requests.PendingDatasourceIDs(c.Request.Context(), uid)
+	if err != nil {
+		pending = nil
+	}
+
+	out := make([]applyableItem, 0, len(items))
+	for _, d := range items {
+		out = append(out, applyableItem{Datasource: d, Applied: pending[d.ID]})
+	}
+	c.JSON(http.StatusOK, gin.H{"items": out})
 }
 
 // Create 提交申请。粒度是数据源：审批通过即拥有该数据源下所有库表的查询权限。
@@ -89,6 +120,19 @@ func (h *GrantRequestHandler) Create(c *gin.Context) {
 	}
 
 	uid, _, _ := currentUser(c)
+
+	// 已有待审批的申请就拒绝重复提交。
+	//
+	// 前端会把这类数据源标成「已申请」，但那是展示层——手工调接口
+	// 或者两个浏览器标签页同时点，都还能塞进第二条。审批人看到两条
+	// 一模一样的单子，批掉一条另一条还挂着，用户会以为申请没成功。
+	// 判定必须在服务端。
+	pending, err := h.Requests.PendingDatasourceIDs(c.Request.Context(), uid)
+	if err == nil && pending[req.DatasourceID] {
+		c.JSON(http.StatusConflict, gin.H{"error": "该数据源已有待审批的申请，请等待审批结果"})
+		return
+	}
+
 	id, err := h.Requests.Create(c.Request.Context(), &model.GrantRequest{
 		UserID:       uid,
 		DatasourceID: req.DatasourceID,
