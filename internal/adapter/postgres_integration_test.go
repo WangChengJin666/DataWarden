@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -49,12 +50,16 @@ func pgConnFromEnv(t *testing.T) ConnConfig {
 	host, port := hostPort, 5432
 	if c := strings.LastIndex(hostPort, ":"); c > 0 {
 		host = hostPort[:c]
-		switch hostPort[c+1:] {
-		case "5432":
-			port = 5432
-		default:
-			port = 5432
+		// 端口必须真的解析出来。这里曾写成 switch + 两个都赋值 5432 的分支，
+		// 效果等于忽略 URL 里的端口：TEST_DATABASE_URL 指向非默认端口的
+		// 环境（例如容器映射的 31567）会一直连 5432，报
+		// "actively refused" 并让人误判为数据库没起。
+		raw := hostPort[c+1:]
+		p, err := strconv.Atoi(raw)
+		if err != nil || p <= 0 || p > 65535 {
+			t.Fatalf("TEST_DATABASE_URL 里的端口 %q 非法", raw)
 		}
+		port = p
 	}
 
 	return ConnConfig{
