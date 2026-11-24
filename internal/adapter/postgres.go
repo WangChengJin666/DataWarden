@@ -197,7 +197,12 @@ func (a *pgAdapter) query(ctx context.Context, sqlText string, args []any, rowLi
 	}
 	cols = dedupeColumnNames(cols)
 
-	res := &QueryResult{Columns: cols}
+	// 空结果也必须序列化成 [] 而不是 null。
+	//
+	// Go 的 nil 切片在 JSON 里是 null，而前端把 rows 当数组用
+	// （result.rows.map），拿到 null 直接抛 TypeError，整页白屏。
+	// 零行是极常见的情况（条件不匹配、表为空），不能让它变成崩溃。
+	res := &QueryResult{Columns: cols, Rows: make([][]interface{}, 0)}
 	for rows.Next() {
 		if len(res.Rows) >= rowLimit {
 			res.Truncated = true

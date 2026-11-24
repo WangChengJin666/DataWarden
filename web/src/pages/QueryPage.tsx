@@ -70,6 +70,24 @@ async function copyText(text: string) {
 }
 
 /**
+ * 把查询结果补成前端可安全渲染的形状。
+ *
+ * 为什么需要：Go 里零行的切片是 nil，序列化出来是 `"rows": null` 而不是 `[]`。
+ * 表格对 rows / columns 调 .map，拿到 null 会抛 TypeError 导致整页白屏
+ * （React 没有 error boundary，一次空结果就把查询页打挂）。
+ * 后端已让空结果返回 []，这里再做一层兜底——前端不能指望接口永远守约。
+ */
+function normalizeResult(r: QueryResult): QueryResult {
+  return {
+    columns: r.columns ?? [],
+    rows: r.rows ?? [],
+    row_count: r.row_count ?? 0,
+    truncated: r.truncated ?? false,
+    elapsed_ms: r.elapsed_ms ?? 0,
+  }
+}
+
+/**
  * 编辑器里「表名 → 字段」的来源是整库 schema（见 schemaMap）；
  * 表清单（tableOptions）只用于展示与复制表名，与补全无关。
  */
@@ -441,19 +459,21 @@ export default function QueryPage() {
                 command: mongoCommand.trim(),
                 row_limit: rowLimit,
               }
-        setResult(await executeMongo(payload))
+        setResult(normalizeResult(await executeMongo(payload)))
         return
       }
       setResult(
-        await executeSQL({
-          datasource_id: datasourceId,
-          database: database.trim(),
-          // 不再提交 tables：表清单只是展示与复制用，本身不参与鉴权，
-          // 而编辑器补全也不再依赖它。审计里的 tables 保持缺省，
-          // 「这次查了哪些表」以 SQL 本身为准（已随审计一起落库）。
-          sql: effectiveSql,
-          row_limit: rowLimit,
-        }),
+        normalizeResult(
+          await executeSQL({
+            datasource_id: datasourceId,
+            database: database.trim(),
+            // 不再提交 tables：表清单只是展示与复制用，本身不参与鉴权，
+            // 而编辑器补全也不再依赖它。审计里的 tables 保持缺省，
+            // 「这次查了哪些表」以 SQL 本身为准（已随审计一起落库）。
+            sql: effectiveSql,
+            row_limit: rowLimit,
+          }),
+        ),
       )
     } catch (e) {
       message.error((e as Error).message)

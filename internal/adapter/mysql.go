@@ -279,7 +279,9 @@ func scanRows(rows *sql.Rows, rowLimit int, start time.Time) (*QueryResult, erro
 		return nil, fmt.Errorf("columns: %w", err)
 	}
 
-	res := &QueryResult{Columns: cols}
+	// 零行时 Rows 也必须是空数组而不是 nil：nil 切片在 JSON 里是 null，
+	// 前端对 null 调 .map 会直接白屏。空结果是最普通的正常情况。
+	res := &QueryResult{Columns: cols, Rows: make([][]interface{}, 0)}
 	for rows.Next() {
 		if len(res.Rows) >= rowLimit {
 			res.Truncated = true
