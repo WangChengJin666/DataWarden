@@ -48,9 +48,12 @@ export interface Datasource {
 /**
  * 「可申请的数据源」列表的一行。
  *
- * 就是 Datasource 加上一个 applied：当前用户在这个数据源上是否还有
- * 待审批的申请。有的话前端把操作列显示成「已申请」并禁用，
- * 不能让用户对同一数据源反复排队（后端也会以 409 拒绝）。
+ * 就是 Datasource 加上一个 applied：当前用户在这个数据源上是否
+ * **已经不需要再申请**——有待审批的申请单，或者已持有生效中的授权。
+ * 为 true 时操作列显示「已申请」并禁用（后端也会以 409 拒绝）。
+ *
+ * 判定口径以「现在有没有权限」为准，不是「有没有提交过」：
+ * 授权到期或被收回后 applied 会重新变回 false，用户才能续期。
  */
 export interface ApplyableDatasource extends Datasource {
   applied: boolean

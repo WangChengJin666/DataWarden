@@ -104,9 +104,10 @@ export default function ApplyPage() {
   // Descriptions，稍有十几个数据源就把「我的申请」挤到屏幕外，要点申请还得
   // 来回滚动找。表格把连接信息和最长天数收进列里，一屏能看一页。
   //
-  // 已有待审批申请的行，操作列换成禁用的「已申请」：
-  // 同一数据源重复提交只会让审批队列里堆一串同样的单子，
-  // 批掉一条另一条还挂着，用户反而以为没申请成功。
+  // applied 为 true 的行，操作列换成禁用的「已申请」：
+  // 它表示「当前无需再申请」——有待审批的申请单，或者已经持有生效授权。
+  // 后半段尤其不能漏：只判 pending 时，审批通过后按钮还写着「申请授权」，
+  // 用户会以为权限没批下来，点进去又被 409 拒绝。
   const applyColumns: ColumnsType<ApplyableDatasource> = [
     {
       title: '数据源',
@@ -145,7 +146,7 @@ export default function ApplyPage() {
       align: 'right',
       render: (_, r) =>
         r.applied ? (
-          <Tooltip title="已有待审批的申请，可在下方「我的申请」里撤销">
+          <Tooltip title="已持有授权或申请正在审批中，无需再次申请">
             <Button size="small" disabled>
               已申请
             </Button>
@@ -215,7 +216,7 @@ export default function ApplyPage() {
         />
         <Text type="secondary" style={{ fontSize: 12 }}>
           审批通过后即可查询该数据源下的全部库与表，申请时无需选择库；
-          已有待审批申请的数据源需等审批结果（或先撤销）才能再次申请。
+          已持有授权或申请仍在审批中的数据源显示为「已申请」，无需重复提交。
         </Text>
       </Card>
 

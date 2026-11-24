@@ -102,24 +102,34 @@ func (s *GrantRequestStore) ListByStatus(ctx context.Context, status string, lim
 	return out, rows.Err()
 }
 
-// PendingDatasourceIDs 返回某用户当前仍有待审批申请单的数据源 ID 集合。
+// AppliedDatasourceIDs 返回某用户「当前无需再申请」的数据源 ID 集合。
 //
-// 申请页用它把「已经申请过、还没审完」的数据源标成不可再申请：
-// 同一数据源重复提交 pending 单，审批人看到两条一模一样的申请，
-// 批了一条另一条还在，用户又会以为自己没申请成功——纯噪音。
+// 申请页用它把这类数据源的操作列从「申请授权」换成「已申请」。
+// 两种情形都算：
 //
-// 只算 pending，不算任何已出结论的状态：
-//   - approved：批过的数据源若授权已经到期，用户理应能再申请一次续期；
-//   - rejected：被驳回的可以补理由重提；
-//   - canceled：自己撤回的也要能重来。
+//  1. 还有待审批的申请单（status='pending'）——再提一份只会让审批队列里
+//     堆两条一模一样的单子，批了一条另一条还挂着，用户会以为自己没提交成功；
+//  2. 已经持有生效中的授权（grant_record 未撤销且未过期）——本来就是能查的
+//     状态，再申请一次等于让人重复走一遍审批。这一条最初漏了，导致
+//     「审批通过后按钮还是申请授权」，看起来像上一版改动根本没生效。
 //
-// 用 IN 一次查完，不要在 Go 里对每个数据源查一遍（N+1）。
-func (s *GrantRequestStore) PendingDatasourceIDs(ctx context.Context, userID int64) (map[int64]bool, error) {
+// 刻意不把「历史上审批通过过」当成已申请：授权到期或被收回后，
+// 用户理应能再申请一次续期，否则这个数据源就永远点不动了。
+// 判据必须落在「现在有没有权限」，而不是「有没有那条历史记录」。
+//
+// rejected / canceled 同理要放行——被驳回的能补理由重提，自己撤回的能重来。
+//
+// 两条查询合并成一个 SQL，一次往返；不要按数据源循环查询（N+1）。
+func (s *GrantRequestStore) AppliedDatasourceIDs(ctx context.Context, userID int64) (map[int64]bool, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT datasource_id FROM grant_request
-		 WHERE user_id = $1 AND status = 'pending'`, userID)
+		`SELECT datasource_id FROM grant_request
+		   WHERE user_id = $1 AND status = 'pending'
+		 UNION
+		 SELECT datasource_id FROM grant_record
+		   WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()`,
+		userID)
 	if err != nil {
-		return nil, fmt.Errorf("query pending grant requests: %w", err)
+		return nil, fmt.Errorf("query applied datasources: %w", err)
 	}
 	defer rows.Close()
 
@@ -127,7 +137,7 @@ func (s *GrantRequestStore) PendingDatasourceIDs(ctx context.Context, userID int
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan pending datasource id: %w", err)
+			return nil, fmt.Errorf("scan applied datasource id: %w", err)
 		}
 		out[id] = true
 	}
