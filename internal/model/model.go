@@ -11,6 +11,20 @@ const (
 	RoleSuperAdmin Role = "superadmin"
 )
 
+// IsPrivileged 判断该角色是否属于「平台管理侧」，即是否需要走授权申请流程。
+//
+// dba / superadmin 不参与授权：他们本身负责审批与回收授权，
+// 再让他们给自己申请一条授权才能查数据，是把审批人放进了被审批的位置——
+// 实际操作中只能靠「先批自己一条」绕过，等于流程空转。
+//
+// 所有判断「是不是管理角色」的地方都应该调这个函数，而不是各自
+// 再写一遍 role == "dba" || role == "superadmin"：
+// 漏写一处就会出现「下拉框看得到全量数据源、执行时却 403」
+// 这种前后不一致的现象，而且很难从界面现象倒推出是哪个环节漏了。
+func (r Role) IsPrivileged() bool {
+	return r == RoleDBA || r == RoleSuperAdmin
+}
+
 type User struct {
 	ID           int64     `json:"id"`
 	Username     string    `json:"username"`

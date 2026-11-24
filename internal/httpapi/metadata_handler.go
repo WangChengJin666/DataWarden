@@ -43,6 +43,10 @@ const catalogTimeout = 8 * time.Second
 // 返回的是「用户有权访问的库」：对每个库判断 ds:<id>:<db>:* 是否放行。
 // 不过滤的话，一个只有 shop 库权限的用户也能看到全部库名——
 // 库名本身就是内网信息（payments / user_center 这类名字足够说明业务）。
+//
+// dba / superadmin 命中内置策略 ds:*:*:*，因此这里对他们是全量放行。
+// 这不是特例分支：放行范围完全由 Casbin 策略表决定，
+// 加角色分支反而会出现「策略说能、代码说不」的第二套事实。
 func (h *MetadataHandler) ListDatabases(c *gin.Context) {
 	if h.Factory == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "metadata not configured"})

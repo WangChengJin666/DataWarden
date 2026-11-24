@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -51,7 +50,7 @@ func (h *QueryHandler) ExecuteMongo(c *gin.Context) {
 	// 反过来的话，任何未授权用户都能触发一次目标库连接：
 	// 既浪费连接资源，也让人可以借报错信息探测目标库是否存在。
 	uid, username, _ := currentUser(c)
-	subject := "u:" + strconv.FormatInt(uid, 10)
+	subject := SubjectOf(uid)
 
 	// 集合名可能带库前缀（db.shop.users 形式解析出 "shop.users"）。
 	// 鉴权必须用拆分后的 (库, 集合)，否则 ds:<id>:<库>:<集合> 会少一段，

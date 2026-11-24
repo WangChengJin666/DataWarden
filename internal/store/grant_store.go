@@ -145,8 +145,42 @@ func (s *GrantStore) MyDatasources(ctx context.Context, userID int64) ([]model.D
 	return out, rows.Err()
 }
 
-// parseScopes 把授权 scope 字符串拆成结构化形态。
+// AllDatasources 返回全量数据源的精简视图，供 dba / superadmin 的查询页下拉使用。
 //
+// 与 MyDatasources 的区别只是「过滤条件」：管理角色不参与授权，
+// 查询范围就是全部数据源，没有 grant_record 可 join。两者返回同一形态，
+// 前端不需要为角色写两套渲染逻辑。
+//
+// 字段清单与 MyDatasources 严格一致（不含 host/port/username）：
+// 即便是 DBA，查询页也没有展示内网拓扑的需求，多余字段只会随响应扩散出去。
+// Scopes 固定为空数组——给管理角色构造「全库全表」的假授权记录会误导前端展示。
+func (s *GrantStore) AllDatasources(ctx context.Context) ([]model.DatasourceBrief, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, name, type, description, db_name
+		 FROM datasource
+		 ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("query all datasources: %w", err)
+	}
+	defer rows.Close()
+
+	out := []model.DatasourceBrief{}
+	for rows.Next() {
+		var (
+			b   model.DatasourceBrief
+			typ string
+		)
+		if err := rows.Scan(&b.ID, &b.Name, &typ, &b.Description, &b.Database); err != nil {
+			return nil, fmt.Errorf("scan datasource brief: %w", err)
+		}
+		b.Type = model.DatasourceType(typ)
+		b.Scopes = []model.ScopeView{}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// parseScopes 把授权 scope 字符串拆成结构化形态。
 // 归一规则与 authz.NormalizeScope / httpapi.splitScope 保持一致：
 //   - "shop" 或 "shop:*"  → {Database: "shop", Tables: nil}（整库）
 //   - "shop:orders,users" → {Database: "shop", Tables: [orders, users]}

@@ -173,9 +173,15 @@ func main() {
 // SyncGrants 会先清空 p 段再按数据库记录重建，内置的 dba / superadmin 策略
 // 不在数据库里，会被一起清掉。所以凡是调用 syncAuthz 之后都必须补一次，
 // 否则刷新一次策略，DBA 自己就查不了任何数据了。
+//
+// 策略对象是 ds:*:*:*（四段全通配），意味着管理角色可以查任何数据源、
+// 任何库、任何表，且不需要 grant_record——这是产品上明确的约定：
+// 审批人不进审批流程。对象格式与「为什么不能写成 ds:*」见
+// authz.BuiltinPolicyObject 的注释。
 func reAddBuiltinPolicies(e *authz.Enforcer) {
-	e.AddPolicy("dba", "ds:*", "read")
-	e.AddPolicy("superadmin", "ds:*", "read")
+	for _, sub := range authz.PrivilegedPolicySubjects {
+		e.AddPolicy(sub, authz.BuiltinPolicyObject, "read")
+	}
 }
 
 // metadataStore 把「数据源读取」和「授权 scope 查询」组合成元数据接口需要的存储。

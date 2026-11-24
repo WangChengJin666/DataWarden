@@ -207,7 +207,8 @@ export async function listColumns(
 export async function executeSQL(payload: {
   datasource_id: number
   database: string
-  tables: string[]
+  /** 选填：dba / superadmin 不需要逐表鉴权，可以不传 */
+  tables?: string[]
   sql: string
   row_limit?: number
 }): Promise<QueryResult> {

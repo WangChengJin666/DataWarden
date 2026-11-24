@@ -18,6 +18,8 @@ type GrantStore interface {
 	Revoke(ctx context.Context, id int64) error
 	// MyDatasources 返回某用户当前有权查询的数据源（去重、仅生效中的授权）。
 	MyDatasources(ctx context.Context, userID int64) ([]model.DatasourceBrief, error)
+	// AllDatasources 返回全量数据源的精简视图，供管理角色使用。
+	AllDatasources(ctx context.Context) ([]model.DatasourceBrief, error)
 }
 
 // GrantHandler 提供授权的查看与回收。
@@ -41,9 +43,25 @@ type GrantHandler struct {
 //
 // 返回的是精简视图（不带 host/port/username），并附带该用户在这些
 // 数据源上的授权 scope，前端可据此提示「你在这个库上有哪些表的权限」。
+//
+// 角色分支：dba / superadmin 走全量清单。
+//
+// 这里必须分支，不能只在查询执行侧放行：那种改法下 DBA 的下拉依然只有
+// 自己历史授权过的那几个数据源，而执行侧已经全开——界面不给选、
+// 后端却允许，用户只会认为「平台坏了」。反过来只改下拉不改执行侧，
+// 则是「能选但一点就 403」，同样不可用。两侧必须用同一个判定（model.Role.IsPrivileged）。
 func (h *GrantHandler) ListMine(c *gin.Context) {
-	uid, _, _ := currentUser(c)
-	items, err := h.Store.MyDatasources(c.Request.Context(), uid)
+	uid, _, role := currentUser(c)
+
+	var (
+		items []model.DatasourceBrief
+		err   error
+	)
+	if model.Role(role).IsPrivileged() {
+		items, err = h.Store.AllDatasources(c.Request.Context())
+	} else {
+		items, err = h.Store.MyDatasources(c.Request.Context(), uid)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

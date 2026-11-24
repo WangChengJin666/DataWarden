@@ -8,6 +8,7 @@ import (
 
 	"github.com/casbin/casbin/v2"
 	"github.com/casbin/casbin/v2/model"
+	appmodel "github.com/opensourceprj/datawarden/internal/model"
 )
 
 // GrantPolicy 是从数据库读出的授权记录，用于重建策略。
@@ -35,6 +36,31 @@ type GrantPolicy struct {
 type Enforcer struct {
 	mu sync.RWMutex
 	e  *casbin.Enforcer
+}
+
+// BuiltinPolicyObject 是 dba / superadmin 的内置策略对象：全部数据源、全部库表。
+//
+// 必须是四段完整形式 ds:*:*:*，不能写成三段 ds:*。
+// keyMatch 的语义是「以模式前缀匹配」，"ds:*" 对 "ds:1:public:orders"
+// 的确是前缀命中（结尾是 *，吞掉后面全部），但写法上省略了两段，
+// 后面任何一次调整 object 拼装规则（比如给 Redis 的 db 号加类型前缀）
+// 都会让这条策略悄悄失效，失效方式是「管理角色突然全线 403」。
+// 写成四段等于把 glob 的边界和 object 的段数钉在一起，
+// 有段数变动时这条策略会在 code review 里立刻显形。
+//
+// 与之对应的判定散落在：querysvc.ExecuteSQL / ExecuteMongo 的逐表鉴权、
+// httpapi.RedisHandler.EnforceKey、MetadataHandler.allowed。
+// 它们都只调 Enforce，不重复实现角色判断——角色到策略的映射只发生在
+// reAddBuiltinPolicies 一处。
+const BuiltinPolicyObject = "ds:*:*:*"
+
+// PrivilegedPolicySubjects 是需要全量查询权限的内置角色。
+//
+// 用切片而不是硬编码两行 AddPolicy：新增管理角色（审计员、只读运维）时
+// 只改这里，不用去翻调用点。导出给测试与启动装配共用同一份清单。
+var PrivilegedPolicySubjects = []string{
+	string(appmodel.RoleDBA),
+	string(appmodel.RoleSuperAdmin),
 }
 
 // modelText 定义权限模型。

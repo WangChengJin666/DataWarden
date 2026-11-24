@@ -23,6 +23,7 @@ import {
   executeMongo,
   executeRedis,
   executeSQL,
+  getCurrentUser,
   listColumns,
   listDatabases,
   listMyDatasources,
@@ -31,6 +32,12 @@ import {
 import type { DatasourceBrief, QueryResult, RedisQueryResult } from '@/api/types'
 
 const { Text, Paragraph } = Typography
+
+/** 管理角色不需要授权即可查询全部数据源（与后端 model.Role.IsPrivileged 对应）。 */
+const PRIVILEGED_ROLES = ['dba', 'superadmin']
+
+const isPrivileged = () =>
+  PRIVILEGED_ROLES.includes(getCurrentUser()?.role ?? '')
 
 /**
  * MongoDB 的字段名是「采样」得来的——取一条文档看看有哪些键。
@@ -42,6 +49,10 @@ type ColumnCache = Record<string, string[] | undefined>
 export default function QueryPage() {
   const [datasources, setDatasources] = useState<DatasourceBrief[]>([])
   const [datasourceId, setDatasourceId] = useState<number>()
+  // 管理角色：不需要授权，任何数据源的所有库表都能查。
+  // 这个标记只影响「下拉怎么加载」和「执行前要不要强制选表」，
+  // 真正的权限判定一律在后端——前端放行不等于能查到数据。
+  const [noGrantNeeded] = useState(isPrivileged)
 
   // 库名在 SQL 下是库/模式名，在 Mongo 下是库名，在 Redis 下是 db 号
   const [database, setDatabase] = useState('')
@@ -89,7 +100,13 @@ export default function QueryPage() {
       try {
         // 用 listMyDatasources 而不是 listDatasources：
         // 后者走 GET /datasources，路由限 DBA，开发者调用会 403，
-        // 下拉变成空、什么都查不了。这里返回的是「我拿到授权的数据源」。
+        // 下拉变成空、什么都查不了。这里返回的是「我拿到授权的数据源」；
+        // 对 dba / superadmin 后端直接返回全量清单（他们不需要授权）。
+        //
+        // 需要留意的是：这个接口对开发者只返回「有授权」的数据源，
+        // 所以下拉为空意味着「一条生效授权都没有」，不是接口故障。
+        // 下面用空态提示把这句话说清楚——之前空下拉静默无提示，
+        // 用户只会以为功能坏了。
         const list = await listMyDatasources()
         setDatasources(list)
         // 优先选 SQL 类型，没有就选第一个可查的。
@@ -283,7 +300,11 @@ export default function QueryPage() {
         message.warning('请选择库')
         return
       }
-      if (tables.length === 0) {
+      // 表清单是「逐表鉴权」的输入：开发者必须填，否则后端无从判断
+      // 他能不能读这些表。dba / superadmin 走内置策略 ds:*:*:*，
+      // 不填也能查，所以这里不再拦截——之前强制必填，
+      // 等于让管理员为了查一张随手写的表先去下拉里找它。
+      if (tables.length === 0 && !noGrantNeeded) {
         message.warning('请选择查询涉及的表，平台需要逐表鉴权')
         return
       }
@@ -343,7 +364,10 @@ export default function QueryPage() {
         await executeSQL({
           datasource_id: datasourceId,
           database: database.trim(),
-          tables,
+          // 没选表就不传：后端对空清单的语义是「按角色判定」，
+          // 开发者会在那里被拒（ErrNoTables），管理角色则直接放行。
+          // 传空数组和不传走同一条路径，这里显式省略让报文更干净。
+          tables: tables.length > 0 ? tables : undefined,
           sql,
           row_limit: rowLimit,
         }),
@@ -449,6 +473,23 @@ export default function QueryPage() {
   return (
     <Space direction="vertical" size="large" style={{ width: '100%' }}>
       <Card title="数据查询">
+        {/* 管理角色的提示放在规则最前面：他们看到的下拉是全量数据源，
+            跟开发者看到的不是一回事。不说明的话，DBA 会以为
+            「没申请过授权的数据源怎么也能选」——看着像权限泄漏。 */}
+        {noGrantNeeded ? (
+          <Alert
+            type="success"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="管理角色：免授权查询"
+            description={
+              <span>
+                当前账号（{getCurrentUser()?.role}）不需要授权即可查询全部数据源的所有库表，
+                因此下拉里是完整数据源清单。所有查询仍会记入审计日志。
+              </span>
+            }
+          />
+        ) : null}
         <Alert
           type="info"
           showIcon
@@ -457,22 +498,50 @@ export default function QueryPage() {
           description={
             isMongo ? (
               <span>
-                集合名用于逐集合鉴权，无权限的集合会被拒绝。只允许查询操作，
+                {noGrantNeeded
+                  ? '管理角色免授权，任意集合都可查询。'
+                  : '集合名用于逐集合鉴权，无权限的集合会被拒绝。'}
+                只允许查询操作，
                 写操作与会写库的聚合阶段（$out、$merge）一律拦截。结果中的手机号、身份证、邮箱等字段会自动脱敏。
               </span>
             ) : isRedis ? (
               <span>
-                授权范围按 key 前缀判定，前缀授权会自动覆盖其下所有子 key。
+                {noGrantNeeded
+                  ? '管理角色免授权，任意 key 与前缀都可查询。'
+                  : '授权范围按 key 前缀判定，前缀授权会自动覆盖其下所有子 key。'}
                 模糊查询走 SCAN，绝不使用 KEYS。
               </span>
             ) : (
               <span>
-                只能执行只读语句（SELECT / SHOW / DESC / EXPLAIN）。必须选择查询涉及的表，
-                平台会逐表校验权限，任一表无权限则整条查询被拒绝。结果中的手机号、身份证、邮箱等字段会自动脱敏。
+                只能执行只读语句（SELECT / SHOW / DESC / EXPLAIN）。
+                {noGrantNeeded
+                  ? '管理角色免授权，「涉及的表」可留空，不会做逐表校验。'
+                  : '必须选择查询涉及的表，平台会逐表校验权限，任一表无权限则整条查询被拒绝。'}
+                结果中的手机号、身份证、邮箱等字段会自动脱敏。
               </span>
             )
           }
         />
+
+        {/* 开发者一条生效授权都没有时，下拉是空的且没有任何解释——
+            这是最常见的困惑来源：「数据源管理里明明有数据，这里怎么是空的」。
+            原因在下拉的数据来源上：它列的是「我有授权的数据源」，
+            不是数据源表本身。把这句话直接写出来，比让用户自己猜强。 */}
+        {!noGrantNeeded && datasources.length === 0 ? (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="没有任何可查询的数据源"
+            description={
+              <span>
+                这个下拉列的是「你已获得授权的数据源」，不是平台上的全部数据源。
+                请先到「申请授权」页提交申请，DBA 审批通过后即可在这里查询。
+                若你确认已经有授权，请检查授权是否已到期。
+              </span>
+            }
+          />
+        ) : null}
 
         <Space wrap style={{ marginBottom: 12 }}>
           <Select
@@ -525,7 +594,11 @@ export default function QueryPage() {
                 <Select
                   mode="multiple"
                   style={{ minWidth: 280, maxWidth: 420 }}
-                  placeholder="选择涉及的表（用于逐表鉴权）"
+                  placeholder={
+                    noGrantNeeded
+                      ? '涉及的表（选填，管理角色可不填）'
+                      : '选择涉及的表（用于逐表鉴权）'
+                  }
                   value={tables}
                   onChange={setTables}
                   // onDropdownVisibleChange 在 antd v5 已废弃（会告警且行为不确定），
