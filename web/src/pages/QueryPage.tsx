@@ -7,6 +7,7 @@ import {
   Input,
   InputNumber,
   message,
+  Popover,
   Select,
   Space,
   Spin,
@@ -16,7 +17,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons'
+import { CopyOutlined, PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons'
 import CodeMirror from '@uiw/react-codemirror'
 import { Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
@@ -45,8 +46,32 @@ const isPrivileged = () =>
   PRIVILEGED_ROLES.includes(getCurrentUser()?.role ?? '')
 
 /**
- * 编辑器里「表名 → 字段」的来源已改为整库 schema（见 schemaMap），
- * 这里只保留下拉与提示用的小工具函数。
+ * 写入剪贴板。navigator.clipboard 只在安全上下文（https / localhost）可用，
+ * 内网 http 部署时会缺席，退回 execCommand 保证复制按钮不至于点了没反应。
+ */
+async function copyText(text: string) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    message.success(`已复制 ${text}`)
+  } catch {
+    message.warning('浏览器不允许自动复制，请手动选中复制')
+  }
+}
+
+/**
+ * 编辑器里「表名 → 字段」的来源是整库 schema（见 schemaMap）；
+ * 表清单（tableOptions）只用于展示与复制表名，与补全无关。
  */
 export default function QueryPage() {
   const [datasources, setDatasources] = useState<DatasourceBrief[]>([])
@@ -56,15 +81,15 @@ export default function QueryPage() {
   // 真正的权限判定一律在后端——前端放行不等于能查到数据。
   const [noGrantNeeded] = useState(isPrivileged)
 
+  // 选中表名的筛选关键字（只在表名清单的 Popover 内过滤，不请求后端）
+  const [tableKeyword, setTableKeyword] = useState('')
+
   // 库名在 SQL 下是库/模式名，在 Mongo 下是库名，在 Redis 下是 db 号
   const [database, setDatabase] = useState('')
-  // 选中用于补全的表（可多选，选填）。
-  //
-  // 这里容易误解，写清楚：授权粒度是「数据源 + 库」，这份表清单
-  // **不参与鉴权**，留空也能执行任意表的查询。它唯一的作用是让编辑器
-  // 知道去拉哪些表的字段名，从而提示 `表名.` 之后的列。
-  // 曾经它是逐表鉴权的输入（拼错一个字母就是 403），现已不是。
-  const [tables, setTables] = useState<string[]>([])
+  // 注意：这里**没有**「已选表」状态。
+  // 表清单（tableOptions）纯粹是给用户看「这个库里有哪些表」并复制的，
+  // 既不参与鉴权（粒度是数据源 + 库），也不再喂给编辑器补全
+  // （题注 `别名.` 的字段来自 schemaMap 的整库结构）。
 
   const [sql, setSql] = useState('')
   const [rowLimit, setRowLimit] = useState(100)
@@ -91,8 +116,8 @@ export default function QueryPage() {
   const [tableError, setTableError] = useState('')
   // 整库表结构（表名 → 字段）。SQL 编辑器靠它把 `别名.` 解析成具体表的字段：
   // 逐表请求跟不上打字，也不能在用户改别名时重新请求，所以一次取全库缓存。
-  // 这取代了早先「选表才拉字段」的 ColumnCache 方案——那条路径要求用户
-  // 先在表下拉里选表，而 Navicat 式的体验是「写了 FROM 就该有提示」。
+  // 与右侧的表清单（tableOptions）是两份独立数据：前者供编辑器补全，
+  // 后者只是给用户看的表名速查，互不依赖。
   const [schemaMap, setSchemaMap] = useState<SchemaMap>({})
   // 库列表请求的序号，用于丢弃过期响应（见 loadDatabases）
   const dbReqSeq = useRef(0)
@@ -119,6 +144,13 @@ export default function QueryPage() {
   const isRedis = current?.type === 'redis'
   const isMongo = current?.type === 'mongodb'
   const isSQL = !isRedis && !isMongo
+
+  // 表清单按关键字过滤（纯前端，不动后端请求）
+  const filteredTables = useMemo(() => {
+    const kw = tableKeyword.trim().toLowerCase()
+    if (!kw) return tableOptions
+    return tableOptions.filter((t) => t.toLowerCase().includes(kw))
+  }, [tableOptions, tableKeyword])
 
   // 方言由数据源类型决定。写进 ref 让补全来源始终读到最新值：
   // EditorView 是长期的，闭包捕获的 current 会停留在首次渲染的那份。
@@ -169,9 +201,9 @@ export default function QueryPage() {
   // 是否生效变成时序巧合。首次加载与手动切换走完全相同的一条路径。
   useEffect(() => {
     setDatabase('')
-    setTables([])
     setSql('')
     setTableOptions([])
+    setTableKeyword('')
     // 整库表结构也要清：留着上一个数据源的 schema 会让编辑器提示
     // 一堆根本不在当前库里的表，比没有提示更误导
     setSchemaMap({})
@@ -219,7 +251,7 @@ export default function QueryPage() {
       if (picked) {
         setDatabase(picked)
         // 预填默认库时也要拉表结构与表清单：这条路径不经过 onDatabaseChange，
-        // 少了这一步编辑器在首次打开页面时就没有任何补全
+        // 少了这一步首次打开页面时表清单为空、编辑器也没有字段提示
         void loadTables(ds.id, picked)
         void loadSchema(ds.id, picked)
       }
@@ -258,10 +290,10 @@ export default function QueryPage() {
     [isRedis],
   )
 
-  // 库变了就重拉表清单与表结构，并清掉已选表（上一个库的表名在新库里不成立）
+  // 库变了就重拉表清单与表结构
   const onDatabaseChange = (db: string) => {
     setDatabase(db)
-    setTables([])
+    setTableKeyword('')
     // 立刻清空而不是等新 schema 回来：过渡期里旧库的表名会误导补全
     setSchemaMap({})
     if (datasourceId) {
@@ -416,10 +448,9 @@ export default function QueryPage() {
         await executeSQL({
           datasource_id: datasourceId,
           database: database.trim(),
-          // 没选表就不传：后端对空清单按角色分流——
-          // 管理角色补成「整库」对象后放行，开发者仍被拒（ErrNoTables）。
-          // 传空数组和不传走同一条路径，这里显式省略让报文更干净。
-          tables: tables.length > 0 ? tables : undefined,
+          // 不再提交 tables：表清单只是展示与复制用，本身不参与鉴权，
+          // 而编辑器补全也不再依赖它。审计里的 tables 保持缺省，
+          // 「这次查了哪些表」以 SQL 本身为准（已随审计一起落库）。
           sql: effectiveSql,
           row_limit: rowLimit,
         }),
@@ -725,29 +756,73 @@ export default function QueryPage() {
               </AutoComplete>
 
               {isSQL ? (
-                <Select
-                  mode="multiple"
-                  style={{ minWidth: 280, maxWidth: 420 }}
-                  // 作用已从「鉴权输入」变成「补全辅助」：
-                  // 授权粒度是库，选不选表都不影响能不能执行，
-                  // 选中只是让编辑器能提示字段名。文案必须说清这一点，
-                  // 否则用户会以为漏选了表会被拒。
-                  placeholder="补全用：选择表以提示字段（选填）"
-                  value={tables}
-                  onChange={setTables}
-                  // onDropdownVisibleChange 在 antd v5 已废弃（会告警且行为不确定），
-                  // 改用 onOpenChange。
+                // 表清单只是一个「有哪些表」的速查表：只读展示 + 一键复制表名。
+                //
+                // 为什么不做成多选：授权粒度是数据源 + 库，选不选表都不影响
+                // 能否执行；编辑器补全也早已改成读整库结构（schemaMap），
+                // 不再需要用户先勾表。留着多选只会让人误以为「漏选会被拒」。
+                <Popover
+                  trigger="click"
+                  placement="bottomLeft"
                   onOpenChange={(open) => {
                     if (open && datasourceId && database) {
                       void loadTables(datasourceId, database)
                     }
                   }}
-                  options={tableOptions.map((t) => ({ value: t, label: t }))}
-                  loading={tableLoading}
-                  status={tableError ? 'error' : undefined}
-                  maxTagCount="responsive"
-                  allowClear
-                />
+                  title={
+                    <Space size={8}>
+                      <span>表（{tableOptions.length}）</span>
+                      <Text type="secondary" style={{ fontSize: 12, fontWeight: 'normal' }}>
+                        点击表名即可复制，无需选择
+                      </Text>
+                    </Space>
+                  }
+                  content={
+                    <div style={{ width: 320 }}>
+                      <Input
+                        size="small"
+                        allowClear
+                        placeholder="筛选表名"
+                        value={tableKeyword}
+                        onChange={(e) => setTableKeyword(e.target.value)}
+                        style={{ marginBottom: 8 }}
+                      />
+                      <div style={{ maxHeight: 320, overflow: 'auto' }}>
+                        {tableLoading ? (
+                          <div style={{ padding: '16px 0', textAlign: 'center' }}>
+                            <Spin size="small" />
+                          </div>
+                        ) : filteredTables.length === 0 ? (
+                          <Text type="secondary" style={{ fontSize: 12 }}>
+                            {tableError
+                              ? `无法列出表：${tableError}`
+                              : database
+                                ? '这个库里没有可见的表'
+                                : '先选择库'}
+                          </Text>
+                        ) : (
+                          filteredTables.map((t) => (
+                            <div
+                              key={t}
+                              className="dw-table-pick"
+                              title="点击复制表名"
+                              onClick={() => void copyText(t)}
+                            >
+                              <Text code style={{ fontSize: 12 }}>
+                                {t}
+                              </Text>
+                              <CopyOutlined style={{ color: '#bfbfbf', fontSize: 12 }} />
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  }
+                >
+                  <Button style={{ minWidth: 140 }} loading={tableLoading}>
+                    表清单{tableOptions.length > 0 ? `（${tableOptions.length}）` : ''}
+                  </Button>
+                </Popover>
               ) : null}
 
               <InputNumber
@@ -790,8 +865,8 @@ export default function QueryPage() {
             message="无法获取表列表"
             description={
               <span>
-                {tableError}。鉴权依赖准确的表名，
-                在没有表列表的情况下请谨慎手填，拼错会导致 403 且难以分辨原因。
+                {tableError}。表清单只用于展示与复制表名，不影响能否执行查询，
+                可以直接手写 SQL 继续。
               </span>
             }
             closable
@@ -922,10 +997,11 @@ export default function QueryPage() {
             />
             <Space size={4} wrap>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                <Text code>别名.</Text> 或 <Text code>表名.</Text> 自动提示字段；
-                <Text code>Ctrl+Space</Text> 手动唤出补全，
+                <Text code>别名.</Text> 或 <Text code>表名.</Text> 自动提示该表的字段
+                （仅限这句语句里 FROM / JOIN 过的表）；
                 <Text code>Ctrl+Enter</Text> 执行光标所在语句，
                 <Text code>Shift+Alt+F</Text> 格式化。
+                表名可从上方「表清单」点选复制。
               </Text>
             </Space>
           </Space>

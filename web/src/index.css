@@ -99,3 +99,24 @@ body {
 .dw-sql-hover__empty {
   color: #8c8c8c;
 }
+
+/* ---------- 查询页：表名清单（仅展示与复制） ---------- */
+
+.dw-table-pick {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.dw-table-pick:hover {
+  background: #f5f5f5;
+}
+
+.dw-table-pick .ant-typography {
+  margin-bottom: 0;
+  word-break: break-all;
+}

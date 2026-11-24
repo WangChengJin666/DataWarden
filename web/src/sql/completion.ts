@@ -1,11 +1,9 @@
 /**
  * 查询页 SQL 编辑器（CodeMirror 6）的扩展集合。
  *
- * 目标是接近 Navicat 的输入体验，核心是四件事：
- *   1. `别名.` 之后提示字段——别名从当前语句的 FROM / JOIN 里实时解析
- *   2. SELECT 列表、WHERE 等「该写列的位置」直接提示字段名
- *   3. 鼠标悬停在表名 / 别名上，显示它的字段清单
- *   4. Ctrl+Enter 执行、Ctrl+Space 手动唤出补全等常用快捷键
+ * 目标只有一件事：`别名.` 或 `表名.` 之后提示该表的字段——别名从当前语句的
+ * FROM / JOIN 里实时解析。其余位置（SELECT 开头、WHERE、FROM 之后）不再给
+ * 表名或字段候选，理由见 makeSchemaCompletion 的注释。
  *
  * 为什么不用 `@codemirror/lang-sql` 自带的 schema 补全：它只在语句语法
  * 完整时才认得出别名，而用户敲到一半（`SELECT t. FROM app_user t` 还在写）
@@ -79,45 +77,19 @@ function columnOptions(schema: SchemaMap, ref: TableRef): Completion[] {
   }))
 }
 
-/** 表候选：schema 里的全部表 + 当前语句已有的别名。 */
-function tableOptions(schema: SchemaMap, refs: TableRef[]): Completion[] {
-  const out: Completion[] = []
-  const seen = new Set<string>()
-
-  for (const ref of refs) {
-    // 有别名时，`别名.` 才是用户在写的写法，权重给高
-    if (ref.alias !== ref.table) {
-      out.push({
-        label: ref.alias,
-        type: 'variable',
-        detail: `${ref.table} 的别名`,
-        boost: 90,
-      })
-      seen.add(ref.alias)
-    }
-  }
-  for (const name of Object.keys(schema)) {
-    // PostgreSQL 下同一张表有裸名与带 schema 两份，候选里只展示裸名
-    if (name.includes('.') || seen.has(name)) continue
-    out.push({ label: name, type: 'type', detail: '表', boost: 60 })
-  }
-  return out
-}
-
-/** 光标前 40 个字符，用来判断「当前位置该不该出现字段 / 表名」。 */
-function contextTail(doc: string, pos: number): string {
-  return maskLiterals(doc.slice(Math.max(0, pos - 40), pos))
-}
-
 /**
- * schema 补全来源。
+ * schema 补全来源：**只有带点号的限定前缀才给候选**，即 `t.` / `app_user.` /
+ * `public.app_user.` → 该表的字段。
  *
- * 三种情况：
- *   - `前缀.`：前缀是别名 / 表名 / 库.表名 → 只提示该表的字段
- *   - 顶层且处于「该写表名」的位置（FROM / JOIN / INTO）→ 表名与别名
- *   - 顶层且处于「该写字段」的位置（SELECT 列表、WHERE、ON、ORDER BY…）→ 字段
- *   - 其余（前缀解析不到、位置判断不出）→ 返回 null，让给关键字补全。
- *     **宁可不提示，也不提示错表的字段**——错提示比没提示更误导人。
+ * 为什么删掉了「SELECT 之后提示字段」「FROM 之后提示表名」这两条：
+ *   - 字段候选是整库的并集（没有 FROM 时只能把库里每张表的列都列出来），
+ *     候选上千条，既选不准，也把真正想要的表名挤到看不见的地方；
+ *   - 表名候选同理，库表本来就由右侧的下拉负责展示与复制，
+ *     编辑器再重复一份只会互相打断。
+ * 只有 `前缀.` 这种「用户已经指明了是哪张表」的场景值得自动弹，
+ * 目标唯一、候选有限，这是它和上面两种情况的本质区别。
+ *
+ * 其余位置一律返回 null（连 Ctrl+Space 也不给），让给关键字补全。
  */
 export function makeSchemaCompletion(getSchema: () => SchemaMap): CompletionSource {
   return (context: CompletionContext): CompletionResult | null => {
@@ -126,70 +98,16 @@ export function makeSchemaCompletion(getSchema: () => SchemaMap): CompletionSour
     // 没有 schema 时完全让给关键字补全，不做任何臆测
     if (Object.keys(schema).length === 0) return null
 
-    const { parents, from, empty } = resolveQueryContext(doc, context.pos)
-    if (empty && !context.explicit) return null
+    const { parents, from } = resolveQueryContext(doc, context.pos)
+    if (parents.length === 0) return null
 
-    const refs = tableRefsAt(doc, context.pos)
+    const ref = resolveTableByPrefix(tableRefsAt(doc, context.pos), parents)
+    if (!ref) return null
 
-    if (parents.length > 0) {
-      const ref = resolveTableByPrefix(refs, parents)
-      if (!ref) return null
-      const options = columnOptions(schema, ref)
-      if (options.length === 0) return null
-      return { from, options, validFor: /^[\w$]*$/ }
-    }
-
-    const tail = contextTail(doc, context.pos)
-    const wantsTable = /(?:\bfrom|\bjoin|\binto)\s+\w*$/i.test(tail)
-    // 字段位置：SELECT 之后、WHERE / ON / HAVING / ORDER BY / GROUP BY /
-    // SET / 逗号之后。判断不出就只在手动唤出时给候选。
-    const wantsColumn = /(?:\bselect|\bwhere|\bon|\bhaving|\bby|\band|\bor|,)\s+\w*$/i.test(tail)
-
-    if (!context.explicit && !wantsTable && !wantsColumn) return null
-
-    const options = wantsTable
-      ? tableOptions(schema, refs)
-      : columnOptionsForQuery(schema, refs)
-
+    const options = columnOptions(schema, ref)
     if (options.length === 0) return null
     return { from, options, validFor: /^[\w$]*$/ }
   }
-}
-
-/**
- * 无前缀时的字段候选：把当前语句涉及的所有表的字段并起来。
- *
- * 为什么不是只给单表字段：`SELECT |` 时用户还没写 FROM，或者写了多表 JOIN，
- * 任何单表都不完整。并集再按表排序是唯一不误导的选择。
- * 语句里还没写 FROM 时退化成「整个库的全部字段」——用户此刻确实还没限定范围，
- * 由 SELECT 之后的输入逐步收敛。
- */
-function columnOptionsForQuery(schema: SchemaMap, refs: TableRef[]): Completion[] {
-  const options: Completion[] = []
-  const seen = new Set<string>()
-  const add = (name: string, table: string, i: number) => {
-    if (seen.has(name)) return
-    seen.add(name)
-    options.push({
-      label: name,
-      type: 'property',
-      detail: table,
-      boost: Math.max(0, 100 - i) / 100,
-    })
-  }
-
-  if (refs.length > 0) {
-    for (const ref of refs) {
-      const cols = schema[ref.table] ?? []
-      cols.slice(0, MAX_COLUMN_OPTIONS).forEach((c, i) => add(c, ref.table, i))
-    }
-  } else {
-    for (const [table, cols] of Object.entries(schema)) {
-      if (table.includes('.')) continue
-      cols.slice(0, MAX_COLUMN_OPTIONS).forEach((c, i) => add(c, table, i))
-    }
-  }
-  return options
 }
 
 /**
