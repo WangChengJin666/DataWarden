@@ -45,6 +45,61 @@ func TestQueryInDatabase_RejectsUnsafeDatabase(t *testing.T) {
 	}
 }
 
+// 按请求库建出的连接配置必须把字符集放在 charsets 里，而不是 Params。
+//
+// 回归 Error 1193 (HY000): Unknown system variable 'charset'：
+// Params 会被驱动拼成 `SET charset = utf8mb4` 在握手后下发，
+// 而 charset 不是系统变量，连接直接建不起来。
+func TestConnConfig_CharsetIsNotSentAsSystemVariable(t *testing.T) {
+	ad, err := newMySQL(ConnConfig{
+		Type: "mysql", Host: "127.0.0.1", Port: 3306,
+		User: "ro", Password: "pw",
+	})
+	if err != nil {
+		t.Fatalf("newMySQL: %v", err)
+	}
+	defer ad.Close()
+
+	cfg, err := ad.connConfig("shop")
+	if err != nil {
+		t.Fatalf("connConfig: %v", err)
+	}
+
+	if _, ok := cfg.Params["charset"]; ok {
+		t.Errorf("charset must not go into Params (it is not a system variable), got %v", cfg.Params)
+	}
+	if got := cfg.DBName; got != "shop" {
+		t.Errorf("DBName = %q, want shop", got)
+	}
+
+	// FormatDSN 会带上驱动自己的 charset 参数——这是 DSN 解析器能识别的写法，
+	// 说明 Charset 选项确实生效了（否则 set names 根本不会被下发）。
+	if dsn := cfg.FormatDSN(); !strings.Contains(dsn, "charset=utf8mb4") {
+		t.Errorf("connector config should carry charset, got DSN: %s", dsn)
+	}
+}
+
+// tls=true 必须原样带到专用连接的配置里，否则这条路径比主连接弱。
+func TestConnConfig_CarriesTLS(t *testing.T) {
+	ad, err := newMySQL(ConnConfig{
+		Type: "mysql", Host: "127.0.0.1", Port: 3306,
+		User: "ro", Password: "pw",
+		Options: map[string]string{"tls": "true"},
+	})
+	if err != nil {
+		t.Fatalf("newMySQL: %v", err)
+	}
+	defer ad.Close()
+
+	cfg, err := ad.connConfig("shop")
+	if err != nil {
+		t.Fatalf("connConfig: %v", err)
+	}
+	if cfg.TLSConfig != "true" {
+		t.Errorf("TLSConfig = %q, want true", cfg.TLSConfig)
+	}
+}
+
 // 空库名走普通 Query：让 MySQL 自己报 1046，而不是被 adapter 悄悄换库。
 func TestQueryInDatabase_EmptyFallsBackToDefault(t *testing.T) {
 	ad, err := newMySQL(ConnConfig{

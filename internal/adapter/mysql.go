@@ -158,6 +158,29 @@ func (a *mysqlAdapter) QueryInDatabase(ctx context.Context, db, sqlText string, 
 // 调用方负责 Close：连接一旦回收进池，下一个人拿到的就是「库已经被切过」
 // 的连接，这正是要避免的状态。
 func (a *mysqlAdapter) withDedicatedConn(ctx context.Context, db string) (*sql.DB, error) {
+	cfg, err := a.connConfig(db)
+	if err != nil {
+		return nil, err
+	}
+
+	connector, err := mysql.NewConnector(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build mysql connector for %q: %w", db, err)
+	}
+	db2 := sql.OpenDB(connector)
+	// 只放一条连接：这条池子只服务当前这一次查询，多放连接没有意义。
+	db2.SetMaxOpenConns(1)
+	db2.SetMaxIdleConns(1)
+	return db2, nil
+}
+
+// connConfig 按目标库构造一条连接的驱动配置。
+//
+// 单独抽出来是为了让它可测：连接参数的正确性（字符集怎么带、Params
+// 里放什么）只有连上服务器才会暴露，而这类错误在单测里完全看不到。
+// 之前把 charset 塞进 Params 就是踩在这上面——本地不连库的测试全绿，
+// 一上线就 Error 1193。
+func (a *mysqlAdapter) connConfig(db string) (*mysql.Config, error) {
 	if !isSafeIdentifier(db) {
 		return nil, fmt.Errorf("invalid database name %q", db)
 	}
@@ -171,22 +194,25 @@ func (a *mysqlAdapter) withDedicatedConn(ctx context.Context, db string) (*sql.D
 	cfg.ParseTime = true
 	cfg.Timeout = 5 * time.Second
 	cfg.ReadTimeout = 30 * time.Second
-	cfg.Params = map[string]string{"charset": "utf8mb4"}
+	// 字符集必须走 Charset 选项，不能塞进 Params。
+	//
+	// Params 会被驱动拼成 `SET <key> = <value>` 逐条下发（见
+	// go-sql-driver/mysql 的 handleParams），而 charset 根本不是系统变量，
+	// 于是连接建立直接失败：
+	//   Error 1193 (HY000): Unknown system variable 'charset'
+	// DSN 里写 charset=utf8mb4 之所以没事，是因为 DSN 解析器把它
+	// 单独收进未导出的 cfg.charsets，由驱动转成 `SET NAMES utf8mb4`。
+	// 用 Config 直接建 connector 时没有解析器插手，charsets 又是未导出字段，
+	// 只能通过 mysql.Charset 这个 Option 设置。
+	if err := mysql.Charset("utf8mb4", "")(cfg); err != nil {
+		return nil, fmt.Errorf("set mysql charset: %w", err)
+	}
 	if a.cfg.Options["tls"] == "true" {
 		// 与 newMySQL 的 DSN 保持一致：只接受 true，具体证书校验
 		// 交给驱动的默认 tls 配置（与 DSN 里 tls=true 等价）。
 		cfg.TLSConfig = "true"
 	}
-
-	connector, err := mysql.NewConnector(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("build mysql connector for %q: %w", db, err)
-	}
-	db2 := sql.OpenDB(connector)
-	// 只放一条连接：这条池子只服务当前这一次查询，多放连接没有意义。
-	db2.SetMaxOpenConns(1)
-	db2.SetMaxIdleConns(1)
-	return db2, nil
+	return cfg, nil
 }
 
 // isSafeIdentifier 只允许 MySQL 库名里合法的字符。
