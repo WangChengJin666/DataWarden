@@ -195,7 +195,13 @@ function RedisCollectionModal({
   )
 }
 
-/** 表格里的集合摘要：类型说明 + 少量预览 + 「查看全部」入口。 */
+/**
+ * 表格里的集合摘要：类型说明 + 少量预览 + 「查看」入口。
+ *
+ * 「查看」是这里唯一的入口文案——它做的事始终是打开同一个弹窗，
+ * 不随元素多少改名（早期按数量分成「查看全部 / 展开」两种叫法，
+ * 用户分不清区别，且两者行为本来就一样）。
+ */
 function RedisCollectionCell({ kv, onOpen }: { kv: RedisKeyValue; onOpen: () => void }) {
   const items = kv.items ?? []
   if (items.length === 0) {
@@ -218,7 +224,7 @@ function RedisCollectionCell({ kv, onOpen }: { kv: RedisKeyValue; onOpen: () => 
         )
       })}
       <Button type="link" size="small" style={{ padding: 0, height: 'auto' }} onClick={onOpen}>
-        {items.length > preview.length ? '查看全部' : '展开'}
+        查看
       </Button>
     </Space>
   )
@@ -805,7 +811,7 @@ export default function QueryPage() {
           },
           {
             title: '值',
-            // 不加 ellipsis：这一列里放的是「N 项 / 预览 / 查看全部」组合控件，
+            // 不加 ellipsis：这一列里放的是「N 项 / 预览 / 查看」组合控件，
             // 裁切会把按钮吃掉。元素本身已在预览里限长，不会撑爆列宽。
             width: 420,
             render: (_, r) => renderRedisValue(r, setRedisCollection),
