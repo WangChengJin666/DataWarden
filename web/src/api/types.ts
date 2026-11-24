@@ -140,12 +140,16 @@ export interface LoginResponse {
   role: Role
 }
 
-// Redis 查询结果。与 SQL 结果结构不同：Redis 是键值对，hash 类型带 fields。
+// Redis 查询结果。与 SQL 结果结构不同：Redis 是键值对，按类型分三种承载字段：
+//   string        -> value
+//   hash          -> fields
+//   list/set/zset -> items（zset 的元素形如 "member:score"）
 export interface RedisKeyValue {
   key: string
   type: string
   value?: string
   fields?: Record<string, string>
+  items?: string[]
   ttl: number
 }
 

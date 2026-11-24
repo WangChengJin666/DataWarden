@@ -3,6 +3,7 @@ package redisq
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -113,8 +114,12 @@ func (c *Client) Fetch(ctx context.Context, key string) (*KeyValue, error) {
 		if err != nil {
 			return nil, fmt.Errorf("zrange %s: %w", key, err)
 		}
+		// 元素形态固定为 "member:score"。member 本身可能含冒号，
+		// 前端应按**最后一个**冒号切分，不要按第一个切。
+		// 分数用 -1 精度格式化：用 %v 会把 12 打成 "12"、12.5 打成 "12.5" 看着还行，
+		// 但 0.1+0.2 这类浮点误差会露出长尾（0.30000000000000004）。
 		for _, z := range v {
-			kv.Items = append(kv.Items, fmt.Sprintf("%v:%v", z.Member, z.Score))
+			kv.Items = append(kv.Items, fmt.Sprintf("%v:%s", z.Member, strconv.FormatFloat(z.Score, 'f', -1, 64)))
 		}
 	default:
 		return nil, fmt.Errorf("unsupported redis type %q for key %s", typ, key)

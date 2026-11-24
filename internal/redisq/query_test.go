@@ -2,7 +2,10 @@ package redisq
 
 import (
 	"context"
+	"strings"
 	"testing"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/opensourceprj/datawarden/internal/testutil"
 )
@@ -78,6 +81,72 @@ func TestFetchExactKey_ReturnsTTL(t *testing.T) {
 	}
 	if got.TTL <= 0 || got.TTL > 3600 {
 		t.Errorf("TTL = %d, want in (0, 3600]", got.TTL)
+	}
+}
+
+func TestFetchExactKey_CollectionTypesReturnItems(t *testing.T) {
+	c := setupClient(t)
+	ctx := context.Background()
+
+	// list / set / zset 三种集合类型的值都走 Items 字段。
+	// 前端曾经只渲染 fields 与 value，导致这三类"有 key 没值"，
+	// 这里把「后端确实返回了 items」钉住，防止再退化成空。
+	listKey := testutil.TestKeyPrefix + "coll:list"
+	setKey := testutil.TestKeyPrefix + "coll:set"
+	zsetKey := testutil.TestKeyPrefix + "coll:zset"
+
+	if err := c.rdb.RPush(ctx, listKey, "a", "b").Err(); err != nil {
+		t.Fatalf("seed list: %v", err)
+	}
+	if err := c.rdb.SAdd(ctx, setKey, "x", "y").Err(); err != nil {
+		t.Fatalf("seed set: %v", err)
+	}
+	// member 故意带冒号：验证 member 与 score 的分隔不会被误切
+	if err := c.rdb.ZAdd(ctx, zsetKey,
+		redis.Z{Score: 120, Member: "app_user"},
+		redis.Z{Score: 0.1 + 0.2, Member: "ns:order_item"},
+	).Err(); err != nil {
+		t.Fatalf("seed zset: %v", err)
+	}
+
+	cases := []struct {
+		key string
+		typ string
+	}{
+		{listKey, "list"},
+		{setKey, "set"},
+		{zsetKey, "zset"},
+	}
+	for _, tc := range cases {
+		got, err := c.Fetch(ctx, tc.key)
+		if err != nil {
+			t.Fatalf("fetch %s: %v", tc.key, err)
+		}
+		if got.Type != tc.typ {
+			t.Errorf("%s: Type = %q, want %q", tc.key, got.Type, tc.typ)
+		}
+		if len(got.Items) != 2 {
+			t.Fatalf("%s: expected 2 items, got %d (%v)", tc.key, len(got.Items), got.Items)
+		}
+	}
+
+	// zset 元素形态固定为 "member:score"，前端按最后一个冒号切分。
+	// ZRANGE 按分数升序，所以 0.3 的排在前、120 的排在后。
+	z, err := c.Fetch(ctx, zsetKey)
+	if err != nil {
+		t.Fatalf("fetch zset: %v", err)
+	}
+	// 浮点误差不能长尾暴露给前端（0.1+0.2 直接 %v 会得到 0.30000000000000004）
+	if z.Items[0] != "ns:order_item:0.3" {
+		t.Errorf("zset item[0] = %q, want ns:order_item:0.3", z.Items[0])
+	}
+	if z.Items[1] != "app_user:120" {
+		t.Errorf("zset item[1] = %q, want app_user:120", z.Items[1])
+	}
+	// 按最后一个冒号切分后，member 应还原成 ns:order_item（而不是 ns）
+	last := strings.LastIndex(z.Items[0], ":")
+	if z.Items[0][:last] != "ns:order_item" {
+		t.Errorf("member should be ns:order_item, got %q", z.Items[0][:last])
 	}
 }
 

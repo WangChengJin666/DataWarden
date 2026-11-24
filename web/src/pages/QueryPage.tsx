@@ -33,11 +33,78 @@ import {
   listMyDatasources,
   listTables,
 } from '@/api/client'
-import type { DatasourceBrief, QueryResult, RedisQueryResult } from '@/api/types'
+import type { DatasourceBrief, QueryResult, RedisKeyValue, RedisQueryResult } from '@/api/types'
 import { buildSqlExtensions, type SchemaMap } from '@/sql/completion'
 import { attachContextMenu, formatSql, pickStatement, sqlMenuItems } from '@/sql/menu'
 
 const { Text, Paragraph } = Typography
+
+// Redis 值的展示形态由类型决定，三种承载字段互斥：
+//   string        -> value
+//   hash          -> fields
+//   list/set/zset -> items
+// 之前只处理了 fields / value 两支，集合类型的值一律渲染成空串，
+// 表现为「list、zset 查出来有 key 但值是空的」。
+const REDIS_COLLECTION_TYPES = new Set(['list', 'set', 'zset'])
+
+/**
+ * 拆分 zset 元素。后端固定输出 `member:score`，而 member 自身可能含冒号，
+ * 因此必须按**最后一个**冒号切分；万一没有冒号就整体当 member。
+ */
+function splitZSetItem(item: string): { member: string; score?: string } {
+  const idx = item.lastIndexOf(':')
+  if (idx <= 0) return { member: item }
+  return { member: item.slice(0, idx), score: item.slice(idx + 1) }
+}
+
+function renderRedisValue(r: RedisKeyValue) {
+  if (r.fields) {
+    return (
+      <Text style={{ fontSize: 13 }}>
+        {Object.entries(r.fields)
+          .map(([k, val]) => `${k}=${val}`)
+          .join(', ')}
+      </Text>
+    )
+  }
+  if (r.items && r.items.length > 0) {
+    // 集合元素可能很多，默认只铺前 20 个，其余折叠成计数，避免单行过长
+    const shown = r.items.slice(0, 20)
+    const rest = r.items.length - shown.length
+    return (
+      <Space size={4} wrap>
+        <Tag color="default" style={{ marginInlineEnd: 0 }}>
+          {r.items.length} 项
+        </Tag>
+        {shown.map((item, i) => {
+          if (r.type !== 'zset') {
+            return (
+              <Text key={i} code style={{ fontSize: 12 }}>
+                {item}
+              </Text>
+            )
+          }
+          const { member, score } = splitZSetItem(item)
+          return (
+            <Text key={i} code style={{ fontSize: 12 }}>
+              {member}
+              {score !== undefined ? <Text type="secondary" style={{ fontSize: 11 }}>{` (${score})`}</Text> : null}
+            </Text>
+          )
+        })}
+        {rest > 0 ? <Text type="secondary" style={{ fontSize: 12 }}>… 另有 {rest} 项</Text> : null}
+      </Space>
+    )
+  }
+  if (REDIS_COLLECTION_TYPES.has(r.type)) {
+    // 空集合：明确写出「空」，避免与「渲染失败」混淆
+    return <Text type="secondary" style={{ fontSize: 13 }}>（空集合）</Text>
+  }
+  if (r.type === 'none') {
+    return <Text type="secondary" style={{ fontSize: 13 }}>（key 不存在）</Text>
+  }
+  return <Text style={{ fontSize: 13 }}>{r.value ?? ''}</Text>
+}
 
 /** 管理角色不需要授权即可查询全部数据源（与后端 model.Role.IsPrivileged 对应）。 */
 const PRIVILEGED_ROLES = ['dba', 'superadmin']
@@ -598,16 +665,7 @@ export default function QueryPage() {
           {
             title: '值',
             ellipsis: true,
-            render: (_, r) =>
-              r.fields ? (
-                <Text style={{ fontSize: 13 }}>
-                  {Object.entries(r.fields)
-                    .map(([k, val]) => `${k}=${val}`)
-                    .join(', ')}
-                </Text>
-              ) : (
-                <Text style={{ fontSize: 13 }}>{r.value ?? ''}</Text>
-              ),
+            render: (_, r) => renderRedisValue(r),
           },
           {
             title: 'TTL',
