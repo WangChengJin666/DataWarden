@@ -364,8 +364,8 @@ export default function QueryPage() {
         await executeSQL({
           datasource_id: datasourceId,
           database: database.trim(),
-          // 没选表就不传：后端对空清单的语义是「按角色判定」，
-          // 开发者会在那里被拒（ErrNoTables），管理角色则直接放行。
+          // 没选表就不传：后端对空清单按角色分流——
+          // 管理角色补成「整库」对象后放行，开发者仍被拒（ErrNoTables）。
           // 传空数组和不传走同一条路径，这里显式省略让报文更干净。
           tables: tables.length > 0 ? tables : undefined,
           sql,
