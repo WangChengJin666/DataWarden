@@ -11,15 +11,18 @@ import (
 
 // MongoRequest 是一次受控的 MongoDB 查询请求。
 //
-// 鉴权粒度与 SQL 一致：按「数据源 + 库 + 集合」判定，
-// object 形如 ds:<id>:<db>:<collection>。
+// 鉴权粒度与 SQL 一致：按「数据源 + 库」判定，object 形如 ds:<id>:<db>:*。
+// 有整库授权就能查该库下任何集合，与 SQL 侧「选了库就能查该库所有表」对齐；
+// 只授了部分集合的用户仍拿到 ds:<id>:<db>:<coll> 形态的策略，
+// 由 keyMatch 逐条命中——细粒度授权没有丢，只是执行时不再强制逐集合声明。
 type MongoRequest struct {
 	Subject      string
 	ActorID      int64
 	ActorName    string
 	DatasourceID int64
 	Database     string
-	// Collection 是集合名，只能有一个：一次查一个集合，便于逐集合鉴权。
+	// Collection 是集合名。没有它就无法定位查询目标，因此仍然必填；
+	// 但它不参与鉴权（鉴权在库级完成）。
 	Collection string
 	Op         string
 	Args       string
@@ -35,33 +38,38 @@ func (s *Service) ExecuteMongo(ctx context.Context, req MongoRequest, ad adapter
 		s.Rules = DefaultRules()
 	}
 
-	// 1. 集合必须声明，否则无法鉴权
+	// 1. 集合必须声明，否则无法定位查询目标
+	//
+	// 注意这不再是鉴权步骤：授权粒度是「数据源 + 库」，鉴权在下面按
+	// ds:<id>:<库>:* 做。集合名缺失只是没法执行，不是权限问题。
 	if req.Collection == "" {
 		s.auditMongo(ctx, req, "mongo.denied", map[string]any{"reason": "no collection declared"})
-		return nil, ErrNoTables
+		return nil, ErrNoCollection
 	}
 
-	// 2. 鉴权：ds:<id>:<db>:<collection>
+	// 2. 库级鉴权：ds:<id>:<db>:*
 	//
-	// 集合名可能带库前缀（适配器支持 "shop.users" 形式）。鉴权对象是
-	// 用冒号拼接的三段式，必须先把库前缀拆出来，否则拼出来只有两段，
-	// keyMatch 的匹配范围就不再是「某库下的某表」。
-	// service 层自己做这一步，不依赖 handler 先处理好——
+	// 集合名可能带库前缀（适配器支持 "shop.users" 形式），所以先拆出
+	// 真正的库名。service 层自己做这一步，不依赖 handler 先处理好——
 	// 有多条调用路径时，校验放在最靠近数据的地方才不会被绕过。
-	authzDB, authzColl, err := SplitDBCollection(req.Collection, req.Database)
+	authzDB, _, err := SplitDBCollection(req.Collection, req.Database)
 	if err != nil {
 		s.auditMongo(ctx, req, "mongo.denied", map[string]any{
 			"reason":     "invalid collection",
 			"collection": req.Collection,
 			"error":      err.Error(),
 		})
-		return nil, ErrNoTables
+		return nil, ErrNoDatabase
 	}
-	obj := fmt.Sprintf("ds:%d:%s:%s", req.DatasourceID, authzDB, authzColl)
+	if authzDB == "" {
+		s.auditMongo(ctx, req, "mongo.denied", map[string]any{"reason": "no database declared"})
+		return nil, ErrNoDatabase
+	}
+	obj := fmt.Sprintf("ds:%d:%s:*", req.DatasourceID, authzDB)
 	if !s.Enforcer.Enforce(req.Subject, obj, "read") {
 		s.auditMongo(ctx, req, "mongo.denied", map[string]any{
 			"reason":     "no grant",
-			"collection": authzColl,
+			"collection": req.Collection,
 			"db":         authzDB,
 		})
 		return nil, ErrForbidden

@@ -207,7 +207,7 @@ export async function listColumns(
 export async function executeSQL(payload: {
   datasource_id: number
   database: string
-  /** 选填：dba / superadmin 不需要逐表鉴权，可以不传 */
+  /** 选填，仅写入审计明细便于追溯；鉴权按库判定，不参与放行 */
   tables?: string[]
   sql: string
   row_limit?: number

@@ -3,7 +3,6 @@ package httpapi
 import (
 	"context"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -61,15 +60,14 @@ func buildSQLRouter(t *testing.T, role string, enf querysvc.Enforcer) *gin.Engin
 	})
 }
 
-// 管理角色不选表直接查询必须放行。
+// 任何角色（含开发者）只选库、不选表都能查询。
 //
-// 前端表下拉写的是「选填，管理角色可不填」。若后端拿着空清单去做逐表鉴权，
-// querysvc 会返回 ErrNoTables，用户看到的就是 400
-// "tables field is required for authorization"——与界面上的「可不填」正面冲突。
+// 这是当前产品口径的直接体现：授权粒度是「数据源 + 库」，
+// 库下所有表都可查，用户不该为了执行一条 SQL 先去勾表。
 //
-// 期望的鉴权对象是 ds:<id>:<库>:*，与「选了整库全部表」等价。
-func TestExecuteSQL_PrivilegedRoleWithEmptyTablesPassesAuthz(t *testing.T) {
-	for _, role := range []string{"dba", "superadmin"} {
+// 期望的鉴权对象恒为 ds:<id>:<库>:*，一次就够。
+func TestExecuteSQL_NoTablesRequired(t *testing.T) {
+	for _, role := range []string{"developer", "dba", "superadmin"} {
 		t.Run(role, func(t *testing.T) {
 			enf := &countingEnforcer{allowed: true}
 			engine := buildSQLRouter(t, role, enf)
@@ -78,7 +76,7 @@ func TestExecuteSQL_PrivilegedRoleWithEmptyTablesPassesAuthz(t *testing.T) {
 			w := postJSON(t, engine, tok, "/api/v1/query/sql", map[string]any{
 				"datasource_id": 3,
 				"database":      "shop",
-				"sql":           "SELECT 1",
+				"sql":           "SELECT * FROM orders",
 			})
 
 			if len(enf.objects) != 1 {
@@ -87,43 +85,36 @@ func TestExecuteSQL_PrivilegedRoleWithEmptyTablesPassesAuthz(t *testing.T) {
 			if want := "ds:3:shop:*"; enf.objects[0] != want {
 				t.Errorf("auth object = %q, want %q", enf.objects[0], want)
 			}
-			// 鉴权通过后会走到执行并失败（500）。只要不是 400，
-			// 就说明没有在「缺表」这一步被拦下。
+			// 鉴权通过后会走到执行并失败（500，替身必然报错）。
+			// 只要不是 400，就说明没有在「没选表」这一步被拦下。
 			if w.Code == http.StatusBadRequest {
-				t.Errorf("privileged empty-tables query must not be a bad request: %s", w.Body.String())
+				t.Errorf("query without tables must not be rejected as bad request: %s", w.Body.String())
 			}
 		})
 	}
 }
 
-// 开发者不选表仍然 400，且提示缺表：上面那条放宽不能顺带放开开发者。
-func TestExecuteSQL_DeveloperWithEmptyTablesStillRejected(t *testing.T) {
+// 缺库仍然 400：库名是鉴权对象的一部分，没有它无法判定。
+func TestExecuteSQL_MissingDatabaseRejected(t *testing.T) {
 	enf := &countingEnforcer{allowed: true}
 	engine := buildSQLRouter(t, "developer", enf)
 	tok := loginAndGetToken(t, engine, "alice", "pw")
 
 	w := postJSON(t, engine, tok, "/api/v1/query/sql", map[string]any{
 		"datasource_id": 3,
-		"database":      "shop",
 		"sql":           "SELECT 1",
 	})
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400, body = %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "请先选择") {
-		t.Errorf("body = %s, want it to mention missing tables", w.Body.String())
-	}
 	if len(enf.objects) != 0 {
-		t.Errorf("developer with empty tables must not reach authz, got %v", enf.objects)
+		t.Errorf("missing database must not reach authz, got %v", enf.objects)
 	}
 }
 
-// 开发者显式选表时，鉴权对象必须按表逐个拼接，不能被折叠成整库通配。
-//
-// 逐表鉴权遇第一个无权限的表就整体返回 ErrForbidden（不暴露是哪张表），
-// 所以这里只能断言第一次鉴权的对象是具体表名而非 shop:*。
-func TestExecuteSQL_DeveloperTablesNotFolded(t *testing.T) {
+// 无库授权时 403。表清单里写了什么都不影响——鉴权只看库。
+func TestExecuteSQL_NoDatabaseGrantIsForbidden(t *testing.T) {
 	enf := &countingEnforcer{allowed: false}
 	engine := buildSQLRouter(t, "developer", enf)
 	tok := loginAndGetToken(t, engine, "alice", "pw")
@@ -131,18 +122,15 @@ func TestExecuteSQL_DeveloperTablesNotFolded(t *testing.T) {
 	w := postJSON(t, engine, tok, "/api/v1/query/sql", map[string]any{
 		"datasource_id": 3,
 		"database":      "shop",
-		"tables":        []string{"orders", "users"},
-		"sql":           "SELECT 1",
+		// 即便声明了一张「应该有权限」的表，也不能凭它放行
+		"tables": []string{"orders"},
+		"sql":    "SELECT 1",
 	})
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403, body = %s", w.Code, w.Body.String())
 	}
-	if len(enf.objects) == 0 {
-		t.Fatal("expected at least one authz check")
-	}
-	if want := "ds:3:shop:orders"; enf.objects[0] != want {
-		t.Errorf("first auth object = %q, want %q (tables must not be folded into shop:*)",
-			enf.objects[0], want)
+	if len(enf.objects) != 1 || enf.objects[0] != "ds:3:shop:*" {
+		t.Errorf("auth objects = %v, want a single database-level check", enf.objects)
 	}
 }

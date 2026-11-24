@@ -49,26 +49,33 @@ func (h *QueryHandler) ExecuteMongo(c *gin.Context) {
 	// 先鉴权，再取连接。
 	// 反过来的话，任何未授权用户都能触发一次目标库连接：
 	// 既浪费连接资源，也让人可以借报错信息探测目标库是否存在。
+	//
+	// 鉴权粒度是「数据源 + 库」：ds:<id>:<库>:*。集合名不参与判定——
+	// 有整库授权就能查该库下任何集合，与 SQL 侧一致。
+	//
+	// querysvc.ExecuteMongo 里也会做同一次库级判定。这里是**有意重复**的：
+	// handler 必须先挡掉未授权请求，才不会替它去连目标库。两处用的是同一个
+	// object 形态，不存在「谁先放开谁后收紧」的漂移风险；
+	// 历史上重复出问题是因为当时一边按集合、一边按整库，形态不一致。
 	uid, username, _ := currentUser(c)
 	subject := SubjectOf(uid)
 
-	// 集合名可能带库前缀（db.shop.users 形式解析出 "shop.users"）。
-	// 鉴权必须用拆分后的 (库, 集合)，否则 ds:<id>:<库>:<集合> 会少一段，
-	// keyMatch 的匹配范围不对。执行层仍然用原始 collection——
+	// 集合名可能带库前缀（db.shop.users 解析出 "shop.users"），
+	// 鉴权的库名要取拆分后的那一半，执行层仍用原始 collection——
 	// 适配器会自己处理前缀，拆了反而改变实际查询的库。
-	//
-	// 这里与 querysvc.ExecuteMongo 内部那道校验走同一个函数，
-	// 不再维护两份实现（两份实现就等于两条会各自漂移的规则）。
-	authzDB, authzColl, err := querysvc.SplitDBCollection(collection, req.Database)
+	authzDB, _, err := querysvc.SplitDBCollection(collection, req.Database)
 	if err != nil {
 		// 拆分失败说明集合名异常（如 "shop." 结尾）。按参数错误返回，
 		// 而不是退化成原值——退化成原值会让鉴权与执行用两套库名。
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid collection: " + err.Error()})
 		return
 	}
-	obj := fmt.Sprintf("ds:%d:%s:%s", req.DatasourceID, authzDB, authzColl)
-	if !h.Service.Enforcer.Enforce(subject, obj, "read") {
-		c.JSON(http.StatusForbidden, gin.H{"error": "no permission on this collection"})
+	if authzDB == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请先选择数据库（database 字段必填）"})
+		return
+	}
+	if !h.Service.Enforcer.Enforce(subject, fmt.Sprintf("ds:%d:%s:*", req.DatasourceID, authzDB), "read") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "no permission on this database"})
 		return
 	}
 
@@ -95,9 +102,14 @@ func (h *QueryHandler) ExecuteMongo(c *gin.Context) {
 	if err != nil {
 		switch {
 		case errors.Is(err, querysvc.ErrForbidden):
-			c.JSON(http.StatusForbidden, gin.H{"error": "no permission on this collection"})
-		case errors.Is(err, querysvc.ErrNoTables):
-			c.JSON(http.StatusBadRequest, gin.H{"error": "collection field is required for authorization"})
+			// 鉴权在库级完成，拒绝时说明也是库级
+			c.JSON(http.StatusForbidden, gin.H{"error": "no permission on this database"})
+		case errors.Is(err, querysvc.ErrNoDatabase):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请先选择数据库（database 字段必填）"})
+		case errors.Is(err, querysvc.ErrNoCollection):
+			// 集合名不再是鉴权输入，而是执行目标：缺了就没法查，
+			// 这与 SQL 里缺 SELECT 语句是同一类问题，不是权限问题。
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请指定集合名或命令（如 db.users.find({})）"})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}

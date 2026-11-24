@@ -96,9 +96,12 @@ func TestExecuteSQL_DeniedWhenNoGrant(t *testing.T) {
 	}
 }
 
-func TestExecuteSQL_DeniedWhenAnyTableMissing(t *testing.T) {
-	// 只有 orders 有权限，users 没有 → 整条拒绝
-	enforcer := &tableScopedEnforcer{allowed: map[string]bool{"ds:7:shop:orders": true}}
+// 有库级授权时，任何表都可以查——不需要事先声明表清单。
+//
+// 这是「只选数据源和库、不选表」的产品需求的回归测试：
+// 鉴权对象必须是 ds:<id>:<库>:*，且一次就够。
+func TestExecuteSQL_LibraryGrantAllowsAnyTable(t *testing.T) {
+	enforcer := &tableScopedEnforcer{allowed: map[string]bool{"ds:7:shop:*": true}}
 	svc := &Service{Enforcer: enforcer, Auditor: &recordingAuditor{}}
 	stub := &stubAdapter{result: &adapter.QueryResult{}}
 
@@ -106,30 +109,76 @@ func TestExecuteSQL_DeniedWhenAnyTableMissing(t *testing.T) {
 		Subject:      "u:1",
 		DatasourceID: 7,
 		Database:     "shop",
-		Tables:       []string{"orders", "users"},
+		Tables:       nil, // 没选表
 		SQL:          "SELECT * FROM orders JOIN users ON 1=1",
 	}, stub)
 
+	if err != nil {
+		t.Fatalf("库级授权下应当允许查询任意表，实际错误: %v", err)
+	}
+	if !stub.called {
+		t.Error("adapter should be called when database grant exists")
+	}
+	if len(enforcer.checked) != 1 || enforcer.checked[0] != "ds:7:shop:*" {
+		t.Errorf("鉴权对象 = %v，期望只做一次库级判定 ds:7:shop:*", enforcer.checked)
+	}
+}
+
+// 没有该库的授权必须拒绝，且不能因为「表清单为空」就把请求放过去。
+func TestExecuteSQL_DeniedWhenNoDatabaseGrant(t *testing.T) {
+	enforcer := &tableScopedEnforcer{allowed: map[string]bool{"ds:7:other:*": true}}
+	svc := &Service{Enforcer: enforcer, Auditor: &recordingAuditor{}}
+	stub := &stubAdapter{result: &adapter.QueryResult{}}
+
+	_, err := svc.ExecuteSQL(context.Background(), SQLRequest{
+		Subject:      "u:1",
+		DatasourceID: 7,
+		Database:     "shop",
+		SQL:          "SELECT * FROM orders",
+	}, stub)
+
 	if !errors.Is(err, ErrForbidden) {
-		t.Fatalf("expected ErrForbidden when any table lacks grant, got %v", err)
+		t.Fatalf("expected ErrForbidden, got %v", err)
 	}
 	if stub.called {
 		t.Error("adapter must not be called when authorization fails")
 	}
 }
 
-func TestExecuteSQL_EmptyTablesRejected(t *testing.T) {
-	svc := &Service{Enforcer: &recordingEnforcer{allowed: true}, Auditor: &recordingAuditor{}}
+// 表清单不参与鉴权：只授了 orders 的用户查 users 也放行（口径是库）。
+//
+// 这条测试是把「曾经的逐表语义」明确钉死成「现在是库级」，
+// 避免以后有人看到请求里有 tables 就想当然地按表判定。
+func TestExecuteSQL_TablesDoNotAffectAuthz(t *testing.T) {
+	enforcer := &tableScopedEnforcer{allowed: map[string]bool{"ds:7:shop:*": true}}
+	svc := &Service{Enforcer: enforcer, Auditor: &recordingAuditor{}}
+
 	_, err := svc.ExecuteSQL(context.Background(), SQLRequest{
 		Subject:      "u:1",
 		DatasourceID: 7,
 		Database:     "shop",
-		Tables:       nil,
+		Tables:       []string{"orders"},
+		SQL:          "SELECT * FROM users",
+	}, &stubAdapter{result: &adapter.QueryResult{}})
+
+	if err != nil {
+		t.Fatalf("鉴权只按库判定，表清单不应影响结果: %v", err)
+	}
+}
+
+// 缺库是错误（fail-closed），因为空库名会拼出 ds:<id>::*，
+// 与「鉴权对象」和「实际执行位置」脱节。
+func TestExecuteSQL_EmptyDatabaseRejected(t *testing.T) {
+	svc := &Service{Enforcer: &recordingEnforcer{allowed: true}, Auditor: &recordingAuditor{}}
+	_, err := svc.ExecuteSQL(context.Background(), SQLRequest{
+		Subject:      "u:1",
+		DatasourceID: 7,
+		Database:     "  ",
 		SQL:          "SELECT * FROM orders",
 	}, &stubAdapter{result: &adapter.QueryResult{}})
 
-	if !errors.Is(err, ErrNoTables) {
-		t.Fatalf("expected ErrNoTables, got %v", err)
+	if !errors.Is(err, ErrNoDatabase) {
+		t.Fatalf("expected ErrNoDatabase, got %v", err)
 	}
 }
 
@@ -257,7 +306,7 @@ func TestExecuteSQL_SuccessPathMasksAndAudits(t *testing.T) {
 	if auditor.events[0].Action != "query.execute" {
 		t.Errorf("audit action = %q", auditor.events[0].Action)
 	}
-	if enforcer.lastObj != "ds:7:shop:orders" {
+	if enforcer.lastObj != "ds:7:shop:*" {
 		t.Errorf("enforce object = %q", enforcer.lastObj)
 	}
 }

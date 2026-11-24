@@ -106,7 +106,10 @@ docs/superpowers/         # plans / specs，内部设计资料
   开发者用 `GET /grants/mine` 拿自己可查的数据源。
 - **数据源密码以明文存 `datasource` 表**，没有应用层加密（`DATAWARDEN_MASTER_KEY` 已废弃）。
   平台元数据库权限与备份加密必须按此约束设计。
-- **SQL 查询请求的 `tables` 是必填的**，平台据此逐表鉴权；缺表时 `querysvc` 返回 `ErrNoTables`，这是唯一校验点。
+- **查询鉴权粒度是「数据源 + 库」**：Casbin object 形如 `ds:<id>:<库>:*`，对该库有 read 权限即可查库下所有表。
+  SQL 请求的 `tables` 是**选填**，只进审计明细，**不参与鉴权**——SQL 实际访问哪些表由数据库决定，
+  按请求体里的表名鉴权等于允许用户少报一张表绕过。缺库返回 `ErrNoDatabase`（fail-closed），缺表不是错误。
+  Mongo 同理：`ds:<id>:<库>:*`，集合名只用于定位查询目标。
 - **Redis 前缀授权向下覆盖**：对目标 key 逐级向上生成候选，任一命中即放行；`redisq/safety_test.go`
   通过解析源码强制"不使用 `KEYS`"，有人写了会直接测试失败。
 - **MongoDB 用白名单而非黑名单**校验命令，`$out`/`$merge` 在解析阶段拒绝。

@@ -9,7 +9,11 @@ import (
 	"github.com/opensourceprj/datawarden/internal/auth"
 )
 
-// 命令行形式：鉴权 object 必须按集合判定
+// 命令行形式：鉴权 object 按「库」判定，与 SQL 侧口径一致。
+//
+// 集合名只用于定位查询目标，不参与鉴权——有整库授权就能查该库下任何集合。
+// 命令行里的库前缀（db.users）必须被拆出来当作鉴权的库名，
+// 否则拼出的对象是 ds:7::*，与执行目标脱节。
 func TestMongoQuery_CommandFormAuthz(t *testing.T) {
 	enforcer := &recordingEnforcer{allowed: true}
 
@@ -28,11 +32,12 @@ func TestMongoQuery_CommandFormAuthz(t *testing.T) {
 	tok := loginAndGetToken(t, r, "alice", "pw")
 	postJSON(t, r, tok, "/api/v1/query/mongo", map[string]any{
 		"datasource_id": 7,
+		"database":      "shop",
 		"command":       `db.users.find({"status":"active"})`,
 	})
 
-	// 这里只关心鉴权对象是否按「集合」拼接，不关心后续执行是否成功
-	want := "ds:7::users"
+	// 这里只关心鉴权对象是否按「库」拼接，不关心后续执行是否成功
+	want := "ds:7:shop:*"
 	if enforcer.lastObj != want {
 		t.Errorf("auth object = %q, want %q", enforcer.lastObj, want)
 	}
@@ -57,7 +62,9 @@ func TestMongoQuery_Forbidden(t *testing.T) {
 	tok := loginAndGetToken(t, r, "alice", "pw")
 	w := postJSON(t, r, tok, "/api/v1/query/mongo", map[string]any{
 		"datasource_id": 7,
-		"collection":    "users",
+		// 库级鉴权必须有库名，否则会先被「请先选择数据库」拦下
+		"database":   "shop",
+		"collection": "users",
 	})
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403; body = %s", w.Code, w.Body.String())

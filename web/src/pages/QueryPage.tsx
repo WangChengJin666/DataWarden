@@ -56,9 +56,12 @@ export default function QueryPage() {
 
   // 库名在 SQL 下是库/模式名，在 Mongo 下是库名，在 Redis 下是 db 号
   const [database, setDatabase] = useState('')
-  // 涉及的表：改成多选。之前是手填逗号分隔的字符串，
-  // 而鉴权就是按这份清单逐表判定的——拼错一个字母 = 403，
-  // 用户分不清是「打错了」还是「真没权限」。
+  // 选中用于补全的表（可多选，选填）。
+  //
+  // 这里容易误解，写清楚：授权粒度是「数据源 + 库」，这份表清单
+  // **不参与鉴权**，留空也能执行任意表的查询。它唯一的作用是让编辑器
+  // 知道去拉哪些表的字段名，从而提示 `表名.` 之后的列。
+  // 曾经它是逐表鉴权的输入（拼错一个字母就是 403），现已不是。
   const [tables, setTables] = useState<string[]>([])
 
   const [sql, setSql] = useState('')
@@ -300,14 +303,8 @@ export default function QueryPage() {
         message.warning('请选择库')
         return
       }
-      // 表清单是「逐表鉴权」的输入：开发者必须填，否则后端无从判断
-      // 他能不能读这些表。dba / superadmin 走内置策略 ds:*:*:*，
-      // 不填也能查，所以这里不再拦截——之前强制必填，
-      // 等于让管理员为了查一张随手写的表先去下拉里找它。
-      if (tables.length === 0 && !noGrantNeeded) {
-        message.warning('请选择查询涉及的表，平台需要逐表鉴权')
-        return
-      }
+      // 不再要求选表：授权粒度是「数据源 + 库」，有该库的权限就能查库里
+      // 任何表。表下拉只是可选的补全辅助，留空合法。
       if (!sql.trim()) {
         message.warning('请输入 SQL')
         return
@@ -500,7 +497,7 @@ export default function QueryPage() {
               <span>
                 {noGrantNeeded
                   ? '管理角色免授权，任意集合都可查询。'
-                  : '集合名用于逐集合鉴权，无权限的集合会被拒绝。'}
+                  : '授权范围按库判定：有该库的权限即可查询库下任意集合。'}
                 只允许查询操作，
                 写操作与会写库的聚合阶段（$out、$merge）一律拦截。结果中的手机号、身份证、邮箱等字段会自动脱敏。
               </span>
@@ -515,8 +512,8 @@ export default function QueryPage() {
               <span>
                 只能执行只读语句（SELECT / SHOW / DESC / EXPLAIN）。
                 {noGrantNeeded
-                  ? '管理角色免授权，「涉及的表」可留空，不会做逐表校验。'
-                  : '必须选择查询涉及的表，平台会逐表校验权限，任一表无权限则整条查询被拒绝。'}
+                  ? '管理角色免授权，任意数据源、任意库表都可查询。'
+                  : '授权范围按库判定：选好数据源和库，该库下所有表都可以查，不需要逐表申明。'}
                 结果中的手机号、身份证、邮箱等字段会自动脱敏。
               </span>
             )
@@ -594,11 +591,11 @@ export default function QueryPage() {
                 <Select
                   mode="multiple"
                   style={{ minWidth: 280, maxWidth: 420 }}
-                  placeholder={
-                    noGrantNeeded
-                      ? '涉及的表（选填，管理角色可不填）'
-                      : '选择涉及的表（用于逐表鉴权）'
-                  }
+                  // 作用已从「鉴权输入」变成「补全辅助」：
+                  // 授权粒度是库，选不选表都不影响能不能执行，
+                  // 选中只是让编辑器能提示字段名。文案必须说清这一点，
+                  // 否则用户会以为漏选了表会被拒。
+                  placeholder="补全用：选择表以提示字段（选填）"
                   value={tables}
                   onChange={setTables}
                   // onDropdownVisibleChange 在 antd v5 已废弃（会告警且行为不确定），
@@ -692,7 +689,7 @@ export default function QueryPage() {
                         style={{ fontFamily: 'Menlo, Consolas, monospace', fontSize: 13 }}
                       />
                       <Text type="secondary" style={{ fontSize: 12 }}>
-                        集合名用于逐集合鉴权，必须填写准确。查询固定为 find（只读）。
+                        集合名用于定位查询目标，必须填写准确。权限按库校验，库下所有集合都可查。查询固定为 find（只读）。
                       </Text>
                     </Space>
                   ),
@@ -781,7 +778,7 @@ export default function QueryPage() {
                 输入表名或 <Text code>表名.</Text> 会弹出字段补全；
               </Text>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                字段候选来自上面「涉及的表」，先选表才有补全。
+                字段候选来自上面选中的表，不选也不影响执行。
               </Text>
             </Space>
           </Space>
