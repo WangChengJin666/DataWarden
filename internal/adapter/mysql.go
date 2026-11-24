@@ -151,7 +151,7 @@ func (a *mysqlAdapter) QueryInDatabase(ctx context.Context, db, sqlText string, 
 	if db == "" {
 		return a.Query(ctx, sqlText, rowLimit)
 	}
-	stmt := EnsureRowLimit(sqlText, rowLimit+1)
+	stmt := mysqlQueryWithLimit(sqlText, rowLimit+1)
 
 	db2, err := a.withDedicatedConn(ctx, db)
 	if err != nil {
@@ -256,7 +256,7 @@ func (a *mysqlAdapter) query(ctx context.Context, sqlText string, args []any, ro
 	// 带参数的语句由调用方保证已经是完整 SQL（含 LIMIT），不再包裹：
 	// 包成 SELECT * FROM (...) 后驱动无法把占位符正确绑定到外层。
 	if len(args) == 0 {
-		stmt = EnsureRowLimit(sqlText, rowLimit+1)
+		stmt = mysqlQueryWithLimit(sqlText, rowLimit+1)
 	}
 
 	rows, err := a.db.QueryContext(ctx, stmt, args...)
@@ -278,6 +278,9 @@ func scanRows(rows *sql.Rows, rowLimit int, start time.Time) (*QueryResult, erro
 	if err != nil {
 		return nil, fmt.Errorf("columns: %w", err)
 	}
+	// 联表 SELECT * 会有同名列（两边的 id / created_at），
+	// 前端按列名建表格，重名会让其中一列渲染不出来，与 PgSQL 同样处理。
+	cols = dedupeColumnNames(cols)
 
 	// 零行时 Rows 也必须是空数组而不是 nil：nil 切片在 JSON 里是 null，
 	// 前端对 null 调 .map 会直接白屏。空结果是最普通的正常情况。

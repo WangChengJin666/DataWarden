@@ -231,7 +231,7 @@ func isIdentChar(b byte) bool {
 	return b == '_' || (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
 
-// EnsureRowLimit 给语句加上行数上限，返回可直接执行的 SQL。
+// EnsureRowLimit 给语句加上行数上限，返回可直接执行的语句。
 //
 // 不能一律包成 SELECT * FROM (...) —— SHOW / DESC / EXPLAIN 不是 SELECT，
 // 嵌进子查询后语法直接报错：
@@ -268,7 +268,38 @@ func EnsureRowLimit(sql string, limit int) string {
 	if hasTopLevelLimit(trimmed) {
 		return trimmed
 	}
+	// 注意：外层包裹对**列名重复**的联表查询是不可执行的——
+	//   SELECT * FROM (SELECT * FROM a JOIN b) AS x
+	// MySQL 要求派生表的列名唯一，同名列（a.id / b.id 这种）会直接报
+	//   Error 1060 (42S21): Duplicate column name 'x'
+	// 因此 MySQL 那条执行路径不再用它，见 mysqlQueryWithLimit。
 	return fmt.Sprintf("SELECT * FROM (%s) AS _dw_limit_wrap LIMIT %d", trimmed, limit)
+}
+
+// mysqlQueryWithLimit 在语句末尾追加 LIMIT，用于 MySQL 的查询执行。
+//
+// 为什么不复用 EnsureRowLimit 的包裹写法：MySQL 的派生表要求列名唯一，
+// `SELECT * FROM a JOIN b` 里两张表都有 id 时，包一层就变成 1060 错误——
+// 而这是最普通不过的写法（`SELECT * FROM 主表 JOIN 明细表`）。
+// 直接在末尾追加 LIMIT 不改动语句结构，因此不受列名影响。
+//
+// 已知取舍：末尾追加对 `... UNION SELECT ...` 这类复合语句会作用在
+// 最后一个分支上，实际返回可能超出上限。这类语句很少出现在平台里，
+// 而「联表查询直接报错」是立刻能碰到的故障，取前者。
+func mysqlQueryWithLimit(sqlText string, limit int) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(sqlText), "; \t\r\n")
+
+	// 语义类语句加不了 LIMIT，靠 adapter 的行数计数兜底
+	upper := strings.ToUpper(trimmed)
+	for _, kw := range []string{"SHOW", "DESC", "DESCRIBE", "EXPLAIN"} {
+		if strings.HasPrefix(upper, kw) {
+			return trimmed
+		}
+	}
+	if hasTopLevelLimit(trimmed) {
+		return trimmed
+	}
+	return fmt.Sprintf("%s LIMIT %d", trimmed, limit)
 }
 
 // hasTopLevelLimit 判断语句顶层是否已经带了 LIMIT 子句。
