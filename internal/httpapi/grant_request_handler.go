@@ -50,7 +50,12 @@ func (h *GrantRequestHandler) ListApplyable(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
-// Create 提交申请。会校验申请范围是否在管理员配置的白名单内。
+// Create 提交申请。数据源开放申请即可申请其下任意库。
+//
+// 不再比对「允许申请的库表范围」：数据源登记时不填范围就是全部可申请，
+// 有该数据源的权限即可访问其下的库和表。范围白名单本身也拦不住越权——
+// 真正的判定在 querysvc，粒度是库（ds:<id>:<库>:*），表名由请求体自述、
+// 不参与鉴权（见 querysvc.ExecuteSQL 的说明）。
 func (h *GrantRequestHandler) Create(c *gin.Context) {
 	var req createGrantRequestReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -88,14 +93,7 @@ func (h *GrantRequestHandler) Create(c *gin.Context) {
 	scope := authz.NormalizeScope(req.Scope)
 	if scope == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "申请范围格式不合法：应为「库名」或「库名:表1,表2」",
-		})
-		return
-	}
-
-	if !scopeAllowed(ds.ApplyScopes, scope) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "requested scope is not in the allowed list of this datasource",
+			"error": "申请范围格式不合法：应为库名，不能为空或含通配符",
 		})
 		return
 	}
@@ -255,44 +253,13 @@ func (h *GrantRequestHandler) Cancel(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "canceled"})
 }
 
-// scopeAllowed 判断申请的 scope 是否命中管理员配置的任一范围。
-// scope 格式 "库" 或 "库:tbl1,tbl2"；"库:*" 与 "库" 等价（整库）。
-//
-// 比较前先规范化：管理员配置里整库是 tables 为空，
-// 而申请侧整库可能写成 "shop" 或 "shop:*" 两种形态，必须归一后再比，
-// 否则会出现「管理员开放了整库，用户申请整库却被拒」。
-func scopeAllowed(allowed []model.ApplyScope, scope string) bool {
-	db, tables := splitScope(authz.NormalizeScope(scope))
-
-	for _, a := range allowed {
-		if a.Database != db {
-			continue
-		}
-		// 该库配置了"全部表"，任何表都允许
-		if len(a.Tables) == 0 {
-			return true
-		}
-		// 申请的是整库但配置只开放了部分表 → 拒绝
-		if len(tables) == 0 {
-			continue
-		}
-		for _, t := range tables {
-			if !containsStr(a.Tables, t) {
-				return false
-			}
-		}
-		return true
-	}
-	return false
-}
-
 // splitScope 把 "库" / "库:*" / "库:t1,t2" 拆成库名与表清单。
 //
 // "*" 必须归一成「无非表清单」：
 // 整库授权在内部统一表示成 tables 为空（与 model.ApplyScope.Tables 的语义一致）。
 // 若把 "*" 当成一个表名放进 tables，后续：
 //   - tablesFor 会把它追加进表下拉，界面上多出一项叫 "*"
-//   - scopeAllowed 会去找一张名为 "*" 的表，整库配置永远匹配不上
+//   - 元数据接口会去找一张名为 "*" 的表，整库配置永远匹配不上
 func splitScope(scope string) (db string, tables []string) {
 	parts := strings.SplitN(scope, ":", 2)
 	db = strings.TrimSpace(parts[0])

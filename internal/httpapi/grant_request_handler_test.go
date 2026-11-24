@@ -137,6 +137,46 @@ func TestCreateGrantRequest_KeepsTableLevelScope(t *testing.T) {
 	}
 }
 
+// 数据源没配任何「允许申请的库表范围」时，申请也必须能提交成功。
+//
+// 这是产品口径：新增数据源时不需要填写范围，有该数据源的权限即可
+// 申请其下任意库。之前的实现会在 apply_scopes 为空时一律拒绝，
+// 结果是「数据源已开放申请，但没人能提交申请」——正是这个 bug 的现场。
+func TestCreateGrantRequest_NoScopeConfigAllowsAnyDatabase(t *testing.T) {
+	cases := []struct{ name, reqScope, wantScope string }{
+		{"裸库名", "shop", "shop:*"},
+		{"整库写法", "shop:*", "shop:*"},
+		{"任意库", "pay", "pay:*"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store := &captureRequests{}
+			h := &GrantRequestHandler{
+				Requests: store,
+				Datasrc: &applyableStub{items: []model.Datasource{{
+					ID: 1, Name: "shop", Type: model.TypePostgreSQL,
+					ApplyEnabled: true, MaxApplyDays: 7,
+					// 不配范围 = 全部可申请
+				}}},
+			}
+			body, _ := json.Marshal(map[string]any{
+				"datasource_id": 1, "scope": c.reqScope, "days": 3, "reason": "排查线上问题",
+			})
+			w := doCreate(t, h, body)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("scope=%q 应当被接受，status=%d body=%s",
+					c.reqScope, w.Code, w.Body.String())
+			}
+			if len(store.got) != 1 {
+				t.Fatalf("应当创建 1 条申请，实际 %d 条", len(store.got))
+			}
+			if got := store.got[0].Scope; got != c.wantScope {
+				t.Errorf("落库 scope = %q，want %q", got, c.wantScope)
+			}
+		})
+	}
+}
+
 // applyableStub 提供 ListApplyable / Get。
 type applyableStub struct{ items []model.Datasource }
 

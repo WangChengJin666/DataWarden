@@ -4,6 +4,7 @@ export type Role = 'developer' | 'dba' | 'superadmin'
 
 export type DatasourceType = 'mysql' | 'postgresql' | 'redis' | 'mongodb'
 
+/** 已废弃：数据源不再配置可申请范围，仅兼容后端返回的旧字段。 */
 export interface ApplyScope {
   database: string
   /** 为空表示该库下全部表 */

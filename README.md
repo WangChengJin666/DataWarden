@@ -278,13 +278,19 @@ MongoDB 不支持 SQL，查询接口是 `POST /api/v1/query/mongo`，支持两�
 
 **类型采用白名单而不是黑名单。** MongoDB 的命令会随版本增加，黑名单漏掉一个就是一次写权限泄漏。
 
-### 申请的三道校验
+### 申请的两道校验
 
 提交申请时后端会依次校验，任何一条不满足都拒绝：
 
 1. 数据源已开启 `apply_enabled`
 2. 申请天数在 `1 ~ max_apply_days` 之间
-3. 申请的库表范围命中 `apply_scopes` 白名单
+
+**不校验库表范围**：新增数据源时不需要填写「允许申请的库表范围」，开放申请即可申请
+该数据源下的任意库——只要有该数据源的权限，库和表都能访问。授权粒度本来就是库
+（`ds:<id>:<库>:*`），逐库逐表的白名单既没人维护，也给不出比库级鉴权更强的保证。
+
+`datasource.apply_scopes` 列已废弃（保留历史值，读取侧忽略），申请单落库的 scope
+统一为 `<库>:*`。
 
 **审批人不能审批自己的申请**，前后端都有拦截。单人 DBA 团队需要另一个 DBA 或 superadmin 来批。
 
@@ -317,15 +323,12 @@ MongoDB 不支持 SQL，查询接口是 `POST /api/v1/query/mongo`，支持两�
 ```json
 {
   "apply_enabled": true,
-  "max_apply_days": 14,
-  "apply_scopes": [
-    { "database": "public", "tables": ["dw_probe"] },
-    { "database": "shop", "tables": [] }
-  ]
+  "max_apply_days": 14
 }
 ```
 
-`tables` 为空数组表示该库下**全部表**都可申请。`apply_scopes` 为空则任何人都申请不了。
+**没有范围字段**：开放申请即代表该数据源下的任意库都可以申请，拿到授权后库下所有表都可查。
+（旧版字段 `apply_scopes` 已废弃，仍可传入但会被忽略；存量数据只作为历史对照保留。）
 
 查询请求体示例：
 

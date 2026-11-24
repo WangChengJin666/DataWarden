@@ -110,6 +110,9 @@ docs/superpowers/         # plans / specs，内部设计资料
   SQL 请求的 `tables` 是**选填**，只进审计明细，**不参与鉴权**——SQL 实际访问哪些表由数据库决定，
   按请求体里的表名鉴权等于允许用户少报一张表绕过。缺库返回 `ErrNoDatabase`（fail-closed），缺表不是错误。
   Mongo 同理：`ds:<id>:<库>:*`，集合名只用于定位查询目标。
+- **数据源不配置「可申请范围」**：`apply_enabled` 打开即可申请其下任意库，
+  `datasource.apply_scopes` 列已废弃（迁移 `0007`，读取侧忽略）。申请单 scope 统一落 `<库>:*`，
+  不要重新引入库表白名单或按表鉴权。
 - **Redis 前缀授权向下覆盖**：对目标 key 逐级向上生成候选，任一命中即放行；`redisq/safety_test.go`
   通过解析源码强制"不使用 `KEYS`"，有人写了会直接测试失败。
 - **MongoDB 用白名单而非黑名单**校验命令，`$out`/`$merge` 在解析阶段拒绝。

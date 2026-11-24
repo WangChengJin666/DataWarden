@@ -78,8 +78,11 @@ type datasourceReq struct {
 	Options      map[string]string `json:"options"`
 	ApplyEnabled bool              `json:"apply_enabled"`
 	MaxApplyDays int               `json:"max_apply_days"`
-	ApplyScopes  []applyScopeReq   `json:"apply_scopes"`
-	Description  string            `json:"description"`
+	// ApplyScopes 已废弃：不再配置「允许申请的库表范围」，
+	// 数据源开放申请即可申请其下任意库/表。字段留在请求体里是为了
+	// 兼容旧版前端（会带一个空数组），服务端一律忽略。
+	ApplyScopes []applyScopeReq `json:"apply_scopes"`
+	Description string          `json:"description"`
 }
 
 // validTypes 限制可登记的数据源类型，避免脏数据进入 Adapter 构造。
@@ -91,15 +94,11 @@ var validTypes = map[string]bool{
 }
 
 // toModel 把请求转成模型。密码按明文写入。
+//
+// ApplyScopes 固定为空：可申请范围不再由数据源配置（不填即全部），
+// 旧版前端带上来的值直接丢弃，避免「界面已无此配置、库里却还留着旧白名单」
+// 造成两套口径。
 func (r datasourceReq) toModel() *model.Datasource {
-	scopes := make([]model.ApplyScope, 0, len(r.ApplyScopes))
-	for _, s := range r.ApplyScopes {
-		scopes = append(scopes, model.ApplyScope{
-			Database: s.Database,
-			Tables:   s.Tables,
-		})
-	}
-
 	return &model.Datasource{
 		Name:         r.Name,
 		Type:         model.DatasourceType(r.Type),
@@ -112,7 +111,6 @@ func (r datasourceReq) toModel() *model.Datasource {
 		Options:      r.Options,
 		ApplyEnabled: r.ApplyEnabled,
 		MaxApplyDays: r.MaxApplyDays,
-		ApplyScopes:  scopes,
 		Description:  r.Description,
 	}
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   Button,
   Card,
@@ -8,7 +8,6 @@ import {
   InputNumber,
   message,
   Modal,
-  Select,
   Space,
   Table,
   Tag,
@@ -61,21 +60,14 @@ export default function ApplyPage() {
   const openApply = (ds: Datasource) => {
     setSelected(ds)
     form.resetFields()
-    form.setFieldsValue({ days: Math.min(7, ds.max_apply_days) })
+    form.setFieldsValue({
+      days: Math.min(7, ds.max_apply_days),
+      // 数据源配了默认库就直接预填，省掉用户去记库名；
+      // 仍可改成其它库——有该数据源的权限就能申请它下面的任意库。
+      scope: ds.database || undefined,
+    })
     setModalOpen(true)
   }
-
-  // 根据选中数据源的可申请范围，生成库→表选项
-  const scopeOptions = useMemo(() => {
-    if (!selected) return []
-    return selected.apply_scopes.map((s) => ({
-      label: s.database,
-      options: (s.tables.length ? s.tables : ['*']).map((t) => ({
-        label: t === '*' ? `${s.database}（全部表）` : `${s.database}:${t}`,
-        value: t === '*' ? s.database : `${s.database}:${t}`,
-      })),
-    }))
-  }, [selected])
 
   const submit = async () => {
     if (!selected) return
@@ -177,14 +169,9 @@ export default function ApplyPage() {
                         {ds.max_apply_days} 天
                       </Descriptions.Item>
                       <Descriptions.Item label="可申请范围">
-                        <Space wrap size={4}>
-                          {ds.apply_scopes.map((s, i) => (
-                            <Tag key={i}>
-                              {s.database}
-                              {s.tables.length ? `: ${s.tables.join(',')}` : ' 全部表'}
-                            </Tag>
-                          ))}
-                        </Space>
+                        <Text type="secondary">
+                          该数据源下的任意库，有授权即可查询库下所有表
+                        </Text>
                       </Descriptions.Item>
                     </Descriptions>
                   </div>
@@ -219,16 +206,19 @@ export default function ApplyPage() {
         <Form form={form} layout="vertical" preserve={false}>
           <Form.Item
             name="scope"
-            label="申请范围"
-            rules={[{ required: true, message: '请选择范围' }]}
-            extra="只能选择管理员开放的范围"
+            label="申请库"
+            rules={[
+              { required: true, message: '请填写库名' },
+              {
+                // 后端用 NormalizeScope 校验，畸形输入会被拒（400）。
+                // 这里先挡一道，用户不用等一次往返才知道写错了。
+                pattern: /^[^\s:*?[\]]+$/,
+                message: '只能填库名，不要带通配符或冒号',
+              },
+            ]}
+            extra="授权粒度是库：拿到该库的权限就能查询库下所有表，不需要逐表申请"
           >
-            <Select
-              placeholder="选择库或表"
-              options={scopeOptions}
-              showSearch
-              optionFilterProp="label"
-            />
+            <Input placeholder="例如 shop" />
           </Form.Item>
           <Form.Item
             name="days"

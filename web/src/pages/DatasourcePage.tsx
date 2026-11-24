@@ -37,7 +37,6 @@ import {
   updateDatasource,
 } from '@/api/client'
 import type {
-  ApplyScope,
   Datasource,
   DatasourceInput,
   DatasourceType,
@@ -282,7 +281,6 @@ export default function DatasourcePage() {
       options: {},
       apply_enabled: false,
       max_apply_days: 7,
-      apply_scopes: [],
     })
     setModalOpen(true)
   }
@@ -306,7 +304,6 @@ export default function DatasourcePage() {
       password: undefined,
       apply_enabled: record.apply_enabled,
       max_apply_days: record.max_apply_days,
-      apply_scopes: record.apply_scopes ?? [],
       description: record.description,
     })
     setModalOpen(true)
@@ -325,21 +322,12 @@ export default function DatasourcePage() {
   const submit = async () => {
     try {
       const values = await form.validateFields()
+      // 不再提交 apply_scopes：可申请范围由数据源整体决定，
+      // 登记时不填 = 该数据源下的库和表都可以申请。
       const input: DatasourceInput = {
         ...values,
         // 空的高级参数不提交：后端会按「未设置」处理，避免存一堆空字符串
         options: cleanOptions(values.options) ?? {},
-        apply_scopes: (values.apply_scopes ?? []).map((s: ApplyScope) => ({
-          database: s?.database ?? '',
-          tables: Array.isArray(s?.tables)
-            ? s.tables
-            : typeof s?.tables === 'string' && s.tables
-              ? String(s.tables)
-                  .split(',')
-                  .map((x) => x.trim())
-                  .filter(Boolean)
-              : [],
-        })),
       }
       if (editing) {
         // 编辑时密码留空表示不修改，交给后端保留原密文
@@ -510,26 +498,18 @@ export default function DatasourcePage() {
     },
     {
       title: '可申请范围',
-      width: 210,
-      render: (_, r) => {
-        if (!r.apply_enabled) return <Text type="secondary">—</Text>
-        if (!r.apply_scopes?.length) return <Text type="warning">未配置范围</Text>
-        return (
+      width: 180,
+      render: (_, r) =>
+        r.apply_enabled ? (
           <Space direction="vertical" size={2}>
-            {r.apply_scopes.slice(0, 2).map((s, i) => (
-              <Text key={i} style={{ fontSize: 12 }}>
-                {s.database}
-                {s.tables?.length ? `: ${s.tables.join(', ')}` : ' (全部表)'}
-              </Text>
-            ))}
-            {r.apply_scopes.length > 2 ? (
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                等 {r.apply_scopes.length} 项
-              </Text>
-            ) : null}
+            <Text style={{ fontSize: 12 }}>全部库表</Text>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              有该数据源的授权即可访问
+            </Text>
           </Space>
-        )
-      },
+        ) : (
+          <Text type="secondary">—</Text>
+        ),
     },
     {
       title: '创建时间',
@@ -920,64 +900,17 @@ export default function DatasourcePage() {
             </Form.Item>
           </Space>
 
-          <Form.Item
-            name="apply_scopes"
-            label="允许申请的库表范围"
-            extra="库名 + 表名列表；表名留空表示该库下全部表。未配置范围的数据源，即使开启申请也无人能提交申请。"
-          >
-            <ScopeList />
-          </Form.Item>
+          {/* 范围不再需要填写：授权粒度是「数据源 + 库」，开放申请即可申请
+              其下任意库表。这里明确写出来，避免管理员以为漏填了配置项。 */}
+          <Alert
+            type="info"
+            showIcon
+            message="可申请范围：全部库表"
+            description="开放申请后，开发者即可申请该数据源下的任意库；拿到授权就能查询该库下的所有表，无需逐库逐表配置。"
+          />
         </Form>
       </Modal>
     </Card>
   )
 }
 
-/** 可增删的范围行编辑器，配合 Form.List 使用 */
-function ScopeList({ value = [], onChange }: { value?: ApplyScope[]; onChange?: (v: ApplyScope[]) => void }) {
-  const update = (idx: number, patch: Partial<ApplyScope>) => {
-    const next = value.map((s, i) => (i === idx ? { ...s, ...patch } : s))
-    onChange?.(next)
-  }
-
-  return (
-    <Space direction="vertical" style={{ width: '100%' }}>
-      {value.map((scope, idx) => (
-        <Space key={idx} style={{ width: '100%' }} align="start">
-          <Input
-            placeholder="库名，如 shop"
-            value={scope.database}
-            onChange={(e) => update(idx, { database: e.target.value })}
-            style={{ width: 180 }}
-          />
-          <Input
-            placeholder="表名，逗号分隔；留空表示全部表"
-            value={Array.isArray(scope.tables) ? scope.tables.join(',') : ''}
-            onChange={(e) =>
-              update(idx, {
-                tables: e.target.value
-                  .split(',')
-                  .map((x) => x.trim())
-                  .filter(Boolean),
-              })
-            }
-            style={{ width: 380 }}
-          />
-          <Button
-            danger
-            icon={<DeleteOutlined />}
-            onClick={() => onChange?.(value.filter((_, i) => i !== idx))}
-          />
-        </Space>
-      ))}
-      <Button
-        type="dashed"
-        icon={<PlusOutlined />}
-        onClick={() => onChange?.([...value, { database: '', tables: [] }])}
-        block
-      >
-        添加范围
-      </Button>
-    </Space>
-  )
-}
