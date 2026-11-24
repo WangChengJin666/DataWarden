@@ -3,7 +3,6 @@ import {
   Alert,
   Button,
   Card,
-  Descriptions,
   Form,
   Input,
   InputNumber,
@@ -95,6 +94,53 @@ export default function ApplyPage() {
     }
   }
 
+  // 可申请数据源用表格分页呈现。之前一个数据源一张小卡片，卡片里还有两块
+  // Descriptions，稍有十几个数据源就把「我的申请」挤到屏幕外，要点申请还得
+  // 来回滚动找。表格把连接信息和最长天数收进列里，一屏能看一页。
+  const applyColumns: ColumnsType<Datasource> = [
+    {
+      title: '数据源',
+      dataIndex: 'name',
+      width: 200,
+      render: (v: string, r) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{v}</Text>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {r.host}:{r.port}
+          </Text>
+        </Space>
+      ),
+    },
+    {
+      title: '类型',
+      dataIndex: 'type',
+      width: 110,
+      render: (v: string) => <Tag>{v}</Tag>,
+    },
+    {
+      title: '说明',
+      dataIndex: 'description',
+      render: (v: string) => v || <Text type="secondary">—</Text>,
+    },
+    {
+      title: '最长可申请',
+      dataIndex: 'max_apply_days',
+      width: 110,
+      align: 'right',
+      render: (v: number) => `${v} 天`,
+    },
+    {
+      title: '操作',
+      width: 110,
+      align: 'right',
+      render: (_, r) => (
+        <Button type="primary" size="small" onClick={() => openApply(r)}>
+          申请授权
+        </Button>
+      ),
+    },
+  ]
+
   const columns: ColumnsType<GrantRequest> = [
     { title: 'ID', dataIndex: 'id', width: 70 },
     { title: '数据源', dataIndex: 'datasource_name', width: 160 },
@@ -132,48 +178,27 @@ export default function ApplyPage() {
 
   return (
     <Space direction="vertical" size="large" style={{ width: '100%' }}>
-      <Card title="可申请的数据源" loading={loading}>
-        {applyable.length === 0 ? (
-          <Text type="secondary">
-            暂无开放申请的数据源。请联系 DBA 在「数据源管理」中开启申请。
-          </Text>
-        ) : (
-          <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-            {applyable.map((ds) => (
-              <Card key={ds.id} size="small" type="inner">
-                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16 }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <Space wrap>
-                      <Text strong>{ds.name}</Text>
-                      <Tag>{ds.type}</Tag>
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        {ds.host}:{ds.port}
-                      </Text>
-                    </Space>
-                    {ds.description ? (
-                      <div style={{ marginTop: 6 }}>
-                        <Text type="secondary">{ds.description}</Text>
-                      </div>
-                    ) : null}
-                    <Descriptions size="small" column={1} style={{ marginTop: 8 }}>
-                      <Descriptions.Item label="最长可申请">
-                        {ds.max_apply_days} 天
-                      </Descriptions.Item>
-                      <Descriptions.Item label="授权范围">
-                        <Text type="secondary">
-                          该数据源下的全部库与表（申请时无需选择库）
-                        </Text>
-                      </Descriptions.Item>
-                    </Descriptions>
-                  </div>
-                  <Button type="primary" onClick={() => openApply(ds)} style={{ flexShrink: 0 }}>
-                    申请授权
-                  </Button>
-                </div>
-              </Card>
-            ))}
-          </Space>
-        )}
+      <Card title="可申请的数据源">
+        <Table
+          rowKey="id"
+          size="middle"
+          columns={applyColumns}
+          dataSource={applyable}
+          loading={loading}
+          locale={{
+            emptyText: '暂无开放申请的数据源。请联系 DBA 在「数据源管理」中开启申请。',
+          }}
+          pagination={{
+            defaultPageSize: 5,
+            showSizeChanger: true,
+            pageSizeOptions: [5, 10, 20, 50],
+            hideOnSinglePage: true,
+            showTotal: (total) => `共 ${total} 个数据源`,
+          }}
+        />
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          审批通过后即可查询该数据源下的全部库与表，申请时无需选择库。
+        </Text>
       </Card>
 
       <Card title="我的申请">
