@@ -11,3 +11,91 @@ body {
 #root {
   min-height: 100vh;
 }
+
+/* ---------- SQL 编辑器：右键菜单 ---------- */
+
+/* 挂在 body 上用 fixed 定位：编辑器容器高度固定且有 overflow，
+   菜单挂在内部会被裁掉。配色跟随 antd 的浅色主题。 */
+.dw-sql-menu {
+  position: fixed;
+  z-index: 2000;
+  min-width: 168px;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid #f0f0f0;
+  border-radius: 8px;
+  box-shadow:
+    0 6px 16px rgba(0, 0, 0, 0.08),
+    0 3px 6px -4px rgba(0, 0, 0, 0.12);
+  font-size: 13px;
+  user-select: none;
+}
+
+.dw-sql-menu__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  color: #1f1f1f;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.dw-sql-menu__item:hover {
+  background: #f5f5f5;
+}
+
+.dw-sql-menu__item--disabled {
+  color: #bfbfbf;
+  cursor: default;
+}
+
+.dw-sql-menu__item--disabled:hover {
+  background: transparent;
+}
+
+.dw-sql-menu__kbd {
+  color: #8c8c8c;
+  font-size: 12px;
+}
+
+.dw-sql-menu__sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: #f0f0f0;
+}
+
+/* ---------- SQL 编辑器：表名悬停卡片 ---------- */
+
+.dw-sql-hover {
+  max-width: 380px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #1f1f1f;
+}
+
+.dw-sql-hover__head {
+  margin-bottom: 4px;
+  font-weight: 600;
+  color: #595959;
+}
+
+.dw-sql-hover__cols {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+
+.dw-sql-hover__cols span {
+  padding: 0 6px;
+  background: #f5f5f5;
+  border-radius: 3px;
+  font-family: Menlo, Consolas, monospace;
+}
+
+.dw-sql-hover__empty {
+  color: #8c8c8c;
+}

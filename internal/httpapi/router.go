@@ -63,6 +63,9 @@ func NewRouter(d Deps) *gin.Engine {
 			authed.GET("/datasources/:id/databases", d.Metadata.ListDatabases)
 			authed.GET("/datasources/:id/tables", d.Metadata.ListTables)
 			authed.GET("/datasources/:id/columns", d.Metadata.Columns)
+			// 整库表结构：SQL 编辑器解析出别名后要据此提示 `别名.` 的字段。
+			// 逐表调 /columns 一次输入会打出十几个请求，跟不上打字。
+			authed.GET("/datasources/:id/schema", d.Metadata.Schema)
 		}
 
 		// 授权申请

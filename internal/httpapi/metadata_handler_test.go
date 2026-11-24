@@ -94,6 +94,7 @@ func newMetadataRouter(t *testing.T, h *MetadataHandler) *gin.Engine {
 	g.GET("/databases", h.ListDatabases)
 	g.GET("/tables", h.ListTables)
 	g.GET("/columns", h.Columns)
+	g.GET("/schema", h.Schema)
 	return r
 }
 
@@ -301,6 +302,87 @@ func TestMetadata_Columns_MissingParamsIs400(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400", path, w.Code)
 		}
+	}
+}
+
+// schemaAdapter 在 okAdapter 基础上实现 adapter.SchemaReader，
+// 用于验证整库表结构的返回与按表裁剪。
+type schemaAdapter struct {
+	*okAdapter
+	tables []adapter.TableColumns
+	err    error
+}
+
+func (s *schemaAdapter) ListSchema(ctx context.Context, db string) ([]adapter.TableColumns, error) {
+	return s.tables, s.err
+}
+
+// Schema 是把 `别名.` 补全所需的数据一次性交给前端的接口，
+// 成功路径要保证字段顺序保持建表顺序（前端直接按顺序展示）。
+func TestMetadata_Schema_ReturnsColumns(t *testing.T) {
+	h := &MetadataHandler{
+		Store: seedDS(),
+		Factory: func(id int64) (adapter.Adapter, error) {
+			return &schemaAdapter{
+				okAdapter: &okAdapter{},
+				tables: []adapter.TableColumns{
+					{Table: "app_user", Columns: []string{"id", "name", "email"}},
+				},
+			}, nil
+		},
+		Enforcer: allowAll{},
+	}
+	r := newMetadataRouter(t, h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/datasources/1/schema?db=shop", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "app_user") || !strings.Contains(body, `"email"`) {
+		t.Errorf("应返回表名与字段名，body=%s", body)
+	}
+}
+
+// 不支持批量能力的适配器（Mongo / Redis）返回 200 + 空清单，
+// 让前端的补全逻辑统一降级，不必为数据源类型写分支。
+func TestMetadata_Schema_UnsupportedAdapterIsEmpty(t *testing.T) {
+	h := &MetadataHandler{
+		Store:    seedDS(),
+		Factory:  func(id int64) (adapter.Adapter, error) { return &okAdapter{}, nil },
+		Enforcer: allowAll{},
+	}
+	r := newMetadataRouter(t, h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/datasources/1/schema?db=shop", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"items":[]`) {
+		t.Errorf("不支持时应返回空清单，body=%s", w.Body.String())
+	}
+}
+
+// 没有该库权限时直接 403，不连库：能列出表结构本身就是信息泄露。
+func TestMetadata_Schema_ForbiddenWithoutGrant(t *testing.T) {
+	h := &MetadataHandler{
+		Store: seedDS(),
+		Factory: func(id int64) (adapter.Adapter, error) {
+			return &schemaAdapter{okAdapter: &okAdapter{}}, nil
+		},
+		Enforcer: denyAll{},
+	}
+	r := newMetadataRouter(t, h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/datasources/1/schema?db=shop", nil))
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403, body=%s", w.Code, w.Body.String())
 	}
 }
 

@@ -13,23 +13,28 @@ import {
   Table,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import { PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons'
 import CodeMirror from '@uiw/react-codemirror'
-import { sql as sqlLang, MySQL, PostgreSQL, type SQLNamespace } from '@codemirror/lang-sql'
-import { EditorView } from '@codemirror/view'
+import { Compartment } from '@codemirror/state'
+import { EditorView, keymap } from '@codemirror/view'
+import { defaultKeymap, historyKeymap } from '@codemirror/commands'
+import { sql as sqlLang, MySQL, PostgreSQL, type SQLDialect } from '@codemirror/lang-sql'
 import {
   executeMongo,
   executeRedis,
   executeSQL,
   getCurrentUser,
-  listColumns,
+  getSchema,
   listDatabases,
   listMyDatasources,
   listTables,
 } from '@/api/client'
 import type { DatasourceBrief, QueryResult, RedisQueryResult } from '@/api/types'
+import { buildSqlExtensions, type SchemaMap } from '@/sql/completion'
+import { attachContextMenu, formatSql, pickStatement, sqlMenuItems } from '@/sql/menu'
 
 const { Text, Paragraph } = Typography
 
@@ -40,12 +45,9 @@ const isPrivileged = () =>
   PRIVILEGED_ROLES.includes(getCurrentUser()?.role ?? '')
 
 /**
- * MongoDB 的字段名是「采样」得来的——取一条文档看看有哪些键。
- * 空集合取不到，所以要把「已知为空」和「还没取过」区分开：
- * 前者显示成「无字段」，后者显示成「未采样」。
+ * 编辑器里「表名 → 字段」的来源已改为整库 schema（见 schemaMap），
+ * 这里只保留下拉与提示用的小工具函数。
  */
-type ColumnCache = Record<string, string[] | undefined>
-
 export default function QueryPage() {
   const [datasources, setDatasources] = useState<DatasourceBrief[]>([])
   const [datasourceId, setDatasourceId] = useState<number>()
@@ -87,16 +89,40 @@ export default function QueryPage() {
   const [tableOptions, setTableOptions] = useState<string[]>([])
   const [tableLoading, setTableLoading] = useState(false)
   const [tableError, setTableError] = useState('')
-  const [columns, setColumns] = useState<ColumnCache>({})
-  // 记录哪些字段已经请求过，避免每次输入都重复发请求
-  const fetchedColumns = useRef<Set<string>>(new Set())
+  // 整库表结构（表名 → 字段）。SQL 编辑器靠它把 `别名.` 解析成具体表的字段：
+  // 逐表请求跟不上打字，也不能在用户改别名时重新请求，所以一次取全库缓存。
+  // 这取代了早先「选表才拉字段」的 ColumnCache 方案——那条路径要求用户
+  // 先在表下拉里选表，而 Navicat 式的体验是「写了 FROM 就该有提示」。
+  const [schemaMap, setSchemaMap] = useState<SchemaMap>({})
   // 库列表请求的序号，用于丢弃过期响应（见 loadDatabases）
   const dbReqSeq = useRef(0)
+  // schema 请求序号，同样用于丢弃过期响应（切库时前一个库的响应可能后到）
+  const schemaReqSeq = useRef(0)
+
+  // 编辑器实例与「随状态变化需要重新配置」的 compartment。
+  // 补全要用到最新的 schema，而 EditorView 是长期的——用 Compartment 热替换，
+  // 比销毁重建编辑器好：后者会丢光标、丢滚动位置，打字中途尤其明显。
+  const editorRef = useRef<EditorView | null>(null)
+  const langCompartment = useRef(new Compartment())
+  const completionCompartment = useRef(new Compartment())
+  // 右键菜单的销毁函数，重建编辑器时要先解绑，否则旧节点的事件会泄漏
+  const detachMenu = useRef<(() => void) | null>(null)
+  // 供右键菜单里的「执行当前语句」调用的最新 run。
+  // 菜单是持久化的 DOM 监听，闭包捕获的 run 会过期（它依赖 loading / sql 等状态）。
+  const runRef = useRef<() => Promise<void>>(async () => {})
+  // 供 reload 回调读取的最新值（闭包会捕获旧值）
+  const schemaRef = useRef<SchemaMap>({})
+  schemaRef.current = schemaMap
+  const dialectRef = useRef<SQLDialect>(PostgreSQL)
 
   const current = datasources.find((d) => d.id === datasourceId)
   const isRedis = current?.type === 'redis'
   const isMongo = current?.type === 'mongodb'
   const isSQL = !isRedis && !isMongo
+
+  // 方言由数据源类型决定。写进 ref 让补全来源始终读到最新值：
+  // EditorView 是长期的，闭包捕获的 current 会停留在首次渲染的那份。
+  dialectRef.current = current?.type === 'mysql' ? MySQL : PostgreSQL
 
   useEffect(() => {
     void (async () => {
@@ -146,8 +172,11 @@ export default function QueryPage() {
     setTables([])
     setSql('')
     setTableOptions([])
-    setColumns({})
-    fetchedColumns.current = new Set()
+    // 整库表结构也要清：留着上一个数据源的 schema 会让编辑器提示
+    // 一堆根本不在当前库里的表，比没有提示更误导
+    setSchemaMap({})
+    // 序号自增让在途请求的结果被丢弃（否则切数据源后被旧响应覆盖）
+    schemaReqSeq.current += 1
     setResult(null)
     setRedisResult(null)
     setRedisKey('')
@@ -181,10 +210,18 @@ export default function QueryPage() {
       setDbOptions(list)
       setDbError('')
       // 数据源配置里有默认库时优先用它；否则只在唯一候选时自动选中
+      let picked = ''
       if (ds.database && list.includes(ds.database)) {
-        setDatabase(ds.database)
+        picked = ds.database
       } else if (list.length === 1) {
-        setDatabase(list[0])
+        picked = list[0]
+      }
+      if (picked) {
+        setDatabase(picked)
+        // 预填默认库时也要拉表结构与表清单：这条路径不经过 onDatabaseChange，
+        // 少了这一步编辑器在首次打开页面时就没有任何补全
+        void loadTables(ds.id, picked)
+        void loadSchema(ds.id, picked)
       }
     } catch (e) {
       if (seq !== dbReqSeq.current) return
@@ -221,65 +258,83 @@ export default function QueryPage() {
     [isRedis],
   )
 
-  // 库变了就重拉表清单，并清掉已选表（上一个库的表名在新库里不成立）
+  // 库变了就重拉表清单与表结构，并清掉已选表（上一个库的表名在新库里不成立）
   const onDatabaseChange = (db: string) => {
     setDatabase(db)
     setTables([])
-    setColumns({})
-    fetchedColumns.current = new Set()
-    if (datasourceId) void loadTables(datasourceId, db)
+    // 立刻清空而不是等新 schema 回来：过渡期里旧库的表名会误导补全
+    setSchemaMap({})
+    if (datasourceId) {
+      void loadTables(datasourceId, db)
+      void loadSchema(datasourceId, db)
+    }
   }
 
-  // 选中表后异步取字段，用于 SQL 补全。失败不提示：补全拿不到不影响查询。
-  useEffect(() => {
-    if (!datasourceId || !database || tables.length === 0) return
-    for (const t of tables) {
-      const key = `${datasourceId}.${database}.${t}`
-      if (fetchedColumns.current.has(key)) continue
-      fetchedColumns.current.add(key)
-      void listColumns(datasourceId, database, t)
-        .then((cols) => setColumns((prev) => ({ ...prev, [t]: cols })))
-        .catch(() => {
-          // 允许下次重试
-          fetchedColumns.current.delete(key)
-          setColumns((prev) => ({ ...prev, [t]: [] }))
-        })
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [datasourceId, database, tables])
-
   /**
-   * 构造 CodeMirror 的补全 schema。
+   * 拉取整库表结构。编辑器解析 `别名.` 时，别名指向哪张表只有解析完
+   * 当前语句才知道，逐表请求既猜不准也跟不上输入，所以一次拿全库。
    *
-   * 结构是 { 库名: { 表名: [字段...] } }，lang-sql 会据此补全
-   * 表名、`表名.` 之后的字段名，以及 SELECT 里直接出现的字段名。
-   *
-   * 只放「当前已选表」而不放整个库的表：全量 schema 会让补全列表变成
-   * 几千条，而且用户没权限的表本来就不该出现在候选里。
+   * 失败不弹提示：补全拿不到不影响查询，弹窗反而打断输入。
+   * 用序号丢弃过期响应——快速切库时前一个库的响应可能后到，
+   * 覆盖掉新库的结构会给出「看起来对但字段全错」的提示，比不提示糟得多。
    */
-  const sqlSchema = useMemo<SQLNamespace>(() => {
-    const inner: SQLNamespace = {}
-    for (const t of tables) {
-      inner[t] = columns[t] ?? []
+  const loadSchema = useCallback(async (id: number, db: string) => {
+    const seq = ++schemaReqSeq.current
+    try {
+      const items = await getSchema(id, db)
+      if (seq !== schemaReqSeq.current) return
+      const map: SchemaMap = {}
+      for (const t of items) {
+        map[t.table] = t.columns
+        // PostgreSQL 的「库」是 schema，SQL 里常写 schema.table，
+        // 两套键都放一份，补全与时才能在两种写法下都命中
+        map[`${db}.${t.table}`] = t.columns
+      }
+      setSchemaMap(map)
+    } catch {
+      if (seq !== schemaReqSeq.current) return
+      setSchemaMap({})
     }
-    if (!database) return inner
-    return { [database]: inner, public: inner }
-  }, [database, tables, columns])
+  }, [])
 
-  const extensions = useMemo(() => {
-    const dialect = current?.type === 'mysql' ? MySQL : PostgreSQL
-    return [
-      sqlLang({ dialect, schema: sqlSchema, upperCaseKeywords: true }),
-      // 允许 Tab 缩进而不跳转到下一个控件，编辑器里这更符合直觉
-      EditorView.contentAttributes.of({ 'aria-label': 'SQL 编辑器' }),
-    ]
-  }, [current?.type, sqlSchema])
+  /** 取编辑器里光标所在的语句；编辑器不存在时返回空串（退回整篇文本）。 */
+  const pickStatementText = () => {
+    const view = editorRef.current
+    if (!view) return ''
+    return pickStatement(view)
+  }
+
+  /** 格式化编辑器里的当前语句（没有选中也没有语句内容时格式化整篇）。 */
+  const formatEditorFromView = (view: EditorView) => {
+    const sel = view.state.selection.main
+    const from = sel.empty ? 0 : sel.from
+    const to = sel.empty ? view.state.doc.length : sel.to
+    const text = view.state.doc.sliceString(from, to)
+    if (!text.trim()) return
+    view.dispatch({ changes: { from, to, insert: formatSql(text) } })
+    view.focus()
+  }
+
+  /** 按钮版格式化：拿不到编辑器时退化为改 state（受控值同步）。 */
+  const formatEditor = () => {
+    const view = editorRef.current
+    if (view) {
+      formatEditorFromView(view)
+      return
+    }
+    const next = formatSql(sql)
+    setSql(next)
+  }
 
   const run = async () => {
     if (!datasourceId) {
       message.warning('请先选择数据源')
       return
     }
+    // 编辑器里有多条语句时只执行光标所在的那一条——
+    // 后端只接受单语句（多语句一律拒绝），整篇丢过去必然报错。
+    // 这也与 Navicat「Ctrl+Enter 执行当前语句」的行为一致。
+    const effectiveSql = isSQL ? (pickStatementText() || sql) : sql
     if (isMongo) {
       if (!database.trim()) {
         message.warning('请选择库')
@@ -305,7 +360,7 @@ export default function QueryPage() {
       }
       // 不再要求选表：授权粒度是「数据源 + 库」，有该库的权限就能查库里
       // 任何表。表下拉只是可选的补全辅助，留空合法。
-      if (!sql.trim()) {
+      if (!effectiveSql.trim()) {
         message.warning('请输入 SQL')
         return
       }
@@ -365,7 +420,7 @@ export default function QueryPage() {
           // 管理角色补成「整库」对象后放行，开发者仍被拒（ErrNoTables）。
           // 传空数组和不传走同一条路径，这里显式省略让报文更干净。
           tables: tables.length > 0 ? tables : undefined,
-          sql,
+          sql: effectiveSql,
           row_limit: rowLimit,
         }),
       )
@@ -375,6 +430,88 @@ export default function QueryPage() {
       setLoading(false)
     }
   }
+
+  // 让右键菜单的「执行当前语句」始终调用最新的 run（它依赖 loading / sql 等状态，
+  // 直接闭包捕获会拿到首帧的旧值）
+  runRef.current = run
+
+  // 编辑器扩展只构造一次：schema 与方言都通过 ref 读取实时值，
+  // 避免每次 schemaMap 变化就重建扩展（会重置补全面板与选区）。
+  const extensions = useMemo(
+    () => [
+      // 语言支持随方言切换（MySQL / PostgreSQL 的关键字与标识符引号不同），
+      // 放在 Compartment 里由下面的 effect 热替换
+      langCompartment.current.of(sqlLang({ dialect: dialectRef.current, upperCaseKeywords: true })),
+      // 补全 + 悬停提示（自定义来源，见 sql/completion.ts）
+      completionCompartment.current.of(
+        buildSqlExtensions({
+          getSchema: () => schemaRef.current,
+          getDialect: () => dialectRef.current,
+        }),
+      ),
+      // 快捷键：Ctrl/Cmd+Enter 执行、Shift+Alt+F 格式化、Ctrl+Space 唤出补全
+      //（Ctrl+Space 已由补全扩展自带，这里不重复绑定）
+      keymap.of([
+        {
+          key: 'Mod-Enter',
+          run: () => {
+            void runRef.current()
+            return true
+          },
+        },
+        {
+          key: 'Shift-Alt-f',
+          run: (view) => {
+            formatEditorFromView(view)
+            return true
+          },
+        },
+        // 编辑器内建按键（移动、选中、撤销等）。basicSetup 已关，这里显式带上，
+        // 不然后续覆盖 keymap 时会把 Ctrl+Z 之类的默认行为一起丢掉。
+        ...defaultKeymap,
+        ...historyKeymap,
+      ]),
+      EditorView.contentAttributes.of({ 'aria-label': 'SQL 编辑器' }),
+    ],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
+
+  // 数据源类型变化时热替换方言与补全配置。
+  // 不销毁编辑器：重建会丢光标、丢滚动位置，切换数据源后用户往往还要接着改 SQL。
+  useEffect(() => {
+    const view = editorRef.current
+    if (!view) return
+    view.dispatch({
+      effects: [
+        langCompartment.current.reconfigure(
+          sqlLang({ dialect: dialectRef.current, upperCaseKeywords: true }),
+        ),
+        completionCompartment.current.reconfigure(
+          buildSqlExtensions({
+            getSchema: () => schemaRef.current,
+            getDialect: () => dialectRef.current,
+          }),
+        ),
+      ],
+    })
+  }, [current?.type])
+
+  // schema 到位后强制刷新一次补全候选：补全来源虽然是惰性的（每次按键都读 ref），
+  // 但编辑器在 schema 为空时不会缓存任何内容，这里只是让已打开的补全面板及时更新。
+  useEffect(() => {
+    const view = editorRef.current
+    if (!view) return
+    // 触发一次 reconfigure，让 autocompletion 的缓存失效
+    view.dispatch({
+      effects: completionCompartment.current.reconfigure(
+        buildSqlExtensions({
+          getSchema: () => schemaRef.current,
+          getDialect: () => dialectRef.current,
+        }),
+      ),
+    })
+  }, [schemaMap])
 
   // Redis 结果：key / 类型 / 值 / TTL
   const redisTable = redisResult ? (
@@ -758,36 +895,67 @@ export default function QueryPage() {
             <CodeMirror
               value={sql}
               onChange={setSql}
+              // extensions 用 useMemo 固定引用，但其中的 schema 通过 ref 读取实时值；
+              // 方言与补全配置分别放在两个 Compartment 里，切换数据源时热替换，
+              // 不销毁编辑器（销毁会丢光标与滚动位置）。
               extensions={extensions}
-              height="220px"
+              onCreateEditor={(view) => {
+                editorRef.current = view
+                detachMenu.current?.()
+                detachMenu.current = attachContextMenu(view, () => sqlMenuItems(() => void runRef.current()))
+              }}
+              height="260px"
               placeholder={
-                "SELECT id, phone FROM orders WHERE created_at > now() - interval '1 day' LIMIT 100"
+                "SELECT u.id, u.phone FROM app_user u WHERE u.created_at > now() - interval '1 day' LIMIT 100"
               }
               basicSetup={{
                 lineNumbers: true,
-                // 补全交给 lang-sql 的 schemaCompletionSource，
-                // 关掉默认的单词联想避免候选里混进无关变量名
-                autocompletion: true,
                 foldGutter: false,
                 highlightActiveLine: true,
+                highlightSelectionMatches: true,
+                // 补全由自定义的 autocompletion 扩展接管（见 sql/completion.ts）
+                autocompletion: false,
+                // 搜索面板的快捷键保留（Ctrl+F），右键菜单里也有入口
+                searchKeymap: true,
               }}
               style={{ border: '1px solid #d9d9d9', borderRadius: 6, fontSize: 13 }}
             />
             <Space size={4} wrap>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                输入表名或 <Text code>表名.</Text> 会弹出字段补全；
-              </Text>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                字段候选来自上面选中的表，不选也不影响执行。
+                <Text code>别名.</Text> 或 <Text code>表名.</Text> 自动提示字段；
+                <Text code>Ctrl+Space</Text> 手动唤出补全，
+                <Text code>Ctrl+Enter</Text> 执行光标所在语句，
+                <Text code>Shift+Alt+F</Text> 格式化。
               </Text>
             </Space>
           </Space>
         )}
 
         <div style={{ marginTop: 16 }}>
-          <Button type="primary" icon={<PlayCircleOutlined />} onClick={run} loading={loading}>
-            执行
-          </Button>
+          <Space>
+            <Button type="primary" icon={<PlayCircleOutlined />} onClick={run} loading={loading}>
+              执行
+            </Button>
+            {isSQL ? (
+              <Tooltip title="只格式化编辑器里的内容，不会执行">
+                <Button onClick={formatEditor}>格式化</Button>
+              </Tooltip>
+            ) : null}
+            <Tooltip title="重新拉取库、表与字段结构，编辑器补全会随之更新">
+              <Button
+                icon={<ReloadOutlined />}
+                onClick={() => {
+                  if (!datasourceId || !database) return
+                  void loadTables(datasourceId, database)
+                  void loadSchema(datasourceId, database)
+                  message.success('已刷新表结构')
+                }}
+                disabled={!datasourceId || !database}
+              >
+                刷新表结构
+              </Button>
+            </Tooltip>
+          </Space>
         </div>
       </Card>
 

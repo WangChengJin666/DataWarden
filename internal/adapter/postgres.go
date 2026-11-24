@@ -149,6 +149,24 @@ func (a *pgAdapter) ListTables(ctx context.Context, db string) ([]string, error)
 	return out, rows.Err()
 }
 
+// ListSchema 一次性返回指定 schema 下所有表（含视图）的字段名。
+//
+// 查询页的 SQL 编辑器要靠它做 `别名.` 的字段补全：别名指向哪张表只有
+// 解析完语句才知道，逐表按需请求跟不上输入。这里一条 information_schema
+// 查询就能覆盖整个 schema，代价远低于循环调用 Columns。
+func (a *pgAdapter) ListSchema(ctx context.Context, db string) ([]TableColumns, error) {
+	rows, err := a.db.QueryContext(ctx,
+		`SELECT table_name, column_name FROM information_schema.columns
+		 WHERE table_schema = $1
+		 ORDER BY table_name, ordinal_position`, db)
+	if err != nil {
+		return nil, fmt.Errorf("list schema: %w", err)
+	}
+	defer rows.Close()
+
+	return scanSchemaRows(rows)
+}
+
 func (a *pgAdapter) Query(ctx context.Context, sqlText string, rowLimit int) (*QueryResult, error) {
 	return a.query(ctx, sqlText, nil, rowLimit)
 }

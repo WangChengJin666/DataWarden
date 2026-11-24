@@ -104,6 +104,21 @@ func (a *mysqlAdapter) ListTables(ctx context.Context, db string) ([]string, err
 	return out, rows.Err()
 }
 
+// ListSchema 一次性返回指定库下所有表（含视图）的字段名，供 SQL 编辑器做
+// `别名.` 字段补全（原因见 adapter.SchemaReader 的注释）。
+func (a *mysqlAdapter) ListSchema(ctx context.Context, db string) ([]TableColumns, error) {
+	rows, err := a.db.QueryContext(ctx,
+		`SELECT table_name, column_name FROM information_schema.columns
+		 WHERE table_schema = ?
+		 ORDER BY table_name, ordinal_position`, db)
+	if err != nil {
+		return nil, fmt.Errorf("list schema: %w", err)
+	}
+	defer rows.Close()
+
+	return scanSchemaRows(rows)
+}
+
 func (a *mysqlAdapter) Query(ctx context.Context, sqlText string, rowLimit int) (*QueryResult, error) {
 	return a.query(ctx, sqlText, nil, rowLimit)
 }

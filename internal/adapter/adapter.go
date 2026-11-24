@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -54,6 +55,54 @@ type QueryResult struct {
 type TableRef struct {
 	Database string
 	Table    string
+}
+
+// TableColumns 是一张表的字段清单（不含类型，保持与 Columns 接口一致）。
+type TableColumns struct {
+	Table   string   `json:"table"`
+	Columns []string `json:"columns"`
+}
+
+// SchemaReader 是「一次取回整库所有表字段」的可选能力。
+//
+// 为什么需要它而不是在 handler 里循环调 Columns：SQL 编辑器要提示
+// `别名.` 之后的字段时，别名对应哪张表只有解析完 SQL 才知道，
+// 而且用户可能随时改别名——逐表按需请求既猜不准也跟不上输入速度。
+// 一次性把整个库的字段拉回来（本地缓存），补全才能做到「打字即提示」。
+//
+// 与 DatabaseQuerier 同理用可选接口：Redis 没有 schema，MongoDB 的字段
+// 是采样得来的、代价远大于一次元数据查询，两者都不实现这个方法，
+// handler 用类型断言决定是否走批量路径。
+type SchemaReader interface {
+	// ListSchema 返回指定库下所有表（含视图）及其字段名。
+	//
+	// db 的语义与 Adapter.ListDatabases 的返回值一致：
+	// PostgreSQL 是 schema 名，MySQL 是库名。
+	ListSchema(ctx context.Context, db string) ([]TableColumns, error)
+}
+
+// scanSchemaRows 把 (table_name, column_name) 两列结果按表分组。
+//
+// PostgreSQL 与 MySQL 的 information_schema.columns 列名一致，
+// 查询都按 table_name, ordinal_position 排序，所以两个适配器共用这段逻辑；
+// 顺序必须保序——编辑器展示字段时按建表顺序比按字母序更贴近直觉。
+func scanSchemaRows(rows *sql.Rows) ([]TableColumns, error) {
+	var (
+		out   []TableColumns
+		lastT string
+	)
+	for rows.Next() {
+		var table, column string
+		if err := rows.Scan(&table, &column); err != nil {
+			return nil, err
+		}
+		if len(out) == 0 || table != lastT {
+			out = append(out, TableColumns{Table: table, Columns: []string{}})
+			lastT = table
+		}
+		out[len(out)-1].Columns = append(out[len(out)-1].Columns, column)
+	}
+	return out, rows.Err()
 }
 
 // Adapter 是 SQL 类数据源的统一入口。

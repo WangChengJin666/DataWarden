@@ -162,3 +162,15 @@ export interface TestConnResult {
   message: string
   elapsed_ms?: number
 }
+
+/**
+ * 整库表结构：一张表及其字段名。
+ *
+ * 查询页的 SQL 编辑器用它解析别名、做 `别名.` 的字段补全。
+ * 字段顺序来自 information_schema 的 ordinal_position，即建表顺序，
+ * 展示时不要重排——按建表顺序比按字母序更贴近表结构本身。
+ */
+export interface TableColumns {
+  table: string
+  columns: string[]
+}

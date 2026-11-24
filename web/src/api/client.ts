@@ -9,6 +9,7 @@ import type {
   LoginResponse,
   QueryResult,
   RedisQueryResult,
+  TableColumns,
   TestConnResult,
 } from './types'
 
@@ -198,6 +199,27 @@ export async function listColumns(
   const { data } = await http.get<{ items: string[] }>(
     `/datasources/${datasourceId}/columns`,
     { params: { db, table } },
+  )
+  return data.items ?? []
+}
+
+/**
+ * 一次取回整库的表结构（表名 + 字段名）。
+ *
+ * SQL 编辑器要提示 `别名.` 之后的字段，而别名指向哪张表得先解析语句才知道。
+ * 逐表调 listColumns 会随着输入不断发请求、且每次都要等一次往返，
+ * 所以这里一次性拿全库、在内存里缓存，由前端解析别名后直接查表。
+ *
+ * 后端只返回当前用户有读权限的表；数据源类型不支持批量读取（Mongo / Redis）
+ * 时返回空数组，不报错——补全拿不到不影响查询。
+ */
+export async function getSchema(
+  datasourceId: number,
+  db: string,
+): Promise<TableColumns[]> {
+  const { data } = await http.get<{ items: TableColumns[] }>(
+    `/datasources/${datasourceId}/schema`,
+    { params: { db } },
   )
   return data.items ?? []
 }

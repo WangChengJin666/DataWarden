@@ -179,6 +179,82 @@ func (h *MetadataHandler) Columns(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": cols})
 }
 
+// Schema 一次性返回整库的表与字段，供 SQL 编辑器做 `别名.` 字段补全。
+//
+// 为什么需要批量接口：编辑器要提示 `t.` 之后的字段时，必须先知道 `t`
+// 是 FROM 子句里的哪张表。别名是随 SQL 改的，无法预先告知后端，
+// 所以把整个库的字段一次取回本地，由前端解析别名后查表。
+// 逐表调 /columns 也行，但一次输入会打出十几个请求，且每敲一个字母都要等。
+//
+// 与 /columns 一样按表过滤：只返回用户读过权限的表的字段。
+// 不这么做的话，这个接口就成了「一次拿到整库表结构」的旁路——
+// /tables 会按授权裁剪，这里却把裁剪掉的那些表的列名又吐回来。
+func (h *MetadataHandler) Schema(c *gin.Context) {
+	if h.Factory == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "metadata not configured"})
+		return
+	}
+	id, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	db := strings.TrimSpace(c.Query("db"))
+	if db == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "db query parameter is required"})
+		return
+	}
+
+	ds, err := h.Store.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "datasource not found"})
+		return
+	}
+
+	uid, _, _ := currentUser(c)
+	// 整库无权限直接 403，不去连库：连库本身也有成本，
+	// 而且能列出表名这件事本身就是信息泄露。
+	if !h.allowed(uid, ds.ID, db, "*") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "no permission on this database"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), catalogTimeout)
+	defer cancel()
+
+	ad, err := h.Factory(ds.ID)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "无法读取表结构：" + err.Error()})
+		return
+	}
+	defer ad.Close()
+
+	// 不支持批量能力的适配器（Mongo / Redis）不报错，返回空清单：
+	// 调用方（编辑器补全）本就不依赖它，报错只会让前端弹无意义的提示。
+	sr, ok := ad.(adapter.SchemaReader)
+	if !ok {
+		c.JSON(http.StatusOK, gin.H{"items": []adapter.TableColumns{}})
+		return
+	}
+
+	tables, err := sr.ListSchema(ctx, db)
+	if err != nil {
+		// 与库 / 表列表同理：这是故障（连不上、账号被回收），不是「没有表」，
+		// 吞成空清单会让补全静默失效且无从排查。
+		c.JSON(http.StatusBadGateway, gin.H{"error": "无法读取表结构：" + err.Error()})
+		return
+	}
+
+	// 库级通配权限已通过，理论上表级也通过；这里仍逐表再判一次，
+	// 是因为授权粒度将来若细化到表，裁剪逻辑必须已经就位。
+	out := make([]adapter.TableColumns, 0, len(tables))
+	for _, t := range tables {
+		if h.allowed(uid, ds.ID, db, t.Table) {
+			out = append(out, t)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"items": out})
+}
+
 // --- 内部实现 ---
 
 // databasesFor 返回用户可见的库名，按名称排序。
