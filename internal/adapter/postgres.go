@@ -195,6 +195,7 @@ func (a *pgAdapter) query(ctx context.Context, sqlText string, args []any, rowLi
 	if err != nil {
 		return nil, fmt.Errorf("columns: %w", err)
 	}
+	cols = dedupeColumnNames(cols)
 
 	res := &QueryResult{Columns: cols}
 	for rows.Next() {
@@ -221,3 +222,50 @@ func (a *pgAdapter) query(ctx context.Context, sqlText string, args []any, rowLi
 }
 
 func (a *pgAdapter) Close() error { return a.db.Close() }
+
+// dedupeColumnNames 给重复的列名加序号前缀，让每一列都能在结果表里被区分。
+//
+// 为什么必须做：PostgreSQL 的结果集**允许有同名的列**。
+// `SELECT * FROM app_user a INNER JOIN audit_log t ON a.id = t.actor_id`
+// 会返回两个 id、两个 created_at。前端把它当 React key 用，重复键下
+// 有一列渲染不出来；用户也无从知道哪个 id 属于哪张表。
+//
+// 为什么加序号而不是表名：database/sql 只给出列名（rows.Columns()），
+// 拿不到来源表；而列名按位置一一对应，所以按位置打序号（"1.id"、"3.created_at"）是唯一
+// 确定且不改动原名的做法。只给重名的列加前缀，其余列名保持原样——
+// 大面积改名会让用户对着结果表找不到熟悉的列名。
+func dedupeColumnNames(cols []string) []string {
+	counts := make(map[string]int, len(cols))
+	for _, c := range cols {
+		counts[c]++
+	}
+	hasDup := false
+	for _, n := range counts {
+		if n > 1 {
+			hasDup = true
+			break
+		}
+	}
+	if !hasDup {
+		return cols
+	}
+
+	out := make([]string, len(cols))
+	used := make(map[string]bool, len(cols))
+	for i, c := range cols {
+		name := c
+		if counts[c] > 1 {
+			// 序号用 1 起的位置编号，重名列之间天然不同；
+			// 再加 while 兜住「库里本来就有叫 1.id 的列」这种极端情况。
+			for suffix := i + 1; ; suffix++ {
+				name = fmt.Sprintf("%d.%s", suffix, c)
+				if !used[name] {
+					break
+				}
+			}
+		}
+		used[name] = true
+		out[i] = name
+	}
+	return out
+}

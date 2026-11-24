@@ -619,6 +619,11 @@ export default function QueryPage() {
         rowKey={(_, i) => String(i)}
         dataSource={result.rows.map((row, i) => ({ __idx: i, row }))}
         columns={result.columns.map((col, ci) => ({
+          // key 用下标而不是列名：联表查询（SELECT * FROM a JOIN b）里
+          // 同名列完全合法，用列名做 key 会让 antd 把两列当成同一个，
+          // 表现为其中一列渲染出错或串值。后端已对重名列加位置前缀，
+          // 这里再用下标兜一层，任何情况下都不会撞。
+          key: ci,
           title: col,
           dataIndex: ['row', ci],
           ellipsis: true,
