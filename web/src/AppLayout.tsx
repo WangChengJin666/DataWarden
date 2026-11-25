@@ -1,5 +1,6 @@
 import { useMemo } from 'react'
 import { Layout, Menu, Dropdown, Avatar, Space, Tag, Typography } from 'antd'
+import type { MenuProps } from 'antd'
 import {
   DatabaseOutlined,
   FileProtectOutlined,
@@ -8,6 +9,8 @@ import {
   UserOutlined,
   AuditOutlined,
   SafetyCertificateOutlined,
+  TeamOutlined,
+  UsergroupAddOutlined,
 } from '@ant-design/icons'
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { clearSession, getCurrentUser } from '@/api/client'
@@ -26,12 +29,19 @@ export default function AppLayout() {
   const loc = useLocation()
   const user = getCurrentUser()
   const isDBA = ['dba', 'superadmin'].includes(user?.role ?? '')
+  // 账号管理单独一档权限：dba 不能管账号，否则能把自己提成 superadmin
+  const isSuperAdmin = user?.role === 'superadmin'
 
   const items = useMemo(() => {
     // 数据源管理只对 DBA / 超级管理员开放：
     // 里面是主机、端口、库名、连接账号和密码配置，开发者用不到，
     // 也不该看到。不放在菜单里，避免点进去才发现无权操作。
-    const base = [
+    //
+    // 显式声明为 MenuProps['items']：让「带 icon 的菜单项」与
+    // 「带字符串 label 的分组」能放进同一个数组。让 TS 自行推断时，
+    // 数组元素类型会被首个元素锁定成 { icon: Element; label: Element }，
+    // 后面 push 分组项就会报「string 不能赋给 Element」。
+    const base: MenuProps['items'] = [
       { key: '/query', icon: <SearchOutlined />, label: <Link to="/query">数据查询</Link> },
       { key: '/apply', icon: <FileProtectOutlined />, label: <Link to="/apply">申请授权</Link> },
     ]
@@ -54,8 +64,24 @@ export default function AppLayout() {
         },
       )
     }
+    // 账号管理只给超级管理员：组与用户是整个平台的权限底座，
+    // dba 拿不到，避免「dba 给自己提权」这条路径。
+    if (isSuperAdmin) {
+      base.push({
+        type: 'group' as const,
+        label: '系统管理',
+        children: [
+          {
+            key: '/users',
+            icon: <UsergroupAddOutlined />,
+            label: <Link to="/users">用户管理</Link>,
+          },
+          { key: '/groups', icon: <TeamOutlined />, label: <Link to="/groups">组管理</Link> },
+        ],
+      })
+    }
     return base
-  }, [isDBA])
+  }, [isDBA, isSuperAdmin])
 
   const logout = () => {
     clearSession()

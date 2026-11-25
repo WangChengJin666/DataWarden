@@ -6,6 +6,7 @@ import ApplyPage from './pages/ApplyPage'
 import DatasourcePage from './pages/DatasourcePage'
 import ReviewPage from './pages/ReviewPage'
 import GrantsPage from './pages/GrantsPage'
+import GroupsPage from './pages/GroupsPage'
 import { getCurrentUser, getToken } from './api/client'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -22,6 +23,17 @@ function RequireDBA({ children }: { children: React.ReactNode }) {
   const role = getCurrentUser()?.role ?? ''
   if (!['dba', 'superadmin'].includes(role)) {
     return <Navigate to="/apply" replace />
+  }
+  return <>{children}</>
+}
+
+// RequireSuperAdmin 拦住直接输入 /users、/groups 地址的非超管。
+// 菜单里已经隐藏了入口，这里是第二道：后端接口同样只对超管开放，
+// 前端拦不拦都不影响安全，但能让用户看到明确的重定向而不是一片报错。
+function RequireSuperAdmin({ children }: { children: React.ReactNode }) {
+  const role = getCurrentUser()?.role ?? ''
+  if (role !== 'superadmin') {
+    return <Navigate to="/query" replace />
   }
   return <>{children}</>
 }
@@ -56,6 +68,14 @@ export default function App() {
             <RequireDBA>
               <GrantsPage />
             </RequireDBA>
+          }
+        />
+        <Route
+          path="groups"
+          element={
+            <RequireSuperAdmin>
+              <GroupsPage />
+            </RequireSuperAdmin>
           }
         />
       </Route>
