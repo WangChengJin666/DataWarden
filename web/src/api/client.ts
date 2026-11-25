@@ -10,8 +10,13 @@ import type {
   LoginResponse,
   QueryResult,
   RedisQueryResult,
+  Role,
   TableColumns,
   TestConnResult,
+  UserFilter,
+  UserGroup,
+  UserStatus,
+  UserView,
 } from './types'
 
 const TOKEN_KEY = 'dw_token'
@@ -284,4 +289,98 @@ export async function executeMongo(payload: {
 }): Promise<QueryResult> {
   const { data } = await http.post<QueryResult>('/query/mongo', payload)
   return data
+}
+
+// ---------- 组管理（仅超级管理员） ----------
+
+export async function listGroups(): Promise<UserGroup[]> {
+  const { data } = await http.get<{ items: UserGroup[] }>('/groups')
+  return data.items ?? []
+}
+
+export async function createGroup(input: {
+  name: string
+  description: string
+}): Promise<number> {
+  const { data } = await http.post<{ id: number }>('/groups', input)
+  return data.id
+}
+
+export async function updateGroup(
+  id: number,
+  input: { name: string; description: string },
+): Promise<void> {
+  await http.put(`/groups/${id}`, input)
+}
+
+/**
+ * 删除组。
+ *
+ * 组员不会被删除，只会变成「未分组」——后端靠外键 ON DELETE SET NULL 保证。
+ * 前端文案要如实说明，否则管理员会以为人也没了。
+ */
+export async function deleteGroup(id: number): Promise<void> {
+  await http.delete(`/groups/${id}`)
+}
+
+// ---------- 用户管理（仅超级管理员） ----------
+
+export async function listUsers(filter: UserFilter = {}): Promise<UserView[]> {
+  const params: Record<string, string> = {}
+  if (filter.keyword) params.keyword = filter.keyword
+  if (filter.role) params.role = filter.role
+  if (filter.status?.length) params.status = filter.status.join(',')
+  if (filter.ungrouped) params.ungrouped = '1'
+  else if (filter.group_id != null) params.group_id = String(filter.group_id)
+
+  const { data } = await http.get<{ items: UserView[] }>('/users', { params })
+  return data.items ?? []
+}
+
+/**
+ * 新建用户。
+ *
+ * 密码由后端随机生成，返回体里的 password 是明文唯一一次出现的地方：
+ * 调用方必须立刻展示给管理员转交，绝不能存到 localStorage / sessionStorage。
+ */
+export async function createUser(input: {
+  username: string
+  email: string
+  role: Role
+  status?: Exclude<UserStatus, 'deleted'>
+  group_id?: number | null
+}): Promise<{ id: number; password: string }> {
+  const { data } = await http.post<{ id: number; password: string }>('/users', input)
+  return data
+}
+
+export async function updateUser(
+  id: number,
+  input: { email: string; role: Role; group_id?: number | null },
+): Promise<void> {
+  await http.put(`/users/${id}`, input)
+}
+
+export async function setUserStatus(
+  id: number,
+  status: Exclude<UserStatus, 'deleted'>,
+): Promise<void> {
+  await http.post(`/users/${id}/status`, { status })
+}
+
+/** 重置密码，返回新的明文密码（只此一次）。 */
+export async function resetUserPassword(id: number): Promise<string> {
+  const { data } = await http.post<{ password: string }>(`/users/${id}/reset-password`)
+  return data.password
+}
+
+/**
+ * 逻辑删除用户。
+ *
+ * 不是物理删除：历史授权与审批记录保留在其用户 ID 下，
+ * 用户名会被改写为 `<原名>#deleted#<ID>`，原名立即可分配给新账号。
+ * 不可恢复。
+ */
+export async function deleteUser(id: number): Promise<void> {
+  await http.delete(`/users/${id}`)
 }

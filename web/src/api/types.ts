@@ -212,3 +212,43 @@ export interface TableColumns {
   table: string
   columns: string[]
 }
+
+/** 账号状态。deleted 是逻辑删除：行保留、用户名被改写、不可恢复。 */
+export type UserStatus = 'active' | 'disabled' | 'deleted'
+
+/**
+ * 用户组（部门）。
+ *
+ * 组只做归类，不承载任何数据权限——权限仍由「角色 + 个人授权」决定。
+ */
+export interface UserGroup {
+  id: number
+  name: string
+  description: string
+  /** 组内人数，不含已删除账号 */
+  member_count: number
+  created_at: string
+}
+
+/** 用户管理的列表行。不含 password_hash（后端从不返回）。 */
+export interface UserView {
+  id: number
+  username: string
+  email: string
+  role: Role
+  status: UserStatus
+  /** null 表示未分组 */
+  group_id: number | null
+  /** 空串表示未分组 */
+  group_name: string
+  created_at: string
+}
+
+export interface UserFilter {
+  keyword?: string
+  role?: Role | ''
+  /** 空表示默认（active + disabled）；传 ['deleted'] 才看已删除 */
+  status?: UserStatus[]
+  group_id?: number | null
+  ungrouped?: boolean
+}
