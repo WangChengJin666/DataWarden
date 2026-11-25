@@ -25,14 +25,96 @@ func (r Role) IsPrivileged() bool {
 	return r == RoleDBA || r == RoleSuperAdmin
 }
 
+// Valid 判断角色值是否属于内置角色。
+//
+// 账号管理接口必须用它校验入参：role 会直接进 SyncRoles 生成 g 段绑定，
+// 接受任意字符串就可能出现一个叫 "*" 或空串的角色。空串在 SyncRoles 里
+// 会被跳过（表现为「设了角色却没有权限」），而 "*" 之类的值会安静地留在
+// 策略表里，排查时没人会想到去看一个不存在的角色名。
+func (r Role) Valid() bool {
+	switch r {
+	case RoleDeveloper, RoleDBA, RoleSuperAdmin:
+		return true
+	}
+	return false
+}
+
 type User struct {
-	ID           int64     `json:"id"`
-	Username     string    `json:"username"`
-	Email        string    `json:"email"`
-	PasswordHash string    `json:"-"` // 绝不序列化到响应
-	Role         Role      `json:"role"`
-	Status       string    `json:"status"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID           int64      `json:"id"`
+	Username     string     `json:"username"`
+	Email        string     `json:"email"`
+	PasswordHash string     `json:"-"` // 绝不序列化到响应
+	Role         Role       `json:"role"`
+	Status       UserStatus `json:"status"`
+	// GroupID 为 nil 表示未分组。用指针而不是 0：
+	// 0 会被当成「组 id 是 0」这种不存在的组，而 nil 明确表示「没有归属」。
+	GroupID   *int64    `json:"group_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// UserStatus 是账号状态。用字符串类型而不是裸 string，
+// 是为了让「哪些值是合法的」有一个统一入口，不必在每个 handler 里重复 switch。
+type UserStatus string
+
+const (
+	StatusActive   UserStatus = "active"
+	StatusDisabled UserStatus = "disabled"
+	// StatusDeleted 是逻辑删除标记：行保留、授权与单据保留、用户名被改写。
+	//
+	// 为什么用 status 的一个取值，而不是新增 deleted_at 列：
+	// 现有所有身份查询（AllRoles、FindByUsername）都写成 status = 'active'，
+	// 新增一个取值天然被排除，一处代码都不用改。若新增独立列，
+	// 每条查询都要补 deleted_at IS NULL，漏一处就是「已删账号还能登录、
+	// 还能查数据」，而且不会有任何报错提示。
+	StatusDeleted UserStatus = "deleted"
+)
+
+// Valid 判断状态值是否合法（含 deleted，用于读取侧校验）。
+func (s UserStatus) Valid() bool {
+	switch s {
+	case StatusActive, StatusDisabled, StatusDeleted:
+		return true
+	}
+	return false
+}
+
+// Assignable 判断该状态能否由「新建用户」或「修改状态」接口写入。
+//
+// deleted 只能由删除接口产生：如果允许调用方直接设成 deleted，
+// 「删除」就退化成一个名字很吓人的停用，而它其实还改写了用户名、不可恢复。
+func (s UserStatus) Assignable() bool {
+	return s == StatusActive || s == StatusDisabled
+}
+
+// UserGroup 是用户所属的组，语义等同部门。
+//
+// 组只做归类，不承载任何数据权限：授权仍由「用户角色 + 个人授权」决定。
+// 若哪天要在组上挂授权，必须同时改 querysvc 的鉴权与 SyncGrants，
+// 否则会出现「组里加人却不生效」的静默错误。
+type UserGroup struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// MemberCount 是该组下的用户数（含已停用，不含已删除）。
+	// 列表页要显示「几人」，单独发一个计数请求会变成 N+1。
+	MemberCount int       `json:"member_count"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// UserView 是用户管理的列表 / 详情视图：在 User 之上补组名。
+//
+// 不直接复用 User：User 是登录链路用的模型，给它塞联表结果会让
+// 「登录时多查一次组」这种无意义的开销渗进去。列表还要展示组名，
+// 只有 group_id 没法用。
+type UserView struct {
+	ID        int64      `json:"id"`
+	Username  string     `json:"username"`
+	Email     string     `json:"email"`
+	Role      Role       `json:"role"`
+	Status    UserStatus `json:"status"`
+	GroupID   *int64     `json:"group_id"`
+	GroupName string     `json:"group_name"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 // DatasourceType 决定用哪个 Adapter 实现。

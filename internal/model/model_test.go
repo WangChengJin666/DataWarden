@@ -155,3 +155,46 @@ func TestDatasourceWithPlainPassword_NoPasswordNoField(t *testing.T) {
 		t.Fatalf("unexpected password field for empty password: %s", b)
 	}
 }
+
+func TestRole_Valid(t *testing.T) {
+	cases := map[Role]bool{
+		RoleDeveloper:  true,
+		RoleDBA:        true,
+		RoleSuperAdmin: true,
+		"":             false,
+		"*":            false,
+		"admin":        false,
+	}
+	for role, want := range cases {
+		if got := role.Valid(); got != want {
+			t.Errorf("Role(%q).Valid() = %v, want %v", role, got, want)
+		}
+	}
+}
+
+func TestUserStatus_Valid(t *testing.T) {
+	cases := map[string]bool{
+		string(StatusActive):   true,
+		string(StatusDisabled): true,
+		string(StatusDeleted):  true,
+		"active ":              false,
+		"DELETED":              false,
+		"":                     false,
+	}
+	for s, want := range cases {
+		if got := UserStatus(s).Valid(); got != want {
+			t.Errorf("UserStatus(%q).Valid() = %v, want %v", s, got, want)
+		}
+	}
+}
+
+// Assignable 只接受「可主动指派」的状态：deleted 由删除接口写入，
+// 不能让改状态接口把它当成一个普通状态。
+func TestUserStatus_Assignable(t *testing.T) {
+	if !StatusActive.Assignable() || !StatusDisabled.Assignable() {
+		t.Error("active / disabled 应当可指派")
+	}
+	if StatusDeleted.Assignable() {
+		t.Error("deleted 不应可指派")
+	}
+}

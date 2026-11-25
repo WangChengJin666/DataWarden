@@ -23,7 +23,7 @@ func (s *UserStore) Create(ctx context.Context, u *model.User) (int64, error) {
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO app_user (username, email, password_hash, role, status)
 		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-		u.Username, u.Email, u.PasswordHash, string(u.Role), orActive(u.Status),
+		u.Username, u.Email, u.PasswordHash, string(u.Role), orActive(string(u.Status)),
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("insert user: %w", err)
@@ -77,7 +77,7 @@ func (s *UserStore) AllRoles(ctx context.Context) (map[int64]string, error) {
 
 func orActive(status string) string {
 	if status == "" {
-		return "active"
+		return string(model.StatusActive)
 	}
 	return status
 }
