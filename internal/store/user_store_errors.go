@@ -1,6 +1,10 @@
 package store
 
-import "errors"
+import (
+	"errors"
+
+	appmodel "github.com/opensourceprj/datawarden/internal/model"
+)
 
 // 账号管理相关的哨兵错误。handler 靠它们映射 HTTP 状态码，
 // 而不是解析错误文本——文本是给人看的，随时会改。
@@ -21,4 +25,11 @@ var (
 	// 而且它的含义是「凭据不对」，与「这个人不存在」是两件事。
 	// 注意 handler 回给前端的文案不要区分这两种情况的具体原因。
 	ErrOldPasswordMismatch = errors.New("old password mismatch")
+
+	// 登录相关的两个分类错误定义在 model 包：httpapi 需要识别它们，
+	// 而 httpapi → store 是单向依赖，不能反过来。这里用别名导出，
+	// 保持 store 调用方（含测试）仍可按 store.ErrLoginUserNotFound 书写，
+	// 同时保证与 handler 里 errors.Is 比较的是同一个值。
+	ErrLoginUserNotFound    = appmodel.ErrLoginUserNotFound
+	ErrLoginAccountInactive = appmodel.ErrLoginAccountInactive
 )

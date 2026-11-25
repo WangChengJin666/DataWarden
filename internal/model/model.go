@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // Role 是用户角色。审批权限绑定在 dba 上，不引入独立流程引擎。
 type Role string
@@ -62,10 +65,13 @@ const (
 	// StatusDeleted 是逻辑删除标记：行保留、授权与单据保留、用户名被改写。
 	//
 	// 为什么用 status 的一个取值，而不是新增 deleted_at 列：
-	// 现有所有身份查询（AllRoles、FindByUsername）都写成 status = 'active'，
-	// 新增一个取值天然被排除，一处代码都不用改。若新增独立列，
-	// 每条查询都要补 deleted_at IS NULL，漏一处就是「已删账号还能登录、
-	// 还能查数据」，而且不会有任何报错提示。
+	// 除了登录链路，所有身份查询（AllRoles、List、Get）都写成
+	// status = 'active' 或显式指定状态集合，新增一个取值天然被排除。
+	// 若新增独立列，每条查询都要补 deleted_at IS NULL，漏一处就是
+	// 「已删账号还能登录、还能查数据」，而且不会有任何报错提示。
+	//
+	// 登录的 FindByUsername 是例外：它要区分「用户不存在」与「账号已停用」，
+	// 因此改为按用户名查、再判断状态是否 active，不再依赖 SQL 过滤。
 	StatusDeleted UserStatus = "deleted"
 )
 
@@ -326,3 +332,24 @@ type GrantRequest struct {
 	GrantID        *int64             `json:"grant_id,omitempty"`
 	CreatedAt      time.Time          `json:"created_at"`
 }
+
+// 登录失败的分类错误。
+//
+// 放在 model 而不是 store：httpapi 通过接口依赖数据层，不能反过来 import store
+// （会成环），而它又必须能区分这几种失败给出不同提示。model 是两边都已依赖的
+// 唯一公共位置，错误语义本身也确实是领域概念。
+//
+// 这里有意的取舍：允许用户名枚举。产品要求「密码错了就说是密码错」，
+// 而不是笼统回「invalid credentials」——后者让停用账号的用户对着正确密码
+// 反复重试，也分不清是记错密码还是账号被停。
+var (
+	// ErrLoginUserNotFound 表示用户名不存在。
+	ErrLoginUserNotFound = errors.New("login user not found")
+	// ErrLoginAccountInactive 表示用户名存在但账号已停用或已删除。
+	ErrLoginAccountInactive = errors.New("login account is inactive")
+	// ErrWrongPassword 表示用户名存在、账号可用，但密码不匹配。
+	//
+	// 由 handler 在 bcrypt 校验失败时返回，不由 store 产生：
+	// store 只负责取哈希，密码学上的判定属于 auth/handler 层。
+	ErrWrongPassword = errors.New("wrong password")
+)

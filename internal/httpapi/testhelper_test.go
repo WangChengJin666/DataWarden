@@ -20,7 +20,7 @@ type memUsers struct {
 func (m *memUsers) FindByUsername(ctx context.Context, username string) (int64, string, string, error) {
 	pw, ok := m.passwords[username]
 	if !ok {
-		return 0, "", "", errors.New("not found")
+		return 0, "", "", model.ErrLoginUserNotFound
 	}
 	hash, err := auth.HashPassword(pw)
 	if err != nil {

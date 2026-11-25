@@ -2,14 +2,18 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/opensourceprj/datawarden/internal/auth"
 	"github.com/opensourceprj/datawarden/internal/model"
 )
 
@@ -26,6 +30,13 @@ func TestLogin_RejectsBadCredentials(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
+	// 用户名存在但密码不对，提示必须是「密码错误」，
+	// 不能是「用户不存在」——否则用户会以为自己账号被删了。
+	var resp map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "密码错误" {
+		t.Errorf("error = %q, want 密码错误", resp["error"])
+	}
 }
 
 func TestLogin_RejectsUnknownUser(t *testing.T) {
@@ -41,11 +52,11 @@ func TestLogin_RejectsUnknownUser(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
-	// 错误信息不能泄露用户是否存在
+	// 用户名不存在与密码错误的提示必须不同（产品决定允许区分）
 	var resp map[string]string
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["error"] != "invalid credentials" {
-		t.Errorf("error message should be generic, got %q", resp["error"])
+	if resp["error"] != "用户不存在" {
+		t.Errorf("error = %q, want 用户不存在", resp["error"])
 	}
 }
 
@@ -86,6 +97,72 @@ func TestLogin_RejectsMissingFields(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+// failingLookup 返回预设错误，用于覆盖「账号停用」与「数据库故障」两条分支。
+type failingLookup struct {
+	err error
+}
+
+func (f *failingLookup) FindByUsername(ctx context.Context, _ string) (int64, string, string, error) {
+	return 0, "", "", f.err
+}
+
+// 停用账号与「用户不存在」必须是不同提示：否则用户拿着正确密码
+// 一直重试，永远不知道是账号被停用了。
+func TestLogin_RejectsInactiveAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	issuer := auth.NewTokenIssuer("test-secret", time.Hour)
+	r := NewRouter(Deps{
+		Issuer: issuer,
+		AuthHandler: &AuthHandler{
+			Users:  &failingLookup{err: model.ErrLoginAccountInactive},
+			Issuer: issuer,
+		},
+		Datasource: &DatasourceHandler{Store: &memDatasources{}},
+		Query:      &QueryHandler{},
+	})
+
+	body := bytes.NewBufferString(`{"username":"alice","password":"correct"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/login", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+	var resp map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !strings.Contains(resp["error"], "停用") {
+		t.Errorf("error = %q, want it to mention 停用", resp["error"])
+	}
+}
+
+// 数据库故障不能被伪装成「凭据错误」：那样用户会一直重试，
+// 运维也看不到真实原因。
+func TestLogin_StoreFailureIs500(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	issuer := auth.NewTokenIssuer("test-secret", time.Hour)
+	r := NewRouter(Deps{
+		Issuer: issuer,
+		AuthHandler: &AuthHandler{
+			Users:  &failingLookup{err: errors.New("connection refused")},
+			Issuer: issuer,
+		},
+		Datasource: &DatasourceHandler{Store: &memDatasources{}},
+		Query:      &QueryHandler{},
+	})
+
+	body := bytes.NewBufferString(`{"username":"alice","password":"correct"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/login", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
 	}
 }
 

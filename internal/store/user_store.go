@@ -58,30 +58,40 @@ func (s *UserStore) Create(ctx context.Context, u *model.User) (int64, error) {
 //
 // 只返回 status='active' 的用户，禁用与已删除账号无法登录。
 //
-// 为什么错误里不带原因（"user not found" vs "user is disabled"）：
-// 登录失败必须是黑盒。若区分「用户不存在」与「账号已停用」，
-// 攻击者就能用一串用户名探出哪些账号真实存在、哪些已被清理，
-// 这本身就是信息泄露。handler 对任何错误都回「invalid credentials」，
-// 所以这里的措辞只需要服务内部排错够用即可，不要写得更有区分度。
+// 关于错误区分度：登录失败的提示按产品决定区分原因（用户名不存在 / 账号停用 /
+// 密码错误），因此这里必须返回可识别的哨兵错误，而不是笼统的 fmt.Errorf。
+// 代价是用户名可被枚举，收益是用户不会对着正确密码反复重试却不知道是账号被停用。
+//
+// 为什么不再用 `WHERE username = $1 AND status = 'active'` 一次查完：
+// 那样「查不到」这一种错误里混了三种原因（没这个人、已停用、已删除），
+// 上层就无法给出正确的提示。改成按用户名查、把状态一并取出来再判断，
+// 代价是停用账号的哈希也读了一次——但没有泄露，因为返回前就拒掉了。
 func (s *UserStore) FindByUsername(ctx context.Context, username string) (int64, string, string, error) {
 	var (
-		id   int64
-		hash string
-		role string
+		id     int64
+		hash   string
+		role   string
+		status string
 	)
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, password_hash, role FROM app_user
-		 WHERE username = $1 AND status = 'active'`,
+		`SELECT id, password_hash, role, status FROM app_user WHERE username = $1`,
 		username,
-	).Scan(&id, &hash, &role)
+	).Scan(&id, &hash, &role, &status)
 	if err != nil {
 		// 必须用 errors.Is：pgx 各版本对 ErrNoRows 的包装方式不同，
 		// `err == pgx.ErrNoRows` 在包装后会失效，进而把「用户不存在」
-		// 当成数据库故障上报 500，登录页会显示「服务器错误」而不是「凭据无效」。
+		// 当成数据库故障上报 500，登录页会显示「服务器错误」而不是「登录失败」。
 		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, "", "", fmt.Errorf("user %q not found", username)
+			return 0, "", "", ErrLoginUserNotFound
 		}
 		return 0, "", "", fmt.Errorf("query user: %w", err)
+	}
+
+	// 停用与已删除都归为「账号不可用」。两者都不该透露过多细节
+	// （尤其是已删除账号的用户名已被改写，正常输入根本不会命中），
+	// 但必须与「密码错误」分开，否则停用账号的人会一直怀疑自己记错密码。
+	if model.UserStatus(status) != model.StatusActive {
+		return 0, "", "", ErrLoginAccountInactive
 	}
 	return id, hash, role, nil
 }

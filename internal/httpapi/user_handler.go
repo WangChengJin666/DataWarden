@@ -117,8 +117,9 @@ func (h *SelfPasswordHandler) ChangeOwnPassword(c *gin.Context) {
 	// 「token 里的 uid 一定还存在」——查不到就是账号在此期间被删了。
 	//
 	// 为什么不直接用 uid + 一个新 store 方法读哈希：这样做会让 SelfPasswordLookup
-	// 与登录链路共用 FindByUsername，登录那里「status='active' 才返回」的过滤
-	// 正好也符合这里的需要（停用账号不该改密码，他又登不进来）。
+	// 与登录链路共用 FindByUsername，那个方法现在会返回分类错误
+	// （不存在 / 已停用），两种在这里都意味着「不该继续改密码」，
+	// 因此只需判断 err != nil 即可，不需要分辨具体是哪一种。
 	_, _, _, err := h.Users.FindByUsername(c.Request.Context(), username)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "账号不存在或已停用，请重新登录"})
