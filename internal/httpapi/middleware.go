@@ -56,6 +56,46 @@ func requireDBAMiddleware() gin.HandlerFunc {
 	}
 }
 
+// requireSuperAdminMiddleware 在路由层拦下非超级管理员的账号管理请求。
+//
+// 为什么账号管理不走 Casbin 而直接判角色：
+// Casbin 的策略主体来自 app_user.role（SyncRoles 每次重建），
+// 而账号管理本身就在改 app_user。用被管理的数据判断「谁有权管理它」，
+// 一旦策略重建那一步出问题（清空 p 段、漏调 reAddBuiltinPolicies），
+// 就会出现「所有人都进不了用户管理」——连修账号的入口都没了。
+// 角色判定只是一次字符串比较，加一层中间件足够，且不引入依赖。
+//
+// 也不给 dba 开放：dba 已经能改数据源、能审批，再给账号管理，
+// 他可以直接把自己提成 superadmin，角色分级就失效了。
+func requireSuperAdminMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		_, _, role := currentUser(c)
+		if role != string(model.RoleSuperAdmin) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error": "forbidden: only superadmin can manage accounts",
+			})
+			return
+		}
+		c.Next()
+	}
+}
+
+// requireSuperAdmin 是 handler 内的第二道校验，与 requireDBA 同样的写法。
+//
+// 路由层已经拦过一次，这里再来一次是为了防止将来有人把 handler
+// 挂到别的 group 上——那样路由层的保护就悄悄失效了，而 handler
+// 内的判断仍然有效。返回 false 时已写入响应。
+func requireSuperAdmin(c *gin.Context) (int64, string, bool) {
+	uid, username, role := currentUser(c)
+	if role != string(model.RoleSuperAdmin) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "forbidden: only superadmin can manage accounts",
+		})
+		return 0, "", false
+	}
+	return uid, username, true
+}
+
 // currentUser 取出中间件写入的身份。未鉴权路由调用时返回零值。
 func currentUser(c *gin.Context) (int64, string, string) {
 	var id int64

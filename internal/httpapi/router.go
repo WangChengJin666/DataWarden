@@ -15,6 +15,9 @@ type Deps struct {
 	Grant       *GrantHandler
 	Metadata    *MetadataHandler
 	Redis       *RedisHandler
+	// Group / User 是账号管理（组与用户），仅 superadmin 可用
+	Group *GroupHandler
+	User  *UserHandler
 	// Auditor 用于记录数据源管理与审批动作，可为 nil
 	Auditor EventRecorder
 }
@@ -86,6 +89,26 @@ func NewRouter(d Deps) *gin.Engine {
 			// 「我能查哪些数据源」：查询页的下拉用这个，不能给开发者开
 			// GET /datasources（那条限 DBA 且含 host/port/username）。
 			authed.GET("/grants/mine", d.Grant.ListMine)
+		}
+
+		// 账号管理：组与用户。仅 superadmin。
+		//
+		// 逐个路由挂中间件而不是用一个子 group：/datasources 那一片也是
+		// 逐个挂 requireDBAMiddleware，保持一致；子 group 少写几行，
+		// 但会让「这条路由到底受不受保护」需要往上翻一层才能确认。
+		if d.Group != nil {
+			authed.GET("/groups", requireSuperAdminMiddleware(), d.Group.List)
+			authed.POST("/groups", requireSuperAdminMiddleware(), d.Group.Create)
+			authed.PUT("/groups/:id", requireSuperAdminMiddleware(), d.Group.Update)
+			authed.DELETE("/groups/:id", requireSuperAdminMiddleware(), d.Group.Delete)
+		}
+		if d.User != nil {
+			authed.GET("/users", requireSuperAdminMiddleware(), d.User.List)
+			authed.POST("/users", requireSuperAdminMiddleware(), d.User.Create)
+			authed.PUT("/users/:id", requireSuperAdminMiddleware(), d.User.Update)
+			authed.DELETE("/users/:id", requireSuperAdminMiddleware(), d.User.Delete)
+			authed.POST("/users/:id/status", requireSuperAdminMiddleware(), d.User.SetStatus)
+			authed.POST("/users/:id/reset-password", requireSuperAdminMiddleware(), d.User.ResetPassword)
 		}
 	}
 	return r
