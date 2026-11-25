@@ -28,6 +28,10 @@ type fakeUserStore struct {
 	lastHash     string
 	lastRole     model.Role
 	err          error
+
+	// 以下字段供自己改密码的测试使用。
+	currentHash  string // 库里「当前」的密码哈希
+	changeCalled bool   // ChangePassword 是否被调用过
 }
 
 func (f *fakeUserStore) List(_ context.Context, filter store.UserFilter) ([]model.UserView, error) {
@@ -72,6 +76,17 @@ func (f *fakeUserStore) ResetPassword(_ context.Context, _ int64, hash string) e
 
 func (f *fakeUserStore) SoftDelete(context.Context, int64) error {
 	f.deleteCalled = true
+	return f.err
+}
+
+// ChangePassword 记录新哈希，并如实调用 verify：改密 handler 的
+// 「旧密码错」分支靠它触发，跳过 verify 就永远测不到那条路径。
+func (f *fakeUserStore) ChangePassword(_ context.Context, _ int64, verify func(string) bool, newHash string) error {
+	f.changeCalled = true
+	if !verify(f.currentHash) {
+		return store.ErrOldPasswordMismatch
+	}
+	f.lastHash = newHash
 	return f.err
 }
 

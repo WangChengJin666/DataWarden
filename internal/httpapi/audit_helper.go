@@ -191,6 +191,9 @@ func writeBindError(c *gin.Context, err error) {
 var publicFieldNames = map[string]struct{}{
 	"username": {}, "email": {}, "role": {}, "status": {}, "group_id": {},
 	"name": {}, "description": {},
+	// old_password / new_password 是自己改密码的字段。只把字段名放进白名单，
+	// 值永远不会出现在提示里——writeBindError 只输出名字。
+	"old_password": {}, "new_password": {},
 }
 
 // isPublicField 判断该 JSON 字段名是否允许出现在响应里。
@@ -208,6 +211,7 @@ func publicFieldName(structField string) (string, bool) {
 		reflect.TypeOf(createUserReq{}),
 		reflect.TypeOf(updateUserReq{}),
 		reflect.TypeOf(groupReq{}),
+		reflect.TypeOf(changeOwnPasswordReq{}),
 	}
 	for _, t := range types {
 		f, ok := t.FieldByName(structField)

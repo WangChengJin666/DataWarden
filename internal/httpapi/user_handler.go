@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -30,6 +31,148 @@ type UserStore interface {
 	SetStatus(ctx context.Context, id int64, status model.UserStatus) error
 	ResetPassword(ctx context.Context, id int64, passwordHash string) error
 	SoftDelete(ctx context.Context, id int64) error
+	// ChangePassword 校验当前密码后写入新哈希。verify 收到的参数是库里当前的哈希，
+	// 由 handler 决定怎么比对（store 不引 bcrypt）。
+	ChangePassword(ctx context.Context, id int64, verify func(currentHash string) bool, newHash string) error
+}
+
+// SelfPasswordLookup 是「自己改密码」需要的最小存储能力。
+//
+// 单独定义而不用整个 UserStore：这条路径对 dba / developer 也开放，
+// 只依赖一个方法能让「它到底读了写哪些字段」在签名上一目了然，
+// 测试里也不必为它实现整套账号管理接口。
+type SelfPasswordLookup interface {
+	FindByUsername(ctx context.Context, username string) (id int64, hash, role string, err error)
+	ChangePassword(ctx context.Context, id int64, verify func(currentHash string) bool, newHash string) error
+}
+
+// SelfPasswordHandler 提供「修改自己的密码」。
+//
+// 与 UserHandler 分开而不是并进 doUpdateUser：UserHandler 的所有路由都挂在
+// requireSuperAdminMiddleware 上，把一条「所有角色都能调」的接口放进去，
+// 迟早会有人顺手挂在同一个 group 下——那样只有超管能改自己的密码，
+// 而且是静默的（超管自己测一遍永远通过）。单独一个 handler，路由注册处
+// 一眼就能看出它不挂角色中间件。
+type SelfPasswordHandler struct {
+	Users SelfPasswordLookup
+	// OnPasswordChange 在改密成功后触发，默认为 nil（当前没有 token 吊销机制）。
+	//
+	// 保留这个钩子是为了把「改密后会不会踢掉其他会话」变成一个显式的装配决定：
+	// 现在不传，等于承认「旧 token 在剩余有效期内仍然可用」。
+	// 将来若引入密码版本号/黑名单，改装配即可，不必改 handler。
+	OnPasswordChange func(ctx context.Context, userID int64)
+}
+
+// minPasswordLen / maxPasswordLen 是自己设置的密码长度范围。
+//
+// 最小 8 位：这条路径是人自己定的密码，不再有「随机生成 12 位」兜底，
+// 8 位是当前能接受的下限（与 NIST 对用户自选密码的通行下限一致）。
+// 最大 72 位是 bcrypt 的硬限制——它只看前 72 字节，超长部分被静默丢弃，
+// 用户会以为「我设了 100 位很安全」，实际后半段毫无作用。前端也拦一道，
+// 这里拦是为了防止直接调接口。
+const (
+	minPasswordLen = 8
+	maxPasswordLen = 72
+)
+
+type changeOwnPasswordReq struct {
+	OldPassword string `json:"old_password" binding:"required"`
+	NewPassword string `json:"new_password" binding:"required"`
+}
+
+// ChangeOwnPassword 修改当前登录用户的密码。
+//
+// 为什么必须校验旧密码：光有 token 不够。token 会出现在浏览器存储、
+// 代理日志、被抓包的请求头里；只凭 token 就能改密码，等于「谁拿到 token
+// 谁就能把账号改成自己的」。校验旧密码把攻击面收回到「知道当前密码」。
+//
+// 已知取舍：改密后**不会**吊销已签发的 token（本项目 JWT 无版本号/黑名单），
+// 其他设备上的会话最多还能用到原 token 的 12 小时有效期结束。
+// 与「停用/删除账号后查询立刻 403、但已签发 token 12 小时内仍能过鉴权」是同一口径。
+func (h *SelfPasswordHandler) ChangeOwnPassword(c *gin.Context) {
+	uid, username, _ := currentUser(c)
+	if uid == 0 || username == "" {
+		// 走到这里说明路由没挂 AuthMiddleware。按未鉴权处理，不要继续往下走——
+		// 否则会用一个空用户名去查库，错误信息还会指向一个莫名其妙的 404。
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+		return
+	}
+
+	var req changeOwnPasswordReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeBindError(c, err)
+		return
+	}
+	if msg := validNewPassword(req.NewPassword); msg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
+		return
+	}
+	if req.NewPassword == req.OldPassword {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "新密码不能与当前密码相同"})
+		return
+	}
+
+	// 用 token 里的 username 而不是 uid 查当前哈希：两个值是同一时刻签发的，
+	// 但 username 是登录凭据的自然主键（唯一索引），用它查不需要额外假设
+	// 「token 里的 uid 一定还存在」——查不到就是账号在此期间被删了。
+	//
+	// 为什么不直接用 uid + 一个新 store 方法读哈希：这样做会让 SelfPasswordLookup
+	// 与登录链路共用 FindByUsername，登录那里「status='active' 才返回」的过滤
+	// 正好也符合这里的需要（停用账号不该改密码，他又登不进来）。
+	_, _, _, err := h.Users.FindByUsername(c.Request.Context(), username)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "账号不存在或已停用，请重新登录"})
+		return
+	}
+
+	newHash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "hash password failed"})
+		return
+	}
+
+	err = h.Users.ChangePassword(c.Request.Context(), uid, func(hash string) bool {
+		return auth.VerifyPassword(hash, req.OldPassword)
+	}, newHash)
+	switch {
+	case errors.Is(err, store.ErrOldPasswordMismatch):
+		// 403 而不是 401：401 会被前端拦截器当成「会话失效」清掉 token 跳登录，
+		// 而用户只是把当前密码打错了——把人踢出登录页会让他更困惑。
+		c.JSON(http.StatusForbidden, gin.H{"error": "当前密码不正确"})
+		return
+	case err != nil:
+		writeStoreError(c, err)
+		return
+	}
+
+	// 审计只记「谁改了密码」，两个密码都不进审计。
+	auditAccountEvent(c, uid, username, "user.change_password", "user:"+itoaInt64(uid), nil)
+	if h.OnPasswordChange != nil {
+		h.OnPasswordChange(c.Request.Context(), uid)
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// validNewPassword 校验新密码，返回空串表示通过。
+//
+// 只做长度与首尾空白的检查，不搞「大小写+数字+符号四选三」：
+// 那套规则会把人逼成 Passw0rd! 这类可预测的组合，而本项目没有并发
+// 暴力破解入口（登录失败没有限速，但 bcrypt 成本因子本身就把离线爆破压住了）。
+// 真正的强度来自长度，所以只守下限。
+func validNewPassword(pw string) string {
+	// 首尾空白必须拦：PasswordOnceModal 之类的复制粘贴很容易带上尾随空格，
+	// 而登录页输入框不会自动 trim，用户会得到一个「刚改的密码登不进去」的谜题。
+	if strings.TrimSpace(pw) != pw {
+		return "新密码首尾不能有空白字符"
+	}
+	n := len([]rune(pw))
+	if n < minPasswordLen {
+		return "新密码至少 8 个字符"
+	}
+	if n > maxPasswordLen {
+		return "新密码不能超过 72 个字符"
+	}
+	return ""
 }
 
 // UserHandler 提供账号管理。仅 superadmin 可用（见路由中间件与 requireSuperAdmin）。

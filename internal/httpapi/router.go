@@ -18,6 +18,8 @@ type Deps struct {
 	// Group / User 是账号管理（组与用户），仅 superadmin 可用
 	Group *GroupHandler
 	User  *UserHandler
+	// SelfPassword 是「修改自己的密码」，所有已登录角色都可用，不挂角色中间件
+	SelfPassword *SelfPasswordHandler
 	// Auditor 用于记录数据源管理与审批动作，可为 nil
 	Auditor EventRecorder
 }
@@ -109,6 +111,13 @@ func NewRouter(d Deps) *gin.Engine {
 			authed.DELETE("/users/:id", requireSuperAdminMiddleware(), d.User.Delete)
 			authed.POST("/users/:id/status", requireSuperAdminMiddleware(), d.User.SetStatus)
 			authed.POST("/users/:id/reset-password", requireSuperAdminMiddleware(), d.User.ResetPassword)
+		}
+
+		// 修改自己的密码：任何已登录角色都能用，**不要**挂角色中间件。
+		// 路径放在 /me 下而不是 /users/:id/password，是为了让「只能改自己」
+		// 在 URL 上就成立——带 id 的路径总有人会试着传别人的 id。
+		if d.SelfPassword != nil {
+			authed.POST("/me/password", d.SelfPassword.ChangeOwnPassword)
 		}
 	}
 	return r

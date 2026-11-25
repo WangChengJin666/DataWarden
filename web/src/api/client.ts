@@ -395,6 +395,20 @@ export async function resetUserPassword(id: number): Promise<string> {
 }
 
 /**
+ * 修改自己的密码。
+ *
+ * 走 /me/password 而不是 /users/:id/password：后端按 token 里的身份改，
+ * 路径里不带 id，前端也就没有「传错 id 改到别人」这条路径。
+ *
+ * 成功不改本地会话：当前 token 在有效期内继续可用，用户不必重新登录。
+ * 这与「停用账号后已签发 token 仍能用满 12 小时」是同一口径的取舍，
+ * 要的是「改密不打断正在进行的操作」，代价是其他设备上的旧会话不会立刻失效。
+ */
+export async function changeOwnPassword(oldPassword: string, newPassword: string): Promise<void> {
+  await http.post('/me/password', { old_password: oldPassword, new_password: newPassword })
+}
+
+/**
  * 逻辑删除用户。
  *
  * 不是物理删除：历史授权与审批记录保留在其用户 ID 下，

@@ -478,6 +478,40 @@ func (s *UserStore) ResetPassword(ctx context.Context, id int64, passwordHash st
 	})
 }
 
+// ChangePassword 修改自己的密码：先在同一个事务里校验当前密码，再写入新哈希。
+//
+// 为什么校验与写入必须在同一个事务（且先 FOR UPDATE 锁行）：
+// 如果先在外面查哈希、校验通过、再单独 UPDATE，两条语句之间可能被管理员
+// 重置密码插入——用户 A 拿着旧密码的校验结果把密码改成 A 自己知道的值，
+// 覆盖掉管理员刚重置的密码，重置等于被静默撤销。锁住行之后，
+// 校验依据的就是「写入那一刻的哈希」，不存在这个窗口。
+//
+// 已删除账号返回 ErrUserDeleted。停用账号不拦：停用只是禁止登录，
+// 而本接口本来就需要通过鉴权（token 仍然有效），此时拦住他反而会让
+// 「被停用的人被要求找管理员改密码」——管理员该做的是重置，不是他改。
+// 而他能调通这个接口说明 token 还在有效期内，改掉密码不会提升任何权限。
+//
+// 不取超管集合锁：改密码不改变「谁是 active 超管」，与该不变式无关。
+func (s *UserStore) ChangePassword(ctx context.Context, id int64, verify func(currentHash string) bool, newHash string) error {
+	return s.withUserTx(ctx, id, true, false, func(tx pgx.Tx, _ model.UserStatus) error {
+		var current string
+		if err := tx.QueryRow(ctx,
+			`SELECT password_hash FROM app_user WHERE id = $1`, id).Scan(&current); err != nil {
+			return fmt.Errorf("query password hash: %w", err)
+		}
+		// 校验逻辑用回调传入，而不是把 bcrypt 依赖搬进 store：
+		// store 只负责持久化，密码算法属于 auth 包。
+		if !verify(current) {
+			return ErrOldPasswordMismatch
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE app_user SET password_hash = $1 WHERE id = $2`, newHash, id); err != nil {
+			return fmt.Errorf("update password: %w", err)
+		}
+		return nil
+	})
+}
+
 // SoftDelete 逻辑删除：标记 status='deleted'，并把用户名改写成
 // <原名>#deleted#<id> 以释放原名。
 //

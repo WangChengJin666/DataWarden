@@ -15,4 +15,10 @@ var (
 	ErrLastSuperAdmin = errors.New("cannot remove the last active superadmin")
 	// ErrGroupMissing 表示指定的组不存在。
 	ErrGroupMissing = errors.New("group not found")
+	// ErrOldPasswordMismatch 表示修改密码时当前密码校验失败。
+	//
+	// 单独一个哨兵而不是复用 ErrUserNotFound：这条错误要映射成 403 而不是 404，
+	// 而且它的含义是「凭据不对」，与「这个人不存在」是两件事。
+	// 注意 handler 回给前端的文案不要区分这两种情况的具体原因。
+	ErrOldPasswordMismatch = errors.New("old password mismatch")
 )

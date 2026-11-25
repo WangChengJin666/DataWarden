@@ -1,9 +1,10 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { Layout, Menu, Dropdown, Avatar, Space, Tag, Typography } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   DatabaseOutlined,
   FileProtectOutlined,
+  KeyOutlined,
   LogoutOutlined,
   SearchOutlined,
   UserOutlined,
@@ -14,6 +15,7 @@ import {
 } from '@ant-design/icons'
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { clearSession, getCurrentUser } from '@/api/client'
+import PasswordChangeModal from '@/components/PasswordChangeModal'
 
 const { Header, Sider, Content } = Layout
 const { Text } = Typography
@@ -31,6 +33,9 @@ export default function AppLayout() {
   const isDBA = ['dba', 'superadmin'].includes(user?.role ?? '')
   // 账号管理单独一档权限：dba 不能管账号，否则能把自己提成 superadmin
   const isSuperAdmin = user?.role === 'superadmin'
+  // 改密码弹窗的开关。放在顶栏而不是菜单里：这不是一个「页面」，
+  // 而是一个随时可能要用的账号操作，且所有角色都得能进。
+  const [passwordOpen, setPasswordOpen] = useState(false)
 
   const items = useMemo(() => {
     // 数据源管理只对 DBA / 超级管理员开放：
@@ -121,7 +126,16 @@ export default function AppLayout() {
         >
           <Dropdown
             menu={{
-              items: [{ key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: logout }],
+              items: [
+                {
+                  key: 'password',
+                  icon: <KeyOutlined />,
+                  label: '修改密码',
+                  onClick: () => setPasswordOpen(true),
+                },
+                { type: 'divider' },
+                { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: logout },
+              ],
             }}
           >
             <Space style={{ cursor: 'pointer' }}>
@@ -132,6 +146,7 @@ export default function AppLayout() {
               </Tag>
             </Space>
           </Dropdown>
+          <PasswordChangeModal open={passwordOpen} onClose={() => setPasswordOpen(false)} />
         </Header>
         <Content style={{ padding: 24, background: '#f5f5f5' }}>
           <Outlet />

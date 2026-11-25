@@ -148,6 +148,10 @@ func main() {
 			Enforcer: enforcer,
 		},
 		Group: &httpapi.GroupHandler{Store: groupStore},
+		// 「修改自己的密码」对所有角色开放。不传 OnPasswordChange：
+		// 当前没有 token 吊销机制，改密后已签发的 token 仍会用满有效期
+		// （与停用账号的口径一致）。将来做密码版本号时在这里接上即可。
+		SelfPassword: &httpapi.SelfPasswordHandler{Users: userStore},
 		User: &httpapi.UserHandler{
 			Store: userStore,
 			// 改角色 / 停用 / 删除后立刻重建策略：
