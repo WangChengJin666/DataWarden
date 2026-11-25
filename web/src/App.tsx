@@ -7,6 +7,7 @@ import DatasourcePage from './pages/DatasourcePage'
 import ReviewPage from './pages/ReviewPage'
 import GrantsPage from './pages/GrantsPage'
 import GroupsPage from './pages/GroupsPage'
+import UsersPage from './pages/UsersPage'
 import { getCurrentUser, getToken } from './api/client'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -75,6 +76,14 @@ export default function App() {
           element={
             <RequireSuperAdmin>
               <GroupsPage />
+            </RequireSuperAdmin>
+          }
+        />
+        <Route
+          path="users"
+          element={
+            <RequireSuperAdmin>
+              <UsersPage />
             </RequireSuperAdmin>
           }
         />
