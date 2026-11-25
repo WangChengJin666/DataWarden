@@ -55,6 +55,7 @@ func main() {
 	dsStore := store.NewDatasourceStore(pool)
 	grantStore := store.NewGrantStore(pool)
 	grantReqStore := store.NewGrantRequestStore(pool)
+	groupStore := store.NewGroupStore(pool)
 	auditLogger := audit.NewLogger(pool)
 	issuer := auth.NewTokenIssuer(cfg.JWTSecret, 12*time.Hour)
 
@@ -145,6 +146,17 @@ func main() {
 			Store:    metadataStore{ds: dsStore, grants: grantStore},
 			Factory:  makeAdapterFactory(ctx, dsStore),
 			Enforcer: enforcer,
+		},
+		Group: &httpapi.GroupHandler{Store: groupStore},
+		User: &httpapi.UserHandler{
+			Store: userStore,
+			// 改角色 / 停用 / 删除后立刻重建策略：
+			// 这些动作都是应急或安全相关的，等 60 秒的定时刷新不可接受。
+			// 注意 refreshAuthz 内部已包含 reAddBuiltinPolicies，
+			// 不会因为重建而清掉 dba/superadmin 的内置策略。
+			OnUserChange: func(ctx context.Context) {
+				refreshAuthz(ctx)
+			},
 		},
 	})
 
