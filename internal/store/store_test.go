@@ -29,9 +29,25 @@ func setupPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("migrate: %v", err)
 	}
 	// 清理业务表，保证可重复执行。audit_log 有触发器，不清理。
-	_, _ = pool.Exec(ctx, "DELETE FROM grant_record")
-	_, _ = pool.Exec(ctx, "DELETE FROM datasource")
-	_, _ = pool.Exec(ctx, "DELETE FROM app_user")
+	//
+	// 顺序必须按外键依赖来：grant_request 与 grant_record 都引用 app_user，
+	// datasource 又被 grant_record / grant_request 引用。
+	// 之前漏了 grant_request，只要某个用例建过申请单，DELETE FROM app_user
+	// 就会因外键失败——而错误被 `_` 吞掉，后续用例变成「用户名已存在」，
+	// 报错点与真正原因隔着好几层，极难排查。
+	//
+	// 这里改为失败即 fatalf：清理失败必须立刻暴露，
+	// 否则后续每个断言都会给出一个错误的失败原因。
+	for _, stmt := range []string{
+		"DELETE FROM grant_request",
+		"DELETE FROM grant_record",
+		"DELETE FROM datasource",
+		"DELETE FROM app_user",
+	} {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("clean fixture (%s): %v", stmt, err)
+		}
+	}
 	t.Cleanup(pool.Close)
 	return pool
 }
