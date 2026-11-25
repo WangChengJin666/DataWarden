@@ -131,23 +131,38 @@ export default function UsersPage() {
       .catch((e: Error) => message.error(e.message))
   }, [])
 
+  // 弹窗内容用 destroyOnClose + preserve={false}：打开时才挂载 Form。
+  // 因此不能在 setOpen(true) 之前 setFieldsValue —— 那时 Form 还没挂载，
+  // 值会被丢掉，表现为「编辑页一片空白」。回填放在 afterOpenChange 里，
+  // 那一刻内容已挂载，setFieldsValue 才会落到真实 Field 上。
   const openCreate = () => {
     setEditing(null)
-    form.resetFields()
-    form.setFieldsValue({ role: 'developer', group_id: UNGROUPED, status: 'active', email: '' })
     setOpen(true)
   }
 
   const openEdit = (u: UserView) => {
     setEditing(u)
-    form.setFieldsValue({
-      username: u.username,
-      email: u.email,
-      role: u.role,
-      group_id: u.group_id ?? UNGROUPED,
-      status: u.status as 'active' | 'disabled',
-    })
     setOpen(true)
+  }
+
+  const fillForm = (u: UserView | null) => {
+    if (u) {
+      form.setFieldsValue({
+        username: u.username,
+        email: u.email,
+        role: u.role,
+        group_id: u.group_id ?? UNGROUPED,
+        status: u.status as 'active' | 'disabled',
+      })
+    } else {
+      form.setFieldsValue({
+        username: '',
+        email: '',
+        role: 'developer',
+        group_id: UNGROUPED,
+        status: 'active',
+      })
+    }
   }
 
   const submit = async () => {
@@ -427,6 +442,10 @@ export default function UsersPage() {
         confirmLoading={saving}
         okText={editing ? '保存' : '创建'}
         destroyOnClose
+        afterOpenChange={(visible) => {
+          // 只在打开时回填：关闭动画结束也会回调，此时只清空不覆盖
+          if (visible) fillForm(editing)
+        }}
       >
         <Form form={form} layout="vertical" preserve={false}>
           <Form.Item

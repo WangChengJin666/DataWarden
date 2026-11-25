@@ -48,16 +48,22 @@ export default function GroupsPage() {
     void load()
   }, [])
 
+  // destroyOnClose 让 Form 只在弹窗打开时挂载，因此在 setOpen(true) 之前
+  // setFieldsValue 会把值丢掉（编辑页空白）。回填统一放到 afterOpenChange。
   const openCreate = () => {
     setEditing(null)
-    form.resetFields()
     setOpen(true)
   }
 
   const openEdit = (g: UserGroup) => {
     setEditing(g)
-    form.setFieldsValue({ name: g.name, description: g.description })
     setOpen(true)
+  }
+
+  const fillForm = (g: UserGroup | null) => {
+    form.setFieldsValue(
+      g ? { name: g.name, description: g.description } : { name: '', description: '' },
+    )
   }
 
   const submit = async () => {
@@ -181,6 +187,9 @@ export default function GroupsPage() {
         confirmLoading={saving}
         okText={editing ? '保存' : '创建'}
         destroyOnClose
+        afterOpenChange={(visible) => {
+          if (visible) fillForm(editing)
+        }}
       >
         <Form form={form} layout="vertical" preserve={false}>
           <Form.Item
