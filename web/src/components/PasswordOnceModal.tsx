@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Alert, Button, Input, Modal, Space, Typography } from 'antd'
 import { CopyOutlined } from '@ant-design/icons'
 
@@ -27,23 +27,37 @@ interface Props {
 export default function PasswordOnceModal({ password, username, mode, onClose }: Props) {
   const [copied, setCopied] = useState(false)
 
+  // 每次弹窗重新出现时重置「已复制」：
+  // 组件本身常驻（由父级条件渲染 modal，而不是条件渲染组件），
+  // 第二次打开时 copied 还是 true，按钮会一上来就显示「已复制」，
+  // 会让管理员以为新密码已经进了剪贴板，实际是上一次的。
+  useEffect(() => {
+    if (password !== null) setCopied(false)
+  }, [password])
+
   const copy = async () => {
     if (!password) return
     try {
       await navigator.clipboard.writeText(password)
       setCopied(true)
     } catch {
-      // 浏览器可能因非 HTTPS 或权限拒绝而失败。此时不报错：
-      // 输入框是可选中复制的，用户可以手动复制。
+      // 浏览器可能因非 HTTPS 或权限拒绝而失败（http 的非 localhost 环境常见）。
+      // 此时不弹错误：输入框是只读但可全选的，用户手动复制即可。
+      // 但也不能把状态改成「已复制」——那是在骗用户。
     }
+  }
+
+  const close = () => {
+    setCopied(false)
+    onClose()
   }
 
   return (
     <Modal
       title={mode === 'created' ? '用户已创建' : '密码已重置'}
       open={password !== null}
-      onCancel={onClose}
-      onOk={onClose}
+      onCancel={close}
+      onOk={close}
       okText="我已记录"
       cancelButtonProps={{ style: { display: 'none' } }}
       maskClosable={false}

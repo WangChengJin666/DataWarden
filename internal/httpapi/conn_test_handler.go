@@ -201,6 +201,13 @@ func friendlyConnError(err error, typ, authSource string) string {
 	case errors.Is(err, context.DeadlineExceeded):
 		return "连接超时"
 	default:
-		return "连接失败：" + msg
+		// 不回显原文：未识别的驱动错误（TLS 握手失败、DNS 解析失败、
+		// 驱动内部错误等）里常带 host、用户名、证书路径，而这些恰恰是
+		// 本函数开头要挡掉的东西。之前这里拼了 "连接失败："+msg，
+		// 等于前面 9 个分支做了脱敏、最后一个分支又把门打开了。
+		//
+		// 原文并未丢弃：调用方会把 err 写进审计 detail（见 TestConnection），
+		// 管理员可以在审计日志里查到完整原因，用户界面只给排查方向。
+		return "连接失败，请检查主机、端口、账号与网络连通性（详细原因见审计日志）"
 	}
 }

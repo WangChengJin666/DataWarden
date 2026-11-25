@@ -66,19 +66,20 @@ export default function AppLayout() {
     }
     // 账号管理只给超级管理员：组与用户是整个平台的权限底座，
     // dba 拿不到，避免「dba 给自己提权」这条路径。
+    //
+    // 刻意不用 type:'group' 做分组：antd 的分组项渲染成不可点击的标题
+    // （icon 也会被忽略），点它不会展开子项，用户必须再去点子项——
+    // 只有两项时，多一层分组反而多一次点击，还丢了图标这个视觉锚点。
+    // 等账号管理长出第三项（比如审计查询、系统配置）再考虑分组。
     if (isSuperAdmin) {
-      base.push({
-        type: 'group' as const,
-        label: '系统管理',
-        children: [
-          {
-            key: '/users',
-            icon: <UsergroupAddOutlined />,
-            label: <Link to="/users">用户管理</Link>,
-          },
-          { key: '/groups', icon: <TeamOutlined />, label: <Link to="/groups">组管理</Link> },
-        ],
-      })
+      base.push(
+        {
+          key: '/users',
+          icon: <UsergroupAddOutlined />,
+          label: <Link to="/users">用户管理</Link>,
+        },
+        { key: '/groups', icon: <TeamOutlined />, label: <Link to="/groups">组管理</Link> },
+      )
     }
     return base
   }, [isDBA, isSuperAdmin])

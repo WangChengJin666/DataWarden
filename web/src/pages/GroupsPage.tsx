@@ -188,7 +188,17 @@ export default function GroupsPage() {
             label="组名"
             rules={[
               { required: true, whitespace: true, message: '请填写组名' },
-              { max: 64, message: '组名不能超过 64 个字符' },
+              // 用 validator 而不是 max:64：长度要按「去掉首尾空白后的字符数」
+              // 来算，否则输入 64 个字符再带两个尾随空格就会被前端放行、
+              // 后端拒绝，用户看到的是「明明没超长却说超长」。
+              // transform 让 Form 在校验前统一 trim，与后端 TrimSpace 口径一致。
+              {
+                transform: (v: string) => (v ?? '').trim(),
+                validator: (_, v: string) =>
+                  (v ?? '').length > 64
+                    ? Promise.reject(new Error('组名不能超过 64 个字符'))
+                    : Promise.resolve(),
+              },
             ]}
           >
             <Input placeholder="例如：数据平台组" maxLength={64} />

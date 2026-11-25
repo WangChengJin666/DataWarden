@@ -50,10 +50,14 @@ func (r groupReq) validate() string {
 }
 
 // List 返回全部组（含成员数）。
+//
+// 错误必须走 writeStoreError 而不是直接 err.Error()：后者会把
+// "query groups: ERROR: relation ... does not exist" 这类 SQL 细节
+// 原样吐给前端，既是信息泄露，也让用户无从处理。
 func (h *GroupHandler) List(c *gin.Context) {
 	items, err := h.Store.List(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeStoreError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"items": items})
@@ -67,7 +71,7 @@ func (h *GroupHandler) Create(c *gin.Context) {
 	}
 	var req groupReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		writeBindError(c, err)
 		return
 	}
 	if msg := req.validate(); msg != "" {
@@ -102,7 +106,7 @@ func (h *GroupHandler) Update(c *gin.Context) {
 	}
 	var req groupReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		writeBindError(c, err)
 		return
 	}
 	if msg := req.validate(); msg != "" {

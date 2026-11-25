@@ -2,10 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/opensourceprj/datawarden/internal/model"
 )
@@ -52,7 +55,14 @@ func (s *UserStore) Create(ctx context.Context, u *model.User) (int64, error) {
 }
 
 // FindByUsername 按用户名取 ID、密码哈希与角色，供登录使用。
-// 只返回 status='active' 的用户，禁用账号无法登录。
+//
+// 只返回 status='active' 的用户，禁用与已删除账号无法登录。
+//
+// 为什么错误里不带原因（"user not found" vs "user is disabled"）：
+// 登录失败必须是黑盒。若区分「用户不存在」与「账号已停用」，
+// 攻击者就能用一串用户名探出哪些账号真实存在、哪些已被清理，
+// 这本身就是信息泄露。handler 对任何错误都回「invalid credentials」，
+// 所以这里的措辞只需要服务内部排错够用即可，不要写得更有区分度。
 func (s *UserStore) FindByUsername(ctx context.Context, username string) (int64, string, string, error) {
 	var (
 		id   int64
@@ -65,7 +75,10 @@ func (s *UserStore) FindByUsername(ctx context.Context, username string) (int64,
 		username,
 	).Scan(&id, &hash, &role)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		// 必须用 errors.Is：pgx 各版本对 ErrNoRows 的包装方式不同，
+		// `err == pgx.ErrNoRows` 在包装后会失效，进而把「用户不存在」
+		// 当成数据库故障上报 500，登录页会显示「服务器错误」而不是「凭据无效」。
+		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, "", "", fmt.Errorf("user %q not found", username)
 		}
 		return 0, "", "", fmt.Errorf("query user: %w", err)
@@ -193,7 +206,9 @@ func (s *UserStore) List(ctx context.Context, f UserFilter) ([]model.UserView, e
 func (s *UserStore) Get(ctx context.Context, id int64) (*model.UserView, error) {
 	v, err := scanUserView(s.pool.QueryRow(ctx, userSelect+` WHERE u.id = $1`, id))
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		// 用 errors.Is 而不是 ==：pgx 可能包装 ErrNoRows，
+		// 用 == 会在包装后失效，把「用户不存在」误判成数据库故障返回 500。
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
 		}
 		return nil, fmt.Errorf("query user: %w", err)
@@ -207,7 +222,7 @@ func (s *UserStore) Get(ctx context.Context, id int64) (*model.UserView, error) 
 // 已删除账号直接拒绝：允许改它等于给「删除」留了后门，
 // 而删除的语义是「不可恢复」。
 func (s *UserStore) UpdateProfile(ctx context.Context, id int64, email string, role model.Role, groupID *int64) error {
-	return s.withUserTx(ctx, id, true, func(tx pgx.Tx, status model.UserStatus) error {
+	return s.withUserTx(ctx, id, true, true, func(tx pgx.Tx, status model.UserStatus) error {
 		if groupID != nil {
 			var exists bool
 			if err := tx.QueryRow(ctx,
@@ -228,11 +243,16 @@ func (s *UserStore) UpdateProfile(ctx context.Context, id int64, email string, r
 			return fmt.Errorf("query previous role: %w", err)
 		}
 
-		// 降级检查。这里不复用 ensureNotLastSuperAdmin：它的语义是
-		// 「别把这个账号弄成不可用」，而本函数只关心「改完之后还有没有超管」。
-		// 条件是「此人是 active 的超管 → 改成非超管」，此时必须确认还有别的超管。
-		// 已停用的超管不计入可用数量，降级他不会让平台失去管理能力。
-		if status == model.StatusActive && prevRole == model.RoleSuperAdmin && role != model.RoleSuperAdmin {
+		// 降级检查。只要「原本是超管、要改成非超管」，就必须有另一个 active 超管兜底。
+		//
+		// 为什么把已停用的超管也算进保护范围（曾经的 bug）：
+		// 原条件要求 status == active 才检查，于是「先停用超管 A，再把 A 降级成
+		// developer」一路放行。此时若 B 恰好是最后一个 active 超管，B 之后
+		// 再被停用/删除就会被正确拦下——但平台已经只剩 B 一个「真超管」，
+		// 而 A 的身份（role）已被永久抹掉且无法重建（用户名仍被 A 占着，
+		// 新建同名超管会 409）。这不是「少扣一个保险」，是把退路直接烧了。
+		// 因此这里不看 status，只看「是不是在把超管变成非超管」。
+		if prevRole == model.RoleSuperAdmin && role != model.RoleSuperAdmin {
 			ok, err := hasOtherActiveSuperAdmin(ctx, tx, id)
 			if err != nil {
 				return err
@@ -262,12 +282,99 @@ func escapeLike(s string) string {
 	return r.Replace(s)
 }
 
+// superAdminGuardLockKey 是保护「超管集合不变式」的事务级 advisory lock 键。
+//
+// 为什么需要它（真实缺陷，已用并发压测复现：30 轮里 29 轮双删都成功）：
+// 只锁目标行的 SELECT ... FOR UPDATE 根本挡不住「两个超管互相删对方」——
+// 事务 A 锁住 A 这一行，事务 B 锁住 B 那一行，两者不冲突；
+// 随后 A 数「除自己之外还有没有超管」看到 B 仍然 active，
+// B 数的时候看到 A 仍然 active，于是双双放行，最后可用超管归零。
+// 要防的是「集合级」的不变式，就必须锁一个有确定名字的逻辑资源，
+// 而不是锁集合里的某一个成员。
+//
+// 选 advisory lock 而不是 SERIALIZABLE 隔离级：
+// 后者会给整库所有事务加上序列化失败重试，影响面远超此处需要；
+// advisory lock 只影响显式参与的几个事务，且同一连接内自动释放。
+//
+// 数值取自 "datawarden-superadmin" 的 CRC 风格哈希，只要全局唯一即可，
+// 与 db.migrationLockKey 不同即可（迁移锁是 0x64657761726477）。
+const superAdminGuardLockKey int64 = 0x6477007375706572
+
+// ErrAccountBusy 表示等待「超管集合锁」超时。
+//
+// 账号管理操作（改角色/停用/删除）需要一把全局串行锁来维持「至少一个
+// 可用超管」这个不变式。正常情况下这把锁只持有几毫秒（几条 SQL），
+// 但如果有外部进程长事务卡住（比如有人在 psql 里开了事务没提交），
+// 后来的请求就会一直等。没有超时的话，等待者会占着连接池的连接不放，
+// 池子（MaxConns=10）很快被占满，整个服务的数据库访问一起挂掉。
+//
+// 所以必须给等待设上界，并把「等不到」作为一个明确的、可映射成 503/409
+// 的业务错误返回，而不是让请求静默卡死。
+var ErrAccountBusy = errors.New("account operation busy, please retry")
+
+// superAdminLockTimeout 是等待超管集合锁的上限。
+//
+// 5 秒远大于正常持锁时间（毫秒级），又远小于用户能忍受的等待，
+// 也小于连接池 10s 的连接超时——保证「等锁失败」先于「拿不到连接」发生，
+// 便于定位是锁竞争而不是池耗尽。
+const superAdminLockTimeout = 5 * time.Second
+
+// lockSuperAdminSet 在当前事务上获取超管集合级别锁，事务结束（commit/rollback）自动释放。
+//
+// pg_advisory_xact_lock 是阻塞式的：后到的事务会等到前一个提交/回滚后才继续，
+// 因此「数剩余超管」必然看到前者已提交的结果，不变式得以成立。
+// 用 xact 版本而不是 session 版本，是为了不依赖连接是否被正确归还连接池。
+//
+// 两重超时保护，缺一不可：
+//   - 连接级 lock_timeout=5s（见 db.Open）：让 PG 自己放弃等待并抛 55P03，
+//     backend 立刻结束阻塞、连接可以归还。这是防「连接池被等锁请求占满」的
+//     根本手段——客户端 ctx 超时并不能让 PG 停止等待。
+//   - 这里再用 SET LOCAL 收紧到同一量级，目的是让语义与 55P03 的处理
+//     在同一个事务里闭环：即使有人从别处改了全局 lock_timeout，
+//     这一段仍然有上界。SET LOCAL 只在当前事务生效，退出即失效。
+//
+// 用 SET LOCAL 而不是 pg_advisory_xact_lock(timeout) 两参版本：后者从
+// PostgreSQL 18 才提供，本项目要兼容 13+。
+func lockSuperAdminSet(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx,
+		fmt.Sprintf("SET LOCAL lock_timeout = %d", superAdminLockTimeout.Milliseconds())); err != nil {
+		return fmt.Errorf("set lock_timeout: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, superAdminGuardLockKey); err != nil {
+		// 55P03 lock_not_available：等锁超时。这是可直接重试的「忙」，
+		// 不能当成 500——用户重复点一下就会成功。
+		// 与 ctx 超时一起识别，因为两种路径都可能触发。
+		if isLockNotAvailable(err) || errors.Is(err, context.DeadlineExceeded) {
+			return ErrAccountBusy
+		}
+		return fmt.Errorf("lock superadmin set: %w", err)
+	}
+	return nil
+}
+
+// isLockNotAvailable 判断错误是否为 PG 的 lock_timeout 超时（55P03）。
+//
+// 用 SQLSTATE 而不是匹配错误文本：文本随版本与 locale 变化，
+// 55P03 是标准错误码。
+func isLockNotAvailable(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "55P03"
+	}
+	return false
+}
+
 // withUserTx 在一个事务里锁住目标用户行后执行 fn。
 //
-// 锁行是必需的：所有「改状态、删、降级」的判断都依赖「当前还有几个超管」，
-// 而两个管理员同时互相降级时，各自读到的都还是「对方仍是超管」，
-// 于是一起通过，最后平台一个超管都不剩。SELECT ... FOR UPDATE
-// 让这两个事务串行执行，第二个必然看到第一个的结果。
+// 这里有两层保护，作用不同，缺一不可：
+//   - SELECT ... FOR UPDATE 锁目标行：防止同一个用户被并发改（例如两个人同时改
+//     同一账号的角色），也让 fn 里读到的 status 与实际写入时的状态一致。
+//   - superAdminGuard 为 true 时再取集合级 advisory lock：防止「两个超管互相
+//     降级/删除」这类跨行操作。单靠锁行挡不住——两个事务锁的是不同的行。
+//
+// 只有会改变「可用超管数量」的操作才需要集合锁（停用、删除、降级）；
+// 改邮箱、改组、重置密码不需要，否则纯属给热路径加串行化。
 //
 // rejectDeleted 为 true 时，目标已删除直接返回 ErrUserDeleted；
 // 只有 SoftDelete 自己传 false（它需要能对已删除账号幂等返回成功）。
@@ -275,6 +382,7 @@ func (s *UserStore) withUserTx(
 	ctx context.Context,
 	id int64,
 	rejectDeleted bool,
+	superAdminGuard bool,
 	fn func(tx pgx.Tx, status model.UserStatus) error,
 ) error {
 	tx, err := s.pool.Begin(ctx)
@@ -283,10 +391,19 @@ func (s *UserStore) withUserTx(
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// 先取集合锁再锁目标行，顺序固定。若反过来（先锁行、后取集合锁），
+	// 两个事务可能各自持有行锁再等集合锁——虽然这里的集合锁是唯一一把、
+	// 不会真正死锁，但固定「粗锁在前」能避免将来引入第二把锁时的死锁隐患。
+	if superAdminGuard {
+		if err := lockSuperAdminSet(ctx, tx); err != nil {
+			return err
+		}
+	}
+
 	var status model.UserStatus
 	err = tx.QueryRow(ctx, `SELECT status FROM app_user WHERE id = $1 FOR UPDATE`, id).Scan(&status)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrUserNotFound
 		}
 		return fmt.Errorf("lock user: %w", err)
@@ -328,7 +445,7 @@ func (s *UserStore) SetStatus(ctx context.Context, id int64, status model.UserSt
 	if !status.Assignable() {
 		return fmt.Errorf("status %q cannot be assigned directly", status)
 	}
-	return s.withUserTx(ctx, id, true, func(tx pgx.Tx, current model.UserStatus) error {
+	return s.withUserTx(ctx, id, true, true, func(tx pgx.Tx, current model.UserStatus) error {
 		// 停用与删除共用同一套「会不会弄丢最后一个超管」的检查，
 		// 抽成 ensureNotLastSuperAdmin 是为了让三处调用点（停用、删除、降级）
 		// 的判断口径完全一致——各自写一遍最容易出现「停用拦了、降级没拦」的分叉。
@@ -348,8 +465,11 @@ func (s *UserStore) SetStatus(ctx context.Context, id int64, status model.UserSt
 // ResetPassword 重置密码。
 //
 // 已删除账号拒绝：删除是不可恢复的，能重置密码就等于能把它用起来。
+//
+// 不取超管集合锁：重置密码不改变「谁是 active 超管」，
+// 与「最后一个超管」不变式无关，没必要让这个操作和账号管理全局串行。
 func (s *UserStore) ResetPassword(ctx context.Context, id int64, passwordHash string) error {
-	return s.withUserTx(ctx, id, true, func(tx pgx.Tx, _ model.UserStatus) error {
+	return s.withUserTx(ctx, id, true, false, func(tx pgx.Tx, _ model.UserStatus) error {
 		if _, err := tx.Exec(ctx,
 			`UPDATE app_user SET password_hash = $1 WHERE id = $2`, passwordHash, id); err != nil {
 			return fmt.Errorf("update password: %w", err)
@@ -375,7 +495,7 @@ func (s *UserStore) ResetPassword(ctx context.Context, id int64, passwordHash st
 //
 // 幂等：对已删除账号再调一次直接返回 nil（重复点删除不该报错）。
 func (s *UserStore) SoftDelete(ctx context.Context, id int64) error {
-	return s.withUserTx(ctx, id, false, func(tx pgx.Tx, status model.UserStatus) error {
+	return s.withUserTx(ctx, id, false, true, func(tx pgx.Tx, status model.UserStatus) error {
 		if status == model.StatusDeleted {
 			return nil // 幂等：重复点删除不该报错
 		}

@@ -1,4 +1,5 @@
 import axios, { AxiosError } from 'axios'
+import { message } from 'antd'
 import type {
   ApplyableDatasource,
   Datasource,
@@ -69,6 +70,25 @@ http.interceptors.response.use(
       if (!location.pathname.startsWith('/login')) {
         location.href = '/login'
       }
+    }
+    // 403 不一定是 bug：更常见的是「我的角色/状态在别处被改了，但本地
+    // 缓存的 dw_user 还是旧值」——菜单照旧显示，点进去一片 403，
+    // 用户会以为系统坏了。清掉会话让 ta 重新登录取最新身份，
+    // 并说明原因，而不是让 ta 反复重试。
+    if (err.response?.status === 403) {
+      clearSession()
+      if (!location.pathname.startsWith('/login')) {
+        message.error('你的权限已变更，请重新登录')
+        location.href = '/login'
+      }
+      return Promise.reject(new Error('权限不足或权限已变更，请重新登录'))
+    }
+    // 503 + Retry-After 是本项目「等超管集合锁超时」的信号。
+    // 后端返回的中文已经可以直接展示，这里保留后端文案。
+    if (err.response?.status === 503) {
+      return Promise.reject(
+        new Error(err.response.data?.error || '账号管理操作繁忙，请稍后重试'),
+      )
     }
     const msg = err.response?.data?.error || err.message || '请求失败'
     return Promise.reject(new Error(msg))

@@ -3,8 +3,10 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -291,14 +293,16 @@ func TestCreateUser_DuplicateReturns409(t *testing.T) {
 	}
 }
 
-func TestCreateUser_MissingGroupReturns409(t *testing.T) {
+// 引用一个不存在的组 → 404。与 409 的区别在于「你选的组没了，刷新列表重选」，
+// 而不是「状态冲突，改改再试」。
+func TestCreateUser_MissingGroupReturns404(t *testing.T) {
 	us := &fakeUserStore{err: store.ErrGroupMissing}
 	r := buildAccountRouter(t, "superadmin", us, nil)
 	w := callAsSuperAdmin(t, r, http.MethodPost, "/api/v1/users", map[string]any{
 		"username": "nogroup", "role": "developer", "group_id": 999,
 	})
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", w.Code)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
 	}
 }
 
@@ -493,5 +497,133 @@ func TestUpdateUser_DeletedReturns409(t *testing.T) {
 	w := callAsSuperAdmin(t, r, http.MethodPut, "/api/v1/users/2", map[string]any{"role": "developer"})
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", w.Code)
+	}
+}
+
+// 等超管集合锁超时要回 503 并带 Retry-After，不能落成 500：
+// 这是并发冲突下的暂时忙，调用方等一会儿重试即可。
+func TestAccountBusyReturns503(t *testing.T) {
+	us := &fakeUserStore{err: store.ErrAccountBusy}
+	r := buildAccountRouter(t, "superadmin", us, nil)
+	w := callAsSuperAdmin(t, r, http.MethodPost, "/api/v1/users/2/status", map[string]string{"status": "disabled"})
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503, body=%s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Error("503 应带 Retry-After，告诉调用方可以稍后重试")
+	}
+}
+
+// 未知错误绝不能把内部细节（SQL 片段、表名）回给前端。
+func TestUnknownErrorDoesNotLeakInternals(t *testing.T) {
+	us := &fakeUserStore{err: errors.New("pq: relation \"app_user\" does not exist")}
+	r := buildAccountRouter(t, "superadmin", us, nil)
+	w := callAsSuperAdmin(t, r, http.MethodPost, "/api/v1/users/2/status", map[string]string{"status": "disabled"})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "app_user") || strings.Contains(w.Body.String(), "pq:") {
+		t.Fatalf("响应体泄露了内部细节: %s", w.Body.String())
+	}
+}
+
+// 锁定「面向用户的文案必须是中文」这一口径。
+//
+// 后端的哨兵错误（store.ErrLastSuperAdmin 等）文本是英文，直接透传给前端
+// 会弹出一句 "cannot remove the last active superadmin"。这里对每条
+// 会展示给用户的错误各断言一次，防止将来有人图省事改回 err.Error()。
+func TestStoreErrorMessagesAreChinese(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"last superadmin", store.ErrLastSuperAdmin, "不能移除最后一名可用的超级管理员"},
+		{"user deleted", store.ErrUserDeleted, "该账号已被删除，无法再修改"},
+		{"username taken", store.ErrUsernameTaken, "用户名已被占用，请换一个"},
+		{"group missing", store.ErrGroupMissing, "你选择的用户组已不存在，请刷新后重新选择"},
+		{"account busy", store.ErrAccountBusy, "账号管理操作繁忙，请稍后重试"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			us := &fakeUserStore{err: tc.err}
+			r := buildAccountRouter(t, "superadmin", us, nil)
+			w := callAsSuperAdmin(t, r, http.MethodPost, "/api/v1/users/2/status",
+				map[string]string{"status": "disabled"})
+			var resp struct {
+				Error string `json:"error"`
+			}
+			_ = json.Unmarshal(w.Body.Bytes(), &resp)
+			if resp.Error != tc.want {
+				t.Fatalf("error = %q, want %q（英文文案不该直接透给用户）", resp.Error, tc.want)
+			}
+		})
+	}
+}
+
+// 客户端断开连接时不该写 body，也不该记成 5xx。
+func TestCanceledRequestIsNotReportedAsError(t *testing.T) {
+	us := &fakeUserStore{err: context.Canceled}
+	r := buildAccountRouter(t, "superadmin", us, nil)
+	w := callAsSuperAdmin(t, r, http.MethodPost, "/api/v1/users/2/status",
+		map[string]string{"status": "disabled"})
+	// Abort 不带状态码时 gin 默认 200 且 body 为空
+	if w.Code >= 500 {
+		t.Fatalf("status = %d, 客户端取消不应是 5xx", w.Code)
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("客户端已断开，不该再写响应体，实际写了: %s", w.Body.String())
+	}
+}
+
+// binding 错误不能把 Go 结构体名/字段名/tag 透给前端。
+// 这条以前是重灾区：响应体会是
+//   Key: 'createUserReq.Role' Error:Field validation for 'Role' failed on the 'required' tag
+func TestBindErrorDoesNotLeakInternals(t *testing.T) {
+	us := &fakeUserStore{}
+	r := buildAccountRouter(t, "superadmin", us, nil)
+
+	// 1) 缺 required 字段 → validator 错误
+	w := callAsSuperAdmin(t, r, http.MethodPost, "/api/v1/users", map[string]any{
+		"username": "nobody",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, leak := range []string{"createUserReq", "updateUserReq", "groupReq", "validation for", "'required' tag", "Struct:"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("响应体泄露了内部结构 %q: %s", leak, body)
+		}
+	}
+
+	// 2) 类型不匹配 → json.UnmarshalTypeError（不会经过 validator）
+	w = callAsSuperAdmin(t, r, http.MethodPost, "/api/v1/users", map[string]any{
+		"username": "x", "role": "developer", "group_id": "not-a-number",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", w.Code, w.Body.String())
+	}
+	body = w.Body.String()
+	for _, leak := range []string{"createUserReq", "cannot unmarshal", "Go struct field"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("响应体泄露了内部结构 %q: %s", leak, body)
+		}
+	}
+	if !strings.Contains(body, "group_id") {
+		t.Fatalf("应指出出错的字段名，实际: %s", body)
+	}
+
+	// 3) 非法 JSON → 语法错误
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader("{not json"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+loginAndGetToken(t, r, "alice", "correct"))
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req)
+	if w2.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w2.Code)
+	}
+	if strings.Contains(w2.Body.String(), "invalid character") {
+		t.Fatalf("响应体泄露了 JSON 解析细节: %s", w2.Body.String())
 	}
 }

@@ -151,7 +151,7 @@ func (h *UserHandler) Create(c *gin.Context) {
 	}
 	var req createUserReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		writeBindError(c, err)
 		return
 	}
 
@@ -225,12 +225,22 @@ func (h *UserHandler) Update(c *gin.Context) {
 	}
 	var req updateUserReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		writeBindError(c, err)
 		return
 	}
 	role := model.Role(req.Role)
 	if !role.Valid() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role: " + req.Role})
+		return
+	}
+
+	// 不允许给自己降级：与「停用自己」同理，请求已经通过鉴权、会「成功」执行，
+	// 但操作者随即失去账号管理入口，只能另找一位超管救。
+	// 注意这里拦的是「把自己改成非超管」，改邮箱、改组仍然允许。
+	// 与「最后一名超管」检查不重复：有多个超管时降级自己完全合法，
+	// 一样会把自己关在门外，所以必须单独拦。
+	if id == uid && role != model.RoleSuperAdmin {
+		c.JSON(http.StatusConflict, gin.H{"error": "cannot demote your own account"})
 		return
 	}
 
@@ -261,7 +271,7 @@ func (h *UserHandler) SetStatus(c *gin.Context) {
 		Status string `json:"status" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		writeBindError(c, err)
 		return
 	}
 	status := model.UserStatus(req.Status)

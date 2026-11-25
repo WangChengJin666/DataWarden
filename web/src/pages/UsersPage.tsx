@@ -76,6 +76,9 @@ export default function UsersPage() {
   const [loading, setLoading] = useState(false)
 
   const [keyword, setKeyword] = useState('')
+  // debouncedKeyword 才是真正进请求的值：直接拿 keyword 做 load 的依赖，
+  // 每敲一个字符就发一次请求，输入六个字打六次库。
+  const [debouncedKeyword, setDebouncedKeyword] = useState('')
   const [roleFilter, setRoleFilter] = useState<Role | ''>('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('default')
   const [groupFilter, setGroupFilter] = useState<number | undefined>(undefined)
@@ -96,7 +99,7 @@ export default function UsersPage() {
     try {
       setItems(
         await listUsers({
-          keyword,
+          keyword: debouncedKeyword,
           role: roleFilter,
           // 默认口径交给后端（active + disabled），这里只显式传时需要
           status: statusFilter === 'default' ? undefined : [statusFilter],
@@ -109,7 +112,14 @@ export default function UsersPage() {
     } finally {
       setLoading(false)
     }
-  }, [keyword, roleFilter, statusFilter, groupFilter])
+  }, [debouncedKeyword, roleFilter, statusFilter, groupFilter])
+
+  // 关键词输入防抖 300ms。其余筛选（角色/状态/组）是下拉选择，
+  // 一次点击就是一次完整意图，不需要防抖。
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedKeyword(keyword), 300)
+    return () => clearTimeout(timer)
+  }, [keyword])
 
   useEffect(() => {
     void load()
@@ -438,6 +448,9 @@ export default function UsersPage() {
             <Col span={12}>
               <Form.Item name="role" label="角色" rules={[{ required: true }]}>
                 <Select
+                  // 编辑自己时禁用角色下拉：把自己降级会立刻失去账号管理入口，
+                  // 后端会以 409 拒绝，这里提前锁住避免无谓报错。
+                  disabled={!!editing && editing.username === me?.username}
                   options={Object.entries(roleLabels).map(([value, cfg]) => ({
                     value,
                     label: cfg.label,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -334,31 +335,84 @@ func TestUserStore_DisableNonSuperAdminAllowed(t *testing.T) {
 }
 
 // 并发：两个超管同时想删掉对方（各自看到的都还有对方），
-// 最终必须留下至少一个。串行锁保证第二个事务能看到第一个的结果。
+// 最终必须留下至少一个。
+//
+// 这条测试曾经被「只锁目标行」的实现骗过：单次跑往往能过，因为两个
+// goroutine 恰好一前一后完成。实测 30 轮里有 29 轮双双成功、可用超管归零。
+// 所以这里必须多轮重复，并在每轮内真正并发（sync.WaitGroup 同时起跑），
+// 同时断言「双删都成功」的次数为 0——只断言「至少剩一个」会漏掉
+// 「先删 A 成功、随后 B 也被删但状态已 deleted」之类的中途态。
 func TestUserStore_LastSuperAdmin_Concurrent(t *testing.T) {
 	pool := setupPool(t)
 	ctx := context.Background()
 	s := NewUserStore(pool)
 
-	a := newUser(t, s, "rootA", model.RoleSuperAdmin)
-	b := newUser(t, s, "rootB", model.RoleSuperAdmin)
+	const rounds = 25
+	hash, _ := auth.HashPassword("x")
 
-	errs := make(chan error, 2)
-	for _, id := range []int64{a, b} {
-		go func(id int64) { errs <- s.SoftDelete(ctx, id) }(id)
+	for i := 0; i < rounds; i++ {
+		// 每轮从干净状态开始，保证「恰好两个 active 超管」这个前提成立
+		for _, stmt := range []string{
+			"DELETE FROM grant_request", "DELETE FROM grant_record",
+			"DELETE FROM datasource", "DELETE FROM app_user",
+		} {
+			if _, err := pool.Exec(ctx, stmt); err != nil {
+				t.Fatalf("reset: %v", err)
+			}
+		}
+		a, err := s.Create(ctx, &model.User{Username: "rootA", PasswordHash: hash, Role: model.RoleSuperAdmin})
+		if err != nil {
+			t.Fatalf("create a: %v", err)
+		}
+		b, err := s.Create(ctx, &model.User{Username: "rootB", PasswordHash: hash, Role: model.RoleSuperAdmin})
+		if err != nil {
+			t.Fatalf("create b: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		wg.Add(2)
+		go func() { defer wg.Done(); errs[0] = s.SoftDelete(ctx, a) }()
+		go func() { defer wg.Done(); errs[1] = s.SoftDelete(ctx, b) }()
+		wg.Wait()
+
+		if errs[0] == nil && errs[1] == nil {
+			t.Fatalf("round %d: both superadmins deleted, platform lost account management", i+1)
+		}
+
+		var alive int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM app_user WHERE role = 'superadmin' AND status = 'active'`).Scan(&alive); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if alive < 1 {
+			t.Fatalf("round %d: must keep at least one active superadmin, got %d", i+1, alive)
+		}
 	}
-	first := <-errs
-	second := <-errs
-	if first != nil && second != nil {
-		t.Fatalf("both deletions failed: %v / %v", first, second)
+}
+
+// 已停用的超管也不能随便降级：一旦降成 developer，超管身份就永久没了，
+// 而用户名还被这个账号占着，无法再建一个同名超管补救。
+// 只有「确实还有另一个 active 超管」时才允许。
+func TestUserStore_DemoteDisabledSuperAdminNeedsAnotherActive(t *testing.T) {
+	pool := setupPool(t)
+	ctx := context.Background()
+	s := NewUserStore(pool)
+
+	// 场景一：只有一个超管（先停用自己那一步会被拦，所以直接构造停用状态）
+	only := newUser(t, s, "rootX", model.RoleSuperAdmin)
+	if _, err := pool.Exec(ctx, `UPDATE app_user SET status = 'disabled' WHERE id = $1`, only); err != nil {
+		t.Fatalf("seed disabled: %v", err)
 	}
 
-	var alive int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM app_user WHERE role = 'superadmin' AND status = 'active'`).Scan(&alive); err != nil {
-		t.Fatalf("count: %v", err)
+	err := s.UpdateProfile(ctx, only, "", model.RoleDeveloper, nil)
+	if !errors.Is(err, ErrLastSuperAdmin) {
+		t.Fatalf("降级已停用的唯一超管应被拦，得到 %v", err)
 	}
-	if alive < 1 {
-		t.Fatal("must keep at least one active superadmin")
+
+	// 场景二：有另一个 active 超管时允许
+	newUser(t, s, "rootY", model.RoleSuperAdmin)
+	if err := s.UpdateProfile(ctx, only, "", model.RoleDeveloper, nil); err != nil {
+		t.Fatalf("有兜底超管时应允许降级，得到 %v", err)
 	}
 }
