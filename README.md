@@ -1,52 +1,56 @@
 # DataWarden
 
-面向研发团队的数据审计工单平台。为开发人员提供生产数据库的受控查询与变更能力，支持 MySQL、PostgreSQL、Redis、MongoDB 四类数据源，所有变更可回滚。
+面向研发团队的数据审计工单平台。为开发人员提供生产数据库的受控只读查询能力，支持 MySQL、PostgreSQL、Redis、MongoDB 四类数据源，所有操作留痕可审计。
 
-## 核心特性
+## 产品目标与当前状态
 
-- **四类数据源**：MySQL、PostgreSQL、Redis、MongoDB
-- **两种查询授权**：平台内限时申请数据源、申请可直连的临时账号
-- **变更工单**：DBA 审批后执行，执行前生成行镜像，支持回滚
-- **跨库跨实例查询**：基于 Trino 的联邦查询（Redis 走独立通道）
-- **全链路审计**：所有操作留痕，审计表数据库层面不可篡改
+完整产品规划包含只读查询、变更工单（执行前生成行镜像、支持回滚）、可直连的临时账号三类能力。
 
-> 上表是完整产品目标。当前仅**查询类能力**已落地，变更工单与临时账号属于后续阶段。
+**当前只交付了只读查询这一条线**：变更工单、回滚、临时账号均未开始实现，
+代码里也没有相关接口。README 中标注「规划」的内容请以此为准，不要当成已有能力。
 
-> **项目状态**：阶段一（地基 + 只读查询 + Redis 通道）已完成，13 个 Task 全部交付并通过真实数据库验证。
-> 变更工单与回滚（阶段二）尚未开始。
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| 阶段一 | 地基 + 只读查询（四类数据源）+ 授权申请审批 + 账号管理 | ✅ 已完成 |
+| 阶段二 | 变更工单、回滚、临时账号 | ⬜ 未开始 |
 
-## 已实现能力（阶段一）
+## 已实现能力
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | 用户登录与 JWT 鉴权 | ✅ | bcrypt 密码哈希，令牌含角色 |
-| 角色权限（developer / dba / superadmin） | ✅ | Casbin 策略，库级 `*` 通配 |
-| 用户与组管理 | ✅ | 仅 superadmin：新建账号（随机初始密码一次性展示）、分配内置角色与组、重置密码、停用启用、逻辑删除（释放用户名）；组只做归类，不承载权限 |
+| 自助修改密码 | ✅ | 登录后右上角「修改密码」，需校验当前密码；校验与写入在同一事务内完成 |
+| 角色权限（developer / dba / superadmin） | ✅ | Casbin 策略，数据源级 `ds:<id>:*:*` 通配 |
+| 用户管理 | ✅ | 仅 superadmin：新建账号（随机初始密码一次性展示）、分配角色与组、重置密码、停用启用、逻辑删除（释放用户名） |
+| 组管理 | ✅ | 仅 superadmin：组只做归类（类似部门），**不承载任何数据权限**；删组时成员转为未分组 |
 | 数据源管理 | ✅ | 增删改查，仅 DBA / superadmin 可访问（列表与详情同样限权） |
-| 可申请数据源配置 | ✅ | 按数据源设置是否开放、最长天数、可申请库表范围 |
+| 可申请配置 | ✅ | 按数据源设置是否开放申请与最长天数（不再配置库表范围） |
 | 授权申请与审批 | ✅ | 提交 → DBA 审批 → 授权即时生效；禁止自审 |
 | PostgreSQL / MySQL 受控查询 | ✅ | 只读白名单、强制限行、超时中断 |
 | MongoDB 受控查询 | ✅ | 集合+过滤条件或原生命令，写操作与 `$out`/`$merge` 在解析阶段拒绝 |
 | Redis 查询通道 | ✅ | 精确 key + `SCAN` 模糊 key，绝不使用 `KEYS` |
-| 查询授权与期限 | ✅ | 授权记录带过期时间，Casbin 按活跃授权重建 |
+| 授权期限与回收 | ✅ | 授权带过期时间，定时重建 Casbin 策略；支持立即收回 |
 | 结果脱敏 | ✅ | 手机号、身份证、邮箱、银行卡按列名关键字匹配 |
-| 全链路审计 | ✅ | 查询、数据源变更、审批动作全部留痕，表级触发器禁止篡改 |
-| Web 界面 | ✅ | React 18 + Ant Design + CodeMirror 6，五个页面，菜单按角色动态渲染 |
+| 全链路审计 | ✅ | 查询、数据源变更、审批、账号操作全部留痕，表级触发器禁止篡改 |
+| Web 界面 | ✅ | React 18 + Ant Design + CodeMirror 6，八个页面，菜单按角色动态渲染 |
 
 ## 界面
 
-前端为 React 18 + Ant Design + CodeMirror 6，五个页面：
+前端为 React 18 + Ant Design + CodeMirror 6，共**八个页面**：
 
 | 页面 | 可见角色 | 功能 |
 |---|---|---|
 | 数据查询 | 全部 | 选择数据源执行只读查询，结果自动脱敏；SQL 编辑器带表名/字段名补全 |
 | 申请授权 | 全部 | 查看可申请的数据源、提交申请、查看自己的申请进度 |
-| 数据源管理 | DBA / superadmin | 登记数据源，配置「是否开放申请 / 最长天数 / 可申请库表范围 / 高级连接参数」 |
+| 数据源管理 | DBA / superadmin | 登记数据源，配置「是否开放申请 / 最长天数 / 高级连接参数」 |
 | 授权审批 | DBA / superadmin | 审批申请，通过后授权立即生效 |
 | 授权管理 | DBA / superadmin | 查看生效中的授权，可立即收回 |
+| 用户管理 | superadmin | 账号增删改查、重置密码、停用启用、查看已删除账号 |
+| 组管理 | superadmin | 组的增删改查，查看成员数 |
 
-侧边栏菜单按角色动态渲染：开发者只看到「数据查询」和「申请授权」，看不到 DBA 的三个页面；
-直接访问 `/datasources` 会被重定向回「申请授权」，接口层同样返回 403。
+侧边栏菜单按角色动态渲染：开发者只有「数据查询」和「申请授权」；
+dba 额外看到数据源管理、授权审批、授权管理三页；用户管理与组管理只对 superadmin 出现。
+直接访问越权路径会被重定向，接口层同样返回 403。
 
 ### SQL 编辑器的补全
 
@@ -54,7 +58,8 @@
 
 1. **库**：进入页面或切换数据源时按 `GET /datasources/:id/databases` 拉取（后端按授权过滤）
 2. **表**：选定库后按 `GET /datasources/:id/tables?db=` 拉取，页面上是**只读的表名清单**
-   （点击表名即复制）。它不参与鉴权（粒度是数据源 + 库），也不再需要用户勾选
+   （点击表名即复制）。它不参与鉴权（授权粒度是数据源，见下文「申请的两道校验」），
+   也不再需要用户勾选
 3. **字段**：选定库后按 `GET /datasources/:id/schema?db=` 一次取回整库结构，
    输入 `别名.` / `表名.` 时直接查表给出该表字段
 
@@ -70,35 +75,61 @@
 
 ## API
 
+所有接口挂在 `/api/v1` 下。除 `POST /login` 外均需 `Authorization: Bearer <token>`。
+
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
-| POST | `/api/v1/login` | 公开 | 换取 JWT |
-| GET | `/api/v1/datasources` | dba / superadmin | 数据源列表（只返回 `has_password`） |
-| GET | `/api/v1/datasources/:id` | dba / superadmin | 数据源详情（含明文 `password`，供编辑框直接回显） |
-| POST | `/api/v1/datasources` | dba / superadmin | 登记数据源（含可申请配置） |
-| PUT | `/api/v1/datasources/:id` | dba / superadmin | 修改数据源与可申请配置 |
-| DELETE | `/api/v1/datasources/:id` | dba / superadmin | 删除数据源 |
-| POST | `/api/v1/datasources/test` | dba / superadmin | 测试连接（不写库） |
-| POST | `/api/v1/query/sql` | 需表级授权 | 执行只读查询 |
-| POST | `/api/v1/query/redis` | 需 key 前缀授权 | 执行 Redis 查询（精确 key 或 SCAN 模式） |
-| POST | `/api/v1/query/mongo` | 需集合级授权 | 执行 MongoDB 查询（集合+过滤 或 原生命令） |
-| GET | `/api/v1/datasources/:id/databases` | 已登录 | 列出可见的库（按授权过滤） |
-| GET | `/api/v1/datasources/:id/tables?db=` | 已登录 | 列出库下可见的表（按授权过滤） |
-| GET | `/api/v1/datasources/:id/columns?db=&table=` | 需表级授权 | 列出表的字段（供编辑器补全） |
-| GET | `/api/v1/grants` | dba / superadmin | 列出生效中的授权 |
-| POST | `/api/v1/grants/:id/revoke` | dba / superadmin | 立即收回一条授权 |
-| GET | `/api/v1/grant/applyable` | 已登录 | 列出开放申请的数据源 |
-| POST | `/api/v1/grant/requests` | 已登录 | 提交授权申请 |
-| GET | `/api/v1/grant/requests/mine` | 已登录 | 我的申请列表 |
-| GET | `/api/v1/grant/requests` | dba / superadmin | 按状态列出申请（默认 pending） |
-| POST | `/api/v1/grant/requests/:id/approve` | dba / superadmin | 审批通过 |
-| POST | `/api/v1/grant/requests/:id/reject` | dba / superadmin | 驳回（必须填原因） |
-| POST | `/api/v1/grant/requests/:id/cancel` | 申请人本人 | 撤销待审申请 |
+| POST | `/login` | 公开 | 换取 JWT |
+| POST | `/me/password` | 已登录 | 修改自己的密码（需当前密码） |
+| GET | `/datasources` | dba / superadmin | 数据源列表（只返回 `has_password`） |
+| GET | `/datasources/:id` | dba / superadmin | 数据源详情（含明文 `password`，供编辑框直接回显） |
+| POST | `/datasources` | dba / superadmin | 登记数据源（含可申请配置） |
+| PUT | `/datasources/:id` | dba / superadmin | 修改数据源与可申请配置 |
+| DELETE | `/datasources/:id` | dba / superadmin | 删除数据源 |
+| POST | `/datasources/test` | dba / superadmin | 测试连接（不写库） |
+| POST | `/query/sql` | 需库级授权 | 执行只读 SQL |
+| POST | `/query/redis` | 需 key 前缀授权 | 执行 Redis 查询（精确 key 或 SCAN 模式） |
+| POST | `/query/mongo` | 需库级授权 | 执行 MongoDB 查询（集合+过滤 或 原生命令） |
+| GET | `/datasources/:id/databases` | 已登录 | 列出可见的库（按授权过滤） |
+| GET | `/datasources/:id/tables?db=` | 已登录 | 列出库下可见的表（按授权过滤） |
+| GET | `/datasources/:id/columns?db=&table=` | 已登录 | 列出表的字段（供编辑器补全） |
+| GET | `/datasources/:id/schema?db=` | 已登录 | 一次返回整库表结构（供编辑器补全，逐表过滤权限） |
+| GET | `/grants` | dba / superadmin | 列出生效中的授权 |
+| POST | `/grants/:id/revoke` | dba / superadmin | 立即收回一条授权 |
+| GET | `/grants/mine` | 已登录 | 自己当前生效的数据源（开发者查可用数据源走这里） |
+| GET | `/grant/applyable` | 已登录 | 列出开放申请的数据源 |
+| POST | `/grant/requests` | 已登录 | 提交授权申请 |
+| GET | `/grant/requests/mine` | 已登录 | 我的申请列表 |
+| GET | `/grant/requests` | dba / superadmin | 按状态列出申请（默认 pending） |
+| POST | `/grant/requests/:id/approve` | dba / superadmin | 审批通过 |
+| POST | `/grant/requests/:id/reject` | dba / superadmin | 驳回（必须填原因） |
+| POST | `/grant/requests/:id/cancel` | 申请人本人 | 撤销待审申请 |
+| GET | `/users` | **superadmin** | 用户列表（默认在用 + 已停用，可筛选已删除） |
+| POST | `/users` | **superadmin** | 新建用户，返回一次性初始密码 |
+| PUT | `/users/:id` | **superadmin** | 改邮箱 / 角色 / 所属组（用户名不可改） |
+| POST | `/users/:id/status` | **superadmin** | 停用 / 启用 |
+| POST | `/users/:id/reset-password` | **superadmin** | 重置密码，返回一次性新密码 |
+| DELETE | `/users/:id` | **superadmin** | 逻辑删除，释放用户名 |
+| GET | `/groups` | **superadmin** | 组列表（含成员数） |
+| POST | `/groups` | **superadmin** | 新建组 |
+| PUT | `/groups/:id` | **superadmin** | 改组名与说明 |
+| DELETE | `/groups/:id` | **superadmin** | 删组（成员转为未分组，不删用户） |
+
+**开发者与 DBA 拿数据源的接口是两套**：`GET /datasources` 只对 DBA 开放（会带 host/port/username），
+开发者用 `GET /grants/mine` 看自己能查哪些数据源。
+
+**登录失败会区分原因**：用户名不存在回「用户不存在」，账号停用回「账号已停用」，
+密码错误回「密码错误」，数据库故障回 500 而不是伪装成凭据错误。
+这是有意的取舍——用户能分清该找回密码还是该找管理员，代价是用户名可被枚举。
+若要收紧为黑盒，只需把 `auth_handler.go` 里三处文案改成同一句，前端无需改动。
 
 ### Redis 查询
 
-Redis 没有表的概念，鉴权用 key 前缀。申请范围写成 `<db号>:<key前缀>`，例如 `37:user:1001`，
-平台会把它转成鉴权对象 `ds:<数据源ID>:37:user:1001`。
+Redis 没有表的概念，鉴权用 key 前缀。授权粒度同样是数据源——
+审批通过后策略为 `ds:<数据源ID>:*:*`，对任意 db 的任意 key 有效。
+
+> 历史遗留：早期是按库里手填范围申请（形如 `37:user:1001` → 鉴权对象
+> `ds:<数据源ID>:37:user:1001`）。这类库级授权仍然兼容，鉴权侧对两种写法一视同仁。
 
 **前缀授权自动向下覆盖。** 授权 `user:1001` 后可以查 `user:1001:name`、`user:1001:profile`
 等所有子 key，但查不到 `user:1002:name`。实现方式是对目标 key 逐级向上生成候选
@@ -196,7 +227,6 @@ Redis 没有表的概念，鉴权用 key 前缀。申请范围写成 `<db号>:<k
 **为什么只有 PostgreSQL 必须填库名：** 它的连接串是
 `postgres://user:pw@host:port/DBNAME`，库名是连接的一部分，留空会连到与用户同名的库
 并直接失败。
-
 MySQL 不一样，DSN 为 `user:pw@tcp(host:port)/DBNAME`，库名留空表示「连接但不选库」，
 查询时写 `库名.表名` 完全可用，所以不该强制填写。
 
@@ -300,6 +330,10 @@ MongoDB 不支持 SQL，查询接口是 `POST /api/v1/query/mongo`，支持两�
 迁移 `0008` 会把当前生效的授权统一提升为 `*`（已撤销与已过期的不动，
 历史申请单的审批留痕也不改）。
 
+因为申请粒度是整个数据源，`days` 决定的有效期要按实际需要批——早期版本里
+审批只给 7 天，导致授权很快全部过期，表现为「数据源管理里有数据、查询页却为空」，
+排查时容易误判成权限失效。
+
 **审批人不能审批自己的申请**，前后端都有拦截。单人 DBA 团队需要另一个 DBA 或 superadmin 来批。
 
 ### 授权什么时候失效
@@ -359,18 +393,22 @@ MongoDB 不支持 SQL，查询接口是 `POST /api/v1/query/mongo`，支持两�
 
 | 层 | 选型 |
 |---|---|
-| 后端 | Go 1.22+ / Gin |
+| 后端 | Go 1.27+ / Gin |
 | 元数据库 | PostgreSQL 16 |
-| 联邦查询 | Trino |
-| 缓存与队列 | Redis |
-| 权限 | Casbin |
-| 前端 | React 18 + TypeScript + Ant Design 5 + Vite |
+| 数据源驱动 | pgx v5（PostgreSQL）、go-sql-driver（MySQL）、go-redis v9、mongo-driver v2 |
+| 权限 | Casbin v2 |
+| 密码 | bcrypt（`golang.org/x/crypto`）+ golang-jwt v5 |
+| 前端 | React 18 + TypeScript + Ant Design 5 + CodeMirror 6 + Vite |
+
+**没有 Trino。** 早期规划里写过「基于 Trino 的跨库跨实例联邦查询」，但代码中没有任何
+Trino 依赖或实现，跨库查询目前只能靠用户自己在一条 SQL 里写 `库名.表名`
+（同一数据源内）。请不要按 README 找 Trino 相关配置——它不存在。
 
 ## 快速开始
 
 ### 前置要求
 
-- Go 1.22 或更高版本（[下载](https://go.dev/dl/)，选 `.msi` 安装包）
+- Go 1.27 或更高版本（`go.mod` 声明为 `go 1.27.4`；[下载](https://go.dev/dl/)，选 `.msi` 安装包）
 - PostgreSQL 16
 - Redis 7
 
@@ -421,7 +459,14 @@ npm run dev
 
 访问 http://localhost:5173 。Vite 已配置 `/api` 代理到 `localhost:8080`，无需处理跨域。
 
-首次访问需要先有一个账号登录。系统不内置默认账号：
+首次访问需要先有一个账号登录。系统不内置默认账号，推荐用现成的初始化脚本：
+
+```bash
+psql -h <host> -p 5432 -U <superuser> -f scripts/init.sql
+```
+
+该脚本会创建库、表结构与一个初始 `superadmin` 账号，整体幂等可重复执行
+（重跑会重置初始账号密码）。也可手工插入：
 
 ```sql
 -- 用 bcrypt 生成密码哈希后插入
@@ -429,12 +474,18 @@ INSERT INTO app_user (username, email, password_hash, role)
 VALUES ('admin', 'admin@example.com', '<bcrypt-hash>', 'superadmin');
 ```
 
+拿到 superadmin 后，后续账号都可以在「用户管理」页面创建，不需要再碰 SQL。
+
 ### 常用流程
 
-1. **DBA 配置数据源**：数据源管理 → 新增，勾选「开放申请」，设置最长天数与可申请库表范围
-2. **开发者申请**：申请授权 → 选择数据源 → 选范围、填天数与理由 → 提交
-3. **DBA 审批**：授权审批 → 通过（可填意见）→ 授权立即生效，无需重启
-4. **开发者查询**：数据查询 → 选数据源与库 → 执行（库下所有表都可查，无需选表）
+1. **准备超级管理员**：按上节插入第一个 `superadmin` 账号（或用 `scripts/init.sql`）
+2. **管理员建组与账号**：用户管理 → 新建用户，选择角色与所属组；初始密码只展示一次
+3. **DBA 配置数据源**：数据源管理 → 新增，勾选「开放申请」，设置最长天数
+4. **开发者申请**：申请授权 → 选择数据源 → 填申请天数与理由 → 提交（不用选库）
+5. **DBA 审批**：授权审批 → 通过（可填意见）→ 授权立即生效，无需重启
+6. **开发者查询**：数据查询 → 选数据源与库 → 执行（库下所有表都可查，无需选表）
+
+> 审批天数决定授权有效期，到期后靠 `AUTHZ_REFRESH_SEC`（默认 60 秒）内的定时重建回收。
 
 生产构建：
 
@@ -468,10 +519,17 @@ curl -s http://localhost:8080/api/v1/datasources -H "Authorization: Bearer $TOKE
 
 本项目会连接生产数据库，部署前请务必了解以下约束：
 
-- **临时账号方案**需要平台在生产库持有 `CREATE USER` / `DROP USER` 权限，这是风险集中点。账号名必须可反查工单，凭据阅后即焚，到期撤销失败必须重试并告警
-- **行镜像存储生产数据副本**，平台元数据库会承载生产敏感数据。该库的安全等级、备份策略必须与业务库对齐，镜像内容需应用层加密后落库
+**当前已生效：**
+
+- **数据源密码明文存储**，平台元数据库必须做访问控制与网络隔离，备份文件需加密（见上文「数据源凭据」）
 - **Redis 查询绝不使用 `KEYS` 命令**，只允许 `SCAN` 游标；这条约束由自动化测试护栏保证
 - **不要用生产库做测试库**，测试会执行建表和删表
+- **账号管理只对 superadmin 开放**，dba 可通过改数据源与审批间接获得很多能力，不能再给它改账号的权限
+
+**阶段二才涉及（当前代码中不存在，部署时不必准备）：**
+
+- **临时账号方案**需要平台在生产库持有 `CREATE USER` / `DROP USER` 权限，这是风险集中点。账号名必须可反查工单，凭据阅后即焚，到期撤销失败必须重试并告警
+- **行镜像存储生产数据副本**，平台元数据库会承载生产敏感数据。该库的安全等级、备份策略必须与业务库对齐，镜像内容需应用层加密后落库
 
 ### 账号删除是逻辑删除
 
@@ -507,13 +565,47 @@ dba 可以把自己提成 superadmin，角色分级就形同虚设。
 用它来判断「谁有权改 `app_user`」会形成循环依赖：策略重建一旦出错，
 连修账号的入口都会一起消失。
 
+### 组不承载数据权限
+
+组是纯归类的组织单元（类似部门），**不生成任何 Casbin 策略**。
+用户能查什么，只取决于它自己的 `grant_record`。要改成「按组授权」，
+必须同时改 `querysvc` 的鉴权与 `SyncGrants` 的策略重建，否则会出现
+「界面上看起来有权、实际查不了」的分裂。
+
+## 数据库迁移
+
+迁移脚本在 `internal/db/migrations/`，**编号全局递增，只增不改**。
+`db.Migrate` 没有版本表，靠脚本自身幂等来保证可重复执行，
+所以新写的迁移必须写成 `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` 风格。
+
+当前共 9 个迁移，新增前先 `ls internal/db/migrations` 确认编号没被占用
+（`0003` 曾被复用过一次，是踩过的坑）：
+
+| 编号 | 内容 |
+|---|---|
+| `0001` | 初始表结构 |
+| `0002` | 可申请配置 |
+| `0003` | 数据源凭据 |
+| `0004` | 明文密码列 |
+| `0005` | 数据源认证库 |
+| `0006` | 数据源高级连接参数 |
+| `0007` | 库级授权范围（`apply_scopes` 随后废弃） |
+| `0008` | 授权范围提升为整数据源 |
+| `0009` | 用户组与账号状态 |
+
 ## 贡献
 
-提交前请确认：
+提交前请确认（唯一权威来源是 `CONTRIBUTING.md`，冲突以它为准）：
 
 1. 没有把 `.env.local` 或任何含真实凭据的文件加入暂存区
-2. `go build ./...` 和 `go test ./...` 通过
+2. `go build ./...`、`go vet ./...`、`go test ./...` 通过；改动前端时
+   `cd web && npm run lint && npm run build` 也通过
 3. 新增的敏感配置项同步更新 `.env.example`（只写占位符）
+4. 触及鉴权时：`syncAuthz` 后补了 `reAddBuiltinPolicies`，权限判定在
+   `querysvc` / handler 而非 `adapter`
+5. 新增逻辑带了测试；Redis 测试 key 带 `dwtest:` 前缀
+6. **没有整体 `gofmt -w`**——仓库文件是 CRLF，整体格式化会产生全文件 diff
+7. 每完成一项任务立即 `git commit`，但**不自动 push**
 
 ## 许可证
 
