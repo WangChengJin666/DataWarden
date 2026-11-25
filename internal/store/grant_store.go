@@ -34,12 +34,27 @@ func (s *GrantStore) Create(ctx context.Context, g *model.Grant) (int64, error) 
 }
 
 // ActiveGrants 返回未撤销且未过期的授权，供 Casbin 重建策略。
+//
+// 必须排除已逻辑删除的账号：grant_record 的行在删除用户时是保留的
+// （那是「谁在什么时候拿到过什么权限」的事实），若这里不加判断，
+// 策略重建会把一个已删账号的授权重新加载进内存——等于「人删了、权限还在」。
+// 排除放在查询里而不是调用方：策略重建是安全关键路径，
+// 让它在数据源头上就只拿到该生效的行，比指望每个调用方都记得过滤可靠。
+//
+// 停用（disabled）不在此排除：停用的权限失效靠「AllRoles 只取 active
+// → g 段没有这个人 → 策略不生效」，授权记录本身保留，便于恢复。
 func (s *GrantStore) ActiveGrants(ctx context.Context) ([]model.Grant, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, user_id, datasource_id, scope, action, expires_at, revoked_at, created_at
-		 FROM grant_record
-		 WHERE revoked_at IS NULL AND expires_at > $1
-		 ORDER BY id`, time.Now())
+		`SELECT g.id, g.user_id, g.datasource_id, g.scope, g.action,
+		        g.expires_at, g.revoked_at, g.created_at
+		 FROM grant_record g
+		 WHERE g.revoked_at IS NULL
+		   AND g.expires_at > $1
+		   AND EXISTS (
+		       SELECT 1 FROM app_user u
+		        WHERE u.id = g.user_id AND u.status <> $2
+		   )
+		 ORDER BY g.id`, time.Now(), string(model.StatusDeleted))
 	if err != nil {
 		return nil, fmt.Errorf("query active grants: %w", err)
 	}
@@ -72,6 +87,10 @@ func (s *GrantStore) Revoke(ctx context.Context, id int64) error {
 //
 // 与 ActiveGrants 的区别是带了 username / datasource_name：
 // 管理页要显示「谁能查哪个库」，只有 ID 没法用。
+//
+// 同样排除已逻辑删除的账号：行还在（审计需要），但它已经不代表任何可用权限。
+// 显示在「授权管理」页会让 DBA 误判「这个人还能查库」而去点回收，
+// 回收一条语义上已失效的记录纯属噪音。
 func (s *GrantStore) ListActive(ctx context.Context, limit int) ([]model.GrantView, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
@@ -83,8 +102,9 @@ func (s *GrantStore) ListActive(ctx context.Context, limit int) ([]model.GrantVi
 		 JOIN app_user u   ON u.id = g.user_id
 		 JOIN datasource d ON d.id = g.datasource_id
 		 WHERE g.revoked_at IS NULL AND g.expires_at > now()
+		   AND u.status <> $2
 		 ORDER BY g.expires_at, g.id
-		 LIMIT $1`, limit)
+		 LIMIT $1`, limit, string(model.StatusDeleted))
 	if err != nil {
 		return nil, fmt.Errorf("list active grants: %w", err)
 	}
