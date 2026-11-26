@@ -1614,7 +1614,14 @@ export default function QueryPage() {
           {resultTable}
         </Card>
       ) : null}
-      {redisResult ? <Card title="Redis 查询结果">{redisTable}</Card> : null}
+      {/* Redis 的结果在单独一张卡片里，导出按钮要跟着结果走：
+          只挂在上面那张「查询结果」卡片上的话，选了 Redis 永远看不到按钮，
+          哪怕导出权限已经批了。 */}
+      {redisResult ? (
+        <Card title="Redis 查询结果" extra={isRedis ? exportButton() : undefined}>
+          {redisTable}
+        </Card>
+      ) : null}
 
       <Paragraph type="secondary" style={{ fontSize: 12 }}>
         提示：所有查询都会记录审计日志，包含 SQL、涉及表、返回行数与耗时。
