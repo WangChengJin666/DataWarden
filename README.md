@@ -95,13 +95,19 @@ dba 额外看到数据源管理、授权审批、授权管理三页；用户管�
 |---|---|
 | 导出**不进 Casbin** | `act` 段目前只有 `read`。把导出做成 `act=export` 要为每条授权多写一条策略，而判定只需要一个布尔值——两套事实源迟早对不上。判定放在 `httpapi.ExportHandler` |
 | 后端**重新执行**语句，而不是接收前端回传的表格 | 前端手里的那份是当前分页、且可被篡改；重新执行后导出的内容可复现，审计才说得清。脱敏规则同样生效 |
-| 导出单独记一条审计（`export.sql` / `export.mongo`） | 数据外带必须能回答「谁、什么时候、导走了哪些数据、多少行」 |
-| Redis 不支持导出 | 它的形态是 key→值（hash / list / zset / 二进制），摊平成二维表没有合理语义 |
+| 导出单独记一条审计（`export.sql` / `export.mongo` / `export.redis`） | 数据外带必须能回答「谁、什么时候、导走了哪些数据、多少行」 |
+| Redis 导出按「一个元素一行」摊平 | key→值 不是二维表，但 Excel 的用法（筛选、透视）要求一行一条记录。规则：`string` 1 行；`hash` 每个 field 一行；`list` 每个下标一行；`set` / `zset` 每个成员一行（zset 的 score 进 value）。列为 `key / type / field_or_index / value / ttl_seconds / encoding`；二进制 string 导出十六进制并在 `encoding` 标明形态 |
+| Redis 导出**不脱敏** | Redis 查询本身就不脱敏，导出与查询同一口径；审批 Redis 的导出时须知悉这一点 |
+| Redis 导出有两级闸门 | 导出权限只到 db，而查询权限可以细到 key 前缀。只有 db 级闸门时，持 `37:user:1001` 前缀授权的人能导出 db 37 里任意 key，所以 key 级判定（与查询共用 `KeyCandidates`）也必须是闸门 |
 | DBA 可以单独关掉某条授权的导出 | 「先别让他导数据」远多于「让他完全不能查」；否则只能整条收回，再走一遍审批 |
 
 行数上限：默认 5000 行，最大 20000 行（`exportMaxRowLimit`）。不设上限时一条
 `SELECT` 就能把整库拉进内存转 xlsx，任何拿到授权的账号都能触发。达到上限时响应头
 `X-Export-Truncated: 1`，前端会提示「结果被截断」。
+
+Redis 的上限有两层：「限 N 行」控制最多取多少个 **key**，同时受服务端扫描上限
+（`REDIS_SCAN_MAX_KEYS`，默认 200）约束；单个 key 展开后的元素数（hash 的 field、
+list 的元素）另有限制，所以「200 行」对 Redis 指的是 200 个 key 而不是 200 行表格。
 
 Excel 生成在 `internal/xlsx`，只写「表头 + 单元格」这一种最小 xlsx（六个 zip 部件），
 不引第三方库。长数字一律按文本写（`numFmtId=49`），否则订单号、身份证号打开就是
@@ -124,7 +130,7 @@ Excel 生成在 `internal/xlsx`，只写「表头 + 单元格」这一种最小 
 | POST | `/query/sql` | 需库级授权 | 执行只读 SQL |
 | POST | `/query/redis` | 需 key 前缀授权 | 执行 Redis 查询（精确 key 或 SCAN 模式） |
 | POST | `/query/mongo` | 需库级授权 | 执行 MongoDB 查询（集合+过滤 或 原生命令） |
-| POST | `/query/export` | 需库级授权 **且** 该数据源批了导出 | 重新执行查询并导出 xlsx |
+| POST | `/query/export` | 需库级 / key 级授权 **且** 该数据源批了导出 | 重新执行查询（SQL / Mongo / Redis）并导出 xlsx |
 | POST | `/grants/:id/export` | dba / superadmin | 单独开关某条授权的导出能力 |
 | GET | `/datasources/:id/databases` | 已登录 | 列出可见的库（按授权过滤） |
 | GET | `/datasources/:id/tables?db=` | 已登录 | 列出库下可见的表（按授权过滤） |

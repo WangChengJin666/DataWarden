@@ -131,6 +131,8 @@ func main() {
 			// 只用于把「没查询权限」与「有查询权限但没批导出」区分开，
 			// 给出不同的提示；不参与放行判断。
 			Enforcer: enforcer,
+			// Redis 导出复用查询的同一套连接与 db 号解析。
+			RedisFactory: makeRedisTargetFactory(ctx, dsStore, cfg),
 		},
 		Redis: &httpapi.RedisHandler{
 			Enforcer: enforcer,

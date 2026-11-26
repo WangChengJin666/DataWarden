@@ -300,13 +300,18 @@ export async function executeSQL(payload: {
  */
 export async function exportQuery(payload: {
   datasource_id: number
-  type: 'sql' | 'mongo'
+  /** 三种数据源共用一个导出接口，后端按 type 分派 */
+  type: 'sql' | 'mongo' | 'redis'
   database?: string
   collection?: string
   /** Mongo 原生命令，与 collection/filter 二选一 */
   command?: string
   filter?: string
   sql?: string
+  /** Redis：精确 key，与 pattern 二选一 */
+  key?: string
+  /** Redis：SCAN 模式 */
+  pattern?: string
   row_limit?: number
   filename?: string
 }): Promise<{ blob: Blob; filename: string; truncated: boolean }> {

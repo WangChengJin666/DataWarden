@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/opensourceprj/datawarden/internal/adapter"
 	"github.com/opensourceprj/datawarden/internal/model"
 	"github.com/opensourceprj/datawarden/internal/querysvc"
+	"github.com/opensourceprj/datawarden/internal/redisq"
 	"github.com/opensourceprj/datawarden/internal/xlsx"
 )
 
@@ -67,7 +70,8 @@ type ExportDenier interface {
 	Enforce(subject, object, action string) bool
 }
 
-// ExportHandler 把一次查询结果导出成 Excel（.xlsx）。
+// ExportHandler 把一次查询结果导出成 Excel（.xlsx）。支持 SQL / Mongo / Redis
+// 三种数据源类型，走同一个接口、同一套导出闸门。
 //
 // 为什么不是「前端把表格数据 POST 回来让后端转格式」：
 // 那样导出的是前端手里的那一份（可能被用户改过、可能只有当前分页），
@@ -85,6 +89,9 @@ type ExportHandler struct {
 	// Enforcer 用于区分「没查询权限」与「没导出权限」，可为 nil
 	//（此时两种情况都回同一句话，不影响安全性）。
 	Enforcer ExportDenier
+	// RedisFactory 解析 Redis 数据源的连接与 db 号，供 type=redis 的导出使用。
+	// 为 nil 时 Redis 导出一律 503（其余类型不受影响）。
+	RedisFactory RedisTargetFactory
 }
 
 // 导出的行数上限。
@@ -106,7 +113,7 @@ const (
 // 脱敏」变成一个问题，而答案永远是"不能"。
 type exportRequest struct {
 	DatasourceID int64  `json:"datasource_id" binding:"required"`
-	// Type 决定按哪种查询执行：sql / mongo。Redis 不支持导出（见 Export）。
+	// Type 决定按哪种查询执行：sql / mongo / redis。
 	Type       string   `json:"type" binding:"required"`
 	Database   string   `json:"database"`
 	Collection string   `json:"collection"`
@@ -114,7 +121,10 @@ type exportRequest struct {
 	SQL        string   `json:"sql"`
 	Filter     string   `json:"filter"`
 	Command    string   `json:"command"`
-	RowLimit   int      `json:"row_limit"`
+	// Key / Pattern 仅 Redis 使用，与 /query/redis 同义：精确 key 或 SCAN 模式，二选一。
+	Key       string `json:"key"`
+	Pattern   string `json:"pattern"`
+	RowLimit  int    `json:"row_limit"`
 	// Filename 是前端建议的文件名（不含扩展名），后端只做清洗，
 	// 不接受任意字符——它直接进 Content-Disposition。
 	Filename string `json:"filename"`
@@ -148,16 +158,17 @@ func (h *ExportHandler) Export(c *gin.Context) {
 	// 两处必须同步改，否则会出现"过了校验但进不了分支"的空档。
 	kind := strings.ToLower(strings.TrimSpace(req.Type))
 	switch kind {
-	case "sql", "mongo":
+	case "sql", "mongo", "redis":
 		// 合法，继续
-	case "redis":
-		// Redis 的结果是 key → 类型 → 值（hash / list / zset / 二进制），
-		// 塞进二维表只会得到一列乱糟糟的字符串；要给一份能用的表格
-		// 得先决定"一个 key 的 100 个元素怎么摊平"，那是产品决定而不是导出功能。
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Redis 查询结果暂不支持导出"})
-		return
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "type must be one of sql, mongo"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "type must be one of sql, mongo, redis"})
+		return
+	}
+
+	// Redis 的鉴权对象、执行通道、结果摊平方式都与 SQL / Mongo 不同，
+	// 单独走一条路径，不在下面的闸门里掺条件分支。
+	if kind == "redis" {
+		h.exportRedis(c, &req)
 		return
 	}
 
@@ -284,9 +295,147 @@ func (h *ExportHandler) Export(c *gin.Context) {
 		return
 	}
 
-	// 3. 生成 xlsx。失败只影响下载，不影响已经发生的查询——
-	//    查询本身已在 querysvc 里审计过（query.execute / mongo.execute）。
-	book, err := xlsx.FromQueryResult(res.Columns, res.Rows)
+	writeExport(c, req, res.Columns, res.Rows, res.Truncated, action, rowLimit, map[string]any{
+		"database":   req.Database,
+		"collection": req.Collection,
+	})
+}
+
+// exportRedis 把一次 Redis 查询结果导出成 xlsx。
+//
+// 与 RedisHandler.Query 的差别同样只有两点：多一道导出闸门，输出变成文件。
+//
+// 闸门是两级的，缺一不可：
+//  1. 导出权限：CanExportDatabase(uid, ds, <db 号>)。Redis 没有库名，
+//     Casbin 对象里的「库」段就是数据源配置的 db 号（ds:<id>:<db>:<key>），
+//     这里必须传同一个数字，否则整源授权（scope "*"）之外的库级授权对不上。
+//  2. key 级查询权限：与查询接口同一套候选（KeyCandidates）。
+//     第 1 级只到 db，而查询权限可以细到 key 前缀，少了这一级，
+//     导出就成了比查询更宽的旁路。
+//
+// 第 2 级拒绝时的文案与第 1 级不同：前者是「这个 key 你本来就不能查」，
+// 后者是「能查但没批导出」，用户据此走不同的修正路径。
+//
+// 不脱敏：Redis 查询本身就不脱敏（见查询页提示），导出与查询同一口径，
+// 不在导出这一步单独加一层——那会让「页面上看得到、导出后不一样」
+// 成为新的困惑来源。
+func (h *ExportHandler) exportRedis(c *gin.Context, req *exportRequest) {
+	if h.RedisFactory == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "redis export not configured"})
+		return
+	}
+
+	key := strings.TrimSpace(req.Key)
+	pattern := strings.TrimSpace(req.Pattern)
+	// 校验顺序与 RedisHandler.Query 一致：参数问题是 400，先于权限。
+	switch {
+	case key != "" && pattern != "":
+		c.JSON(http.StatusBadRequest, gin.H{"error": "key 与 pattern 只能二选一"})
+		return
+	case key == "" && pattern == "":
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请输入 key 或 key 模式"})
+		return
+	}
+
+	uid, _, role := currentUser(c)
+
+	target, err := h.RedisFactory(c.Request.Context(), req.DatasourceID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	subject := key
+	if key == "" {
+		subject = pattern
+	}
+
+	// 导出闸门：管理角色免授权，开发者必须有覆盖该 db 的 can_export 授权。
+	authzDB := strconv.Itoa(target.Database)
+	if !model.Role(role).IsPrivileged() {
+		if h.Grants == nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "no permission to export"})
+			return
+		}
+		allowed, err := h.Grants.CanExportDatabase(c.Request.Context(), uid, req.DatasourceID, authzDB)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+		if !allowed {
+			// 与 SQL / Mongo 同样的两种拒绝分开提示。
+			if h.Enforcer != nil && !enforceRedisKey(
+				h.Enforcer, SubjectOf(uid), req.DatasourceID, target.Database, subject) {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error": "no permission for this redis key or pattern（该 key 无查询权限，需先申请数据源授权）",
+				})
+				return
+			}
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "当前授权不包含导出权限，请在「申请授权」页勾选「可导出查询结果」后重新申请",
+			})
+			return
+		}
+		// 2. key 级查询权限：必须是闸门，不能只用来措辞。
+		//
+		// CanExportDatabase 的粒度是 db，而授权可以是 key 前缀级的
+		//（scope "37:user:1001" 覆盖 db 37）。只查第 1 级的话，持前缀授权
+		// 的人能查 user:1001:*，却能导出 db 37 里的**任意** key——
+		// 导出比查询的权限还大。判定与 RedisHandler.Query 共用同一套候选。
+		//
+		// Enforcer 为 nil 时无法证明 key 在授权范围内，拒绝（fail-closed）：
+		// 导出是数据外带动作，权限不明时不能靠猜。
+		if h.Enforcer == nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "no permission to export"})
+			return
+		}
+		if !enforceRedisKey(h.Enforcer, SubjectOf(uid), req.DatasourceID, target.Database, subject) {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "no permission for this redis key or pattern（该 key 无查询权限，需先申请数据源授权）",
+			})
+			return
+		}
+	}
+
+	rowLimit := clampExportRows(req.RowLimit)
+
+	// 仍然走 redisq：模式校验、SCAN 限流、单集合元素上限全部复用。
+	res, err := target.Query.Query(c.Request.Context(), redisq.QueryRequest{
+		Key:      key,
+		Pattern:  pattern,
+		RowLimit: rowLimit,
+	})
+	if err != nil {
+		code := http.StatusInternalServerError
+		if errors.Is(err, redisq.ErrPatternTooBroad) {
+			code = http.StatusBadRequest
+		}
+		c.JSON(code, gin.H{"error": err.Error()})
+		return
+	}
+	if res == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "redis query returned no result"})
+		return
+	}
+
+	columns, rows := redisExportRows(res)
+	writeExport(c, *req, columns, rows, res.Truncated, "export.redis", rowLimit, map[string]any{
+		"db":      target.Database,
+		"key":     key,
+		"pattern": pattern,
+		"keys":    len(res.Items),
+	})
+}
+
+// writeExport 是三种类型共用的收尾：生成 xlsx、写响应头、记一条导出审计。
+//
+// extra 是各类型自己的审计明细（库 / 集合，或 key / 模式），
+// 与公共字段合并后写入。
+func writeExport(c *gin.Context, req exportRequest, columns []string, rows [][]any,
+	truncated bool, action string, rowLimit int, extra map[string]any) {
+	uid, username, _ := currentUser(c)
+
+	book, err := xlsx.FromQueryResult(columns, rows)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "generate xlsx: " + err.Error()})
 		return
@@ -298,22 +447,101 @@ func (h *ExportHandler) Export(c *gin.Context) {
 	c.Header("Content-Length", fmt.Sprintf("%d", len(book)))
 	// 前端靠这个响应头拿真实文件名与截断标记：Content-Disposition 里的
 	// 中文名经过 RFC 5987 编码，直接读出来是一串 %E4%...
-	c.Header("X-Export-Rows", fmt.Sprintf("%d", len(res.Rows)))
-	c.Header("X-Export-Truncated", boolStr(res.Truncated))
+	c.Header("X-Export-Rows", fmt.Sprintf("%d", len(rows)))
+	c.Header("X-Export-Truncated", boolStr(truncated))
 
 	// 单独一条审计：导出与外带相关，不能只在查询审计里留个痕。
 	// 记下这个数据源、语句与行数，事后能回答"他到底导走了什么"。
-	auditEvent(c, uid, username, action, req.DatasourceID, map[string]any{
-		"database":   req.Database,
-		"collection": req.Collection,
-		"row_count":  len(res.Rows),
-		"truncated":  res.Truncated,
-		"row_limit":  rowLimit,
-		"query":      exportQueryText(req),
-		"bytes":      len(book),
-	})
+	detail := map[string]any{
+		"row_count": len(rows),
+		"truncated": truncated,
+		"row_limit": rowLimit,
+		"query":     exportQueryText(req),
+		"bytes":     len(book),
+	}
+	for k, v := range extra {
+		detail[k] = v
+	}
+	auditEvent(c, uid, username, action, req.DatasourceID, detail)
 
 	c.Data(http.StatusOK, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", book)
+}
+
+// redisExportRows 把 Redis 的 key → 值摊平成二维表。
+//
+// 这是 Redis 导出唯一需要「做决定」的地方：一个 key 下面可能有
+// 上千个元素，必须定一个展开规则。采用的规则是**一个元素一行**，
+// key 本身的信息在每行重复，这样在 Excel 里按 key 篩选、透视都能直接用：
+//
+//	string  → 1 行，value 为文本；二进制 / HyperLogLog 的 value 是十六进制，
+//	          encoding 列标明形态（否则用户会把 hex 当成真正的值）
+//	hash    → 每个 field 一行，field_or_index = field 名（按名排序，结果可复现）
+//	list    → 每个下标一行，field_or_index = 0 起的下标
+//	set     → 每个成员一行（排序后输出；SMembers 本身无序）
+//	zset    → 每个成员一行，field_or_index = member，value = score（按分数序）
+//	none    → 1 行，type=none（精确查询的 key 不存在）
+//	error   → 1 行，type=error（单个 key 读取失败，不影响其余 key）
+//
+// ttl_seconds：有过期时间时是秒数，否则为空（空 = 永久）。
+func redisExportRows(res *redisq.QueryResponse) ([]string, [][]any) {
+	columns := []string{"key", "type", "field_or_index", "value", "ttl_seconds", "encoding"}
+	if res == nil {
+		return columns, nil
+	}
+	rows := make([][]any, 0, len(res.Items))
+	for _, kv := range res.Items {
+		if kv == nil {
+			continue
+		}
+		ttl := any("") // 过期秒数；空串表示永久
+		if kv.TTL > 0 {
+			ttl = kv.TTL
+		}
+		emit := func(field, value any) {
+			rows = append(rows, []any{kv.Key, kv.Type, field, value, ttl, string(kv.Encoding)})
+		}
+		switch kv.Type {
+		case "hash":
+			fields := make([]string, 0, len(kv.Fields))
+			for f := range kv.Fields {
+				fields = append(fields, f)
+			}
+			sort.Strings(fields)
+			for _, f := range fields {
+				emit(f, kv.Fields[f])
+			}
+		case "list":
+			for i, item := range kv.Items {
+				emit(i, item)
+			}
+		case "set":
+			items := append([]string(nil), kv.Items...)
+			sort.Strings(items)
+			for _, item := range items {
+				emit("", item)
+			}
+		case "zset":
+			// redisq 固定给 "member:score"，member 可能含冒号，按最后一个冒号切。
+			for _, item := range kv.Items {
+				member, score := item, ""
+				if i := strings.LastIndex(item, ":"); i >= 0 {
+					member, score = item[:i], item[i+1:]
+				}
+				emit(member, score)
+			}
+		case "string":
+			// 文本给原文；二进制只给十六进制预览（与页面展示同一份数据）。
+			value := any(kv.Value)
+			if kv.Encoding != "" && kv.Encoding != redisq.EncodingText {
+				value = kv.Hex
+			}
+			emit("", value)
+		default:
+			// none / error
+			emit("", "")
+		}
+	}
+	return columns, rows
 }
 
 // exportAuthzDatabase 取出这次导出实际落在哪个库上，用于复刻 querysvc 的
@@ -360,7 +588,8 @@ func pickMongoArgs(req exportRequest) string {
 
 // exportQueryText 是写进审计里的"导出了什么"。
 //
-// Mongo 的两种输入形态合并成一条可读文本；SQL 原样记录。
+// Mongo 的两种输入形态合并成一条可读文本；SQL 原样记录；
+// Redis 记 key 或 pattern。
 // 只用于审计呈现，不参与任何判定。
 func exportQueryText(req exportRequest) string {
 	if strings.TrimSpace(req.Command) != "" {
@@ -368,6 +597,12 @@ func exportQueryText(req exportRequest) string {
 	}
 	if strings.TrimSpace(req.Filter) != "" {
 		return req.Filter
+	}
+	if strings.TrimSpace(req.Key) != "" {
+		return req.Key
+	}
+	if strings.TrimSpace(req.Pattern) != "" {
+		return req.Pattern
 	}
 	return req.SQL
 }

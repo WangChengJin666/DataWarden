@@ -82,6 +82,30 @@ function splitZSetItem(item: string): { member: string; score?: string } {
 }
 
 /**
+ * Redis 输入的本地校验，查询与导出共用一份。
+ *
+ * 导出实际上是「重新执行 + 落文件」，允许导出的条件不能比允许查询更松；
+ * 两处各写一遍的话，改了其中一处就会出现「查不了却能导」或反过来的空档。
+ * 返回 null 表示通过，否则是给用户看的提示。
+ */
+function validateRedisInput(mode: 'exact' | 'scan', raw: string): string | null {
+  if (!raw.trim()) return '请输入 key 或 key 模式'
+  if (mode === 'exact' && /[*?[]/.test(raw)) {
+    return '精确查询不支持通配符，请切换到「模糊 Key」标签页'
+  }
+  if (mode === 'scan') {
+    if (!/[*?[]/.test(raw)) {
+      return '模糊查询需要带通配符（如 user:1001:*），精确 key 请用「精确 Key」'
+    }
+    const prefix = raw.split(/[*?[]/)[0].replace(/[:.\-_/]/g, '')
+    if (prefix.length < 2) {
+      return '模糊查询的前缀至少需要 2 个有效字符，否则扫描范围过宽'
+    }
+  }
+  return null
+}
+
+/**
  * Redis 值详情弹窗。同一个入口承载两类内容，二者都不适合塞进表格一格：
  *   - 集合（list / set / zset）：元素可能上百条，需要搜索与分页；
  *   - 二进制（bitmap / HyperLogLog / 其他）：十六进制串很长，需要完整视图。
@@ -758,19 +782,11 @@ export default function QueryPage() {
         message.warning('请输入 SQL')
         return
       }
-    } else if (!redisKey.trim()) {
-      message.warning('请输入 key 或 key 模式')
-      return
-    } else if (redisMode === 'exact' && /[*?[]/.test(redisKey)) {
-      message.warning('精确查询不支持通配符，请切换到「模糊 Key」标签页')
-      return
-    } else if (redisMode === 'scan' && !/[*?[]/.test(redisKey)) {
-      message.warning('模糊查询需要带通配符（如 user:1001:*），精确 key 请用「精确 Key」')
-      return
-    } else if (redisMode === 'scan') {
-      const prefix = redisKey.split(/[*?[]/)[0].replace(/[:.\-_/]/g, '')
-      if (prefix.length < 2) {
-        message.warning('模糊查询的前缀至少需要 2 个有效字符，否则扫描范围过宽')
+    } else {
+      // 到这里的只会是 Redis（isMongo / isSQL 已在前面分支处理）
+      const redisError = validateRedisInput(redisMode, redisKey)
+      if (redisError) {
+        message.warning(redisError)
         return
       }
     }
@@ -782,10 +798,13 @@ export default function QueryPage() {
     setRedisDetail(null)
     try {
       if (isRedis) {
+        // 带上限：与导出用同一个「限 N 行」，页面上看到多少个 key、
+        // 导出就是多少个（后端 Redis 服务另有扫描上限，超出会被截断）。
+        const base = { datasource_id: datasourceId, row_limit: queryRowLimit }
         const payload =
           redisMode === 'exact'
-            ? { datasource_id: datasourceId, key: redisKey.trim() }
-            : { datasource_id: datasourceId, pattern: redisKey.trim() }
+            ? { ...base, key: redisKey.trim() }
+            : { ...base, pattern: redisKey.trim() }
         setRedisResult(await executeRedis(payload))
         return
       }
@@ -846,7 +865,7 @@ export default function QueryPage() {
   const canExport = current?.can_export === true
 
   /**
-   * 把当前查询结果导出成 Excel。
+   * 把当前查询结果导出成 Excel。SQL / Mongo / Redis 三种数据源都支持。
    *
    * 为什么重新发一次请求而不是把页面上这一份表格转成 CSV：
    *   - 页面上的数据是脱敏、限行、且只渲染了当前分页的；
@@ -878,7 +897,21 @@ export default function QueryPage() {
     // 允许导出的条件不能比允许查询更松。
     const effectiveSql = isSQL ? (pickStatementText() || sql) : sql
     let payload: Parameters<typeof exportQuery>[0]
-    if (isMongo) {
+    if (isRedis) {
+      // 与 run() 共用同一份校验：能导出的前提是这条输入本身能查。
+      const redisError = validateRedisInput(redisMode, redisKey)
+      if (redisError) {
+        message.warning(redisError)
+        return
+      }
+      const subject = redisKey.trim()
+      // 文件名带的是 key / 模式本身，模式里的 * 会被后端清洗成下划线。
+      const filename = `${current?.name ?? 'redis'}_${subject}`
+      payload =
+        redisMode === 'exact'
+          ? { datasource_id: datasourceId, type: 'redis', key: subject, row_limit: rowLimit, filename }
+          : { datasource_id: datasourceId, type: 'redis', pattern: subject, row_limit: rowLimit, filename }
+    } else if (isMongo) {
       if (!database.trim()) {
         message.warning('请选择库')
         return
@@ -1135,11 +1168,15 @@ export default function QueryPage() {
    */
   const exportButton = () => {
     if (!canExport) return null
+    // Redis 与 SQL 一样要求先查出结果：导出的是「你看到的这一份」重新执行
+    // 后的结果，还没查过就导，用户不知道自己会导走什么。Mongo 的命令行模式
+    // 不产生页面表格，所以对它不设这个门槛。
+    const hasResult = isRedis ? redisResult !== null : result !== null || isMongo
     return (
       <Tooltip
         title={
           isRedis
-            ? 'Redis 结果暂不支持导出'
+            ? '按当前 key / key 模式重新查询并导出为 Excel；hash / list / set / zset 逐元素展开成多行'
             : '按当前查询条件重新执行并导出为 Excel（受「限 N 行」约束）'
         }
       >
@@ -1147,7 +1184,7 @@ export default function QueryPage() {
           icon={<DownloadOutlined />}
           onClick={() => void doExport()}
           loading={exporting}
-          disabled={isRedis || (!result && !isMongo)}
+          disabled={!hasResult}
         >
           导出 Excel
         </Button>
@@ -1198,6 +1235,9 @@ export default function QueryPage() {
                   ? '管理角色免授权，任意 key 与前缀都可查询。'
                   : '授权范围按 key 前缀判定，前缀授权会自动覆盖其下所有子 key。'}
                 模糊查询走 SCAN，绝不使用 KEYS。
+                {canExport
+                  ? ' 当前数据源已批导出权限，可把结果导出为 Excel（集合类型逐元素展开成多行）；Redis 结果不做脱敏，导出内容同样不脱敏，并单独记入审计日志。'
+                  : ''}
               </span>
             ) : (
               <span>

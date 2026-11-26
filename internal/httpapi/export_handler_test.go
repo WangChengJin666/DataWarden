@@ -309,17 +309,26 @@ func TestExport_FailsClosedWhenGateErrors(t *testing.T) {
 	}
 }
 
-// Redis 结果不做导出：它的形态是 key→值，摊平成二维表没有合理语义。
-// 明确回 400 而不是生成一个乱七八糟的文件。
-func TestExport_RejectsRedis(t *testing.T) {
-	h := newExportHandler(&fakeExportGrants{allowed: map[string]bool{grantKey(1, "shop"): true}})
-	w := doExport(t, h, string(model.RoleDeveloper), map[string]any{
-		"datasource_id": 1, "type": "redis", "key": "user:1",
-	})
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400, body=%s", w.Code, w.Body.String())
+// 审计里的导出文本要带上查询内容：SQL / Mongo / Redis 各取各的字段。
+func TestExportQueryText(t *testing.T) {
+	cases := []struct {
+		req  exportRequest
+		want string
+	}{
+		{exportRequest{SQL: "select 1"}, "select 1"},
+		{exportRequest{Filter: `{"a":1}`, SQL: "select 1"}, `{"a":1}`},
+		{exportRequest{Command: "db.t.find()", SQL: "select 1"}, "db.t.find()"},
+		{exportRequest{Key: "user:1"}, "user:1"},
+		{exportRequest{Pattern: "user:*"}, "user:*"},
+	}
+	for _, c := range cases {
+		if got := exportQueryText(c.req); got != c.want {
+			t.Errorf("exportQueryText(%+v) = %q, want %q", c.req, got, c.want)
+		}
 	}
 }
+
+// Redis 导出见 export_redis_test.go。
 
 // 导出文件名会被塞进 Content-Disposition，必须挡住路径与头注入字符；
 // 中文要保留（用户看得懂），扩展名统一由后端补。
@@ -380,7 +389,7 @@ func TestExport_InvalidTypeBeforePermissionCheck(t *testing.T) {
 	grants := &fakeExportGrants{allowed: map[string]bool{}}
 	h := newExportHandler(grants)
 
-	for _, typ := range []string{"mysql", "SQLx", "", "redis"} {
+	for _, typ := range []string{"mysql", "SQLx", "", "mongodb"} {
 		w := doExport(t, h, string(model.RoleDeveloper), map[string]any{
 			"datasource_id": 1, "type": typ, "database": "shop", "sql": "select 1",
 		})

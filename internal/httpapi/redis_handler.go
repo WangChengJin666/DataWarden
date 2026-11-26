@@ -122,9 +122,17 @@ func SubjectOf(uid int64) string {
 // EnforceKey 判断用户是否有权访问给定的 key 或 pattern。
 // 候选对象由具体到宽泛依次尝试，任意一个命中即放行。
 func (h *RedisHandler) EnforceKey(user string, dsID int64, db int, subject string) bool {
+	return enforceRedisKey(h.Enforcer, user, dsID, db, subject)
+}
+
+// enforceRedisKey 是 key 级鉴权的唯一实现，查询与导出共用。
+//
+// 两处必须是同一套判定：导出若自己拼一遍候选，改了其中一处就会
+// 出现「查得到、导出时却说没权限」（或反过来）的不一致。
+func enforceRedisKey(enf ExportDenier, user string, dsID int64, db int, subject string) bool {
 	base := fmt.Sprintf("ds:%d:%d", dsID, db)
 	for _, cand := range KeyCandidates(subject) {
-		if h.Enforcer.Enforce(user, base+":"+cand, "read") {
+		if enf.Enforce(user, base+":"+cand, "read") {
 			return true
 		}
 	}
