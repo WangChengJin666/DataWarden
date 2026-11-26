@@ -3,6 +3,7 @@ import {
   Alert,
   Button,
   Card,
+  Checkbox,
   Form,
   Input,
   InputNumber,
@@ -68,6 +69,8 @@ export default function ApplyPage() {
     form.resetFields()
     form.setFieldsValue({
       days: Math.min(7, ds.max_apply_days),
+      // 默认不勾：导出是数据外带，要用户主动选，不替他做主。
+      can_export: false,
     })
     setModalOpen(true)
   }
@@ -80,6 +83,9 @@ export default function ApplyPage() {
         datasource_id: selected.id,
         days: values.days,
         reason: values.reason,
+        // 明确传布尔值：不勾也要把 false 发过去，
+        // 让「这个人是主动不要导出」和「旧客户端没这个字段」在库里可区分。
+        can_export: values.can_export === true,
       })
       message.success('申请已提交，等待 DBA 审批')
       setModalOpen(false)
@@ -164,6 +170,13 @@ export default function ApplyPage() {
     { title: '数据源', dataIndex: 'datasource_name', width: 160 },
     { title: '天数', dataIndex: 'days', width: 70 },
     {
+      title: '导出',
+      dataIndex: 'can_export',
+      width: 80,
+      render: (v: boolean) =>
+        v ? <Tag color="blue">可导出</Tag> : <Text type="secondary">仅查看</Text>,
+    },
+    {
       title: '状态',
       dataIndex: 'status',
       width: 100,
@@ -217,6 +230,7 @@ export default function ApplyPage() {
         <Text type="secondary" style={{ fontSize: 12 }}>
           审批通过后即可查询该数据源下的全部库与表，申请时无需选择库；
           已持有授权或申请仍在审批中的数据源显示为「已申请」，无需重复提交。
+          需要导出 Excel 的请在申请时勾选「可导出查询结果」，导出权限按数据源单独审批。
         </Text>
       </Card>
 
@@ -259,6 +273,21 @@ export default function ApplyPage() {
           >
             <InputNumber min={1} max={selected?.max_apply_days ?? 1} addonAfter="天" style={{ width: '100%' }} />
           </Form.Item>
+          {/* 导出权限是独立的一项：查询权限和导出权限分开审批，
+              同一份授权里没勾导出，就只能在页面上看结果、不能落成文件。 */}
+          <Form.Item
+            name="can_export"
+            valuePropName="checked"
+            style={{ marginBottom: 8 }}
+          >
+            <Checkbox>可导出查询结果</Checkbox>
+          </Form.Item>
+          <div style={{ marginBottom: 16 }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              勾选后审批通过可在查询页把结果导出为 Excel，不勾则只能在线查看。
+              导出权限按数据源单独生效：这里只影响 {selected?.name ?? '该数据源'}，不会带到其它数据源上。
+            </Text>
+          </div>
           <Form.Item
             name="reason"
             label="申请理由"

@@ -228,9 +228,16 @@ type Grant struct {
 	DatasourceID int64      `json:"datasource_id"`
 	Scope        string     `json:"scope"`
 	Action       string     `json:"action"` // 目前只支持 read
-	ExpiresAt    time.Time  `json:"expires_at"`
-	RevokedAt    *time.Time `json:"revoked_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
+	// CanExport 表示这条授权是否允许把查询结果导出成 Excel。
+	//
+	// 它跟着「单条授权」走，而不是跟着用户或组走：同一个人完全可能
+	// A 数据源批了导出、B 数据源没批，那是两次独立审批各自的决定。
+	// 导出**不进 Casbin**（act 段只有 read），判定在 httpapi 的导出接口；
+	// 理由见迁移 0010 的注释。
+	CanExport bool       `json:"can_export"`
+	ExpiresAt time.Time  `json:"expires_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 // GrantView 是授权的展示形态：在 Grant 基础上补上用户名与数据源名。
@@ -246,8 +253,10 @@ type GrantView struct {
 	DatasourceName string    `json:"datasource_name"`
 	Scope          string    `json:"scope"`
 	Action         string    `json:"action"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	CreatedAt      time.Time `json:"created_at"`
+	// CanExport 见 Grant.CanExport：该用户在这个数据源上能否导出查询结果。
+	CanExport bool      `json:"can_export"`
+	ExpiresAt time.Time `json:"expires_at"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // ScopeView 是授权范围的结构化形态，供前端直接渲染权限提示。
@@ -287,6 +296,17 @@ type DatasourceBrief struct {
 	Database string `json:"database"`
 	// Scopes 是该用户在这个数据源上的授权范围（已结构化）。
 	Scopes []ScopeView `json:"scopes"`
+	// CanExport 表示该用户在这个数据源上能否把查询结果导出成 Excel。
+	//
+	// 放在这个结构里是因为查询页的「导出」按钮就按它显隐，而下拉的数据
+	// 正是由这个接口一次给全的——不在这里带上，前端就得为每个数据源
+	// 再发一次请求去问「这个源能不能导出」。
+	//
+	// 它的取值口径：
+	//   - 开发者为 true 当且仅当该数据源上存在一条生效授权 can_export=true
+	//     （多条授权时取「或」：另一次审批批过导出就是批过）；
+	//   - 管理角色（dba / superadmin）恒为 true，与免授权查询同一口径。
+	CanExport bool `json:"can_export"`
 }
 
 type AuditLog struct {
@@ -325,6 +345,12 @@ type GrantRequest struct {
 	Scope          string             `json:"scope"`
 	Days           int                `json:"days"`
 	Reason         string             `json:"reason"`
+	// CanExport 是申请人的诉求：是否要求把查询结果导出成 Excel。
+	//
+	// 只是留痕，实际权限由审批通过时复制到 grant_record.can_export 的那份决定。
+	// 不直接生效是刻意的：否则申请人在审批前改一下勾选就等于自己给自己
+	// 加了导出，审批人所看到的与最终生效的就不是同一件事。
+	CanExport      bool               `json:"can_export"`
 	Status         GrantRequestStatus `json:"status"`
 	ReviewerID     *int64             `json:"reviewer_id,omitempty"`
 	ReviewComment  string             `json:"review_comment"`

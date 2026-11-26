@@ -99,6 +99,15 @@ export default function ReviewPage() {
     },
     { title: '天数', dataIndex: 'days', width: 60 },
     {
+      // 导出权限必须在审批列表里显式可见：DBA 批的是「查询 + 导出」两件事，
+      // 而导出意味着数据能落成本地带走，漏看这一列就等于批了一件没看过的事。
+      title: '导出',
+      dataIndex: 'can_export',
+      width: 90,
+      render: (v: boolean) =>
+        v ? <Tag color="blue">申请导出</Tag> : <Text type="secondary">仅查询</Text>,
+    },
+    {
       title: '理由',
       dataIndex: 'reason',
       width: 200,
@@ -191,7 +200,7 @@ export default function ReviewPage() {
         columns={columns}
         dataSource={items}
         loading={loading}
-        scroll={{ x: 1180 }}
+        scroll={{ x: 1270 }}
         pagination={{ pageSize: 20 }}
       />
 
@@ -218,6 +227,17 @@ export default function ReviewPage() {
               )}
               的查询权限，共 {target.req.days} 天。
             </Text>
+            {target.req.can_export ? (
+              <Text>
+                申请人还要求 <Text strong>可导出查询结果</Text>：
+                通过后 ta 可以在查询页把结果导出成 Excel 文件带走。
+                确认数据可以外带再通过。
+              </Text>
+            ) : (
+              <Text type="secondary">
+                申请人未要求导出权限，通过后只能在页面上查看结果，不能导出文件。
+              </Text>
+            )}
             <Text type="secondary">理由：{target.req.reason}</Text>
             {/* 历史遗留的待审批单可能只申请了单个库（改口径前提交）。
                 审批通过时授权一律落成整个数据源，与申请人当初写的不一致，

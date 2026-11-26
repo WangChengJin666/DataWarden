@@ -45,6 +45,12 @@ type createGrantRequestReq struct {
 	Scope  string `json:"scope"`
 	Days   int    `json:"days" binding:"required"`
 	Reason string `json:"reason" binding:"required"`
+	// CanExport 是申请人的可选诉求：是否要「把查询结果导出成 Excel」的权限。
+	//
+	// 服务端不会替申请人补默认值——不传就是不要。这条不能反过来：
+	// 默认给 true 会让「没想清楚就提交」的人拿到导出权限，
+	// 而审批人看到的是自己批了、却未必注意到导出那一行。
+	CanExport bool `json:"can_export"`
 }
 
 // applyableItem 是「可申请的数据源」列表的一行。
@@ -149,6 +155,10 @@ func (h *GrantRequestHandler) Create(c *gin.Context) {
 		Scope:  authz.ScopeAllDatabases,
 		Days:   req.Days,
 		Reason: req.Reason,
+		// 导出权限跟着申请走：审批通过时原样复制到 grant_record。
+		// 这里照抄客户端的值是安全的——它决定的是「申请什么」，
+		// 而不是「得到什么」；后者由审批动作产生。
+		CanExport: req.CanExport,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -230,6 +240,7 @@ func (h *GrantRequestHandler) Approve(c *gin.Context) {
 		"user_id":    existing.UserID,
 		"scope":      existing.Scope,
 		"days":       existing.Days,
+		"can_export": existing.CanExport,
 		"grant_id":   g.ID,
 	})
 

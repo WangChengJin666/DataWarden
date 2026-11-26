@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/opensourceprj/datawarden/internal/model"
@@ -16,6 +17,8 @@ type GrantStore interface {
 	ListActive(ctx context.Context, limit int) ([]model.GrantView, error)
 	Get(ctx context.Context, id int64) (*model.Grant, error)
 	Revoke(ctx context.Context, id int64) error
+	// SetCanExport 开关某条授权的导出能力，返回是否命中该记录。
+	SetCanExport(ctx context.Context, id int64, canExport bool) (bool, error)
 	// MyDatasources 返回某用户当前有权查询的数据源（去重、仅生效中的授权）。
 	MyDatasources(ctx context.Context, userID int64) ([]model.DatasourceBrief, error)
 	// AllDatasources 返回全量数据源的精简视图，供管理角色使用。
@@ -123,4 +126,64 @@ func (h *GrantHandler) Revoke(c *gin.Context) {
 		h.OnRevoke(c.Request.Context())
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
+}
+
+// SetExport 开关某条授权的导出能力，仅 DBA / superadmin。
+//
+// 不改 Casbin 策略、也不触发策略重建：导出不进策略表（见迁移 0010），
+// 每次导出请求都由 QueryHandler 现查 grant_record.can_export。
+// 所以这个接口改完立刻生效，没有「等 60 秒刷新」的窗口。
+func (h *GrantHandler) SetExport(c *gin.Context) {
+	uid, username, ok := requireDBA(c)
+	if !ok {
+		return
+	}
+	id, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+
+	var req struct {
+		// CanExport 用指针：缺省字段不能当成 false 处理，
+		// 否则一个写错的请求体会静默把导出关掉。
+		CanExport *bool `json:"can_export"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.CanExport == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "can_export is required"})
+		return
+	}
+
+	g, err := h.Store.Get(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "grant not found"})
+		return
+	}
+	// 已撤销 / 已过期的授权改导出没有意义：它本来就不再生效，
+	// 改了会让「授权管理」页看起来有一条奇怪的可用权限。
+	if g.RevokedAt != nil || !g.ExpiresAt.After(time.Now()) {
+		c.JSON(http.StatusConflict, gin.H{"error": "该授权已撤销或已过期，导出设置无意义"})
+		return
+	}
+
+	hit, err := h.Store.SetCanExport(c.Request.Context(), id, *req.CanExport)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !hit {
+		c.JSON(http.StatusNotFound, gin.H{"error": "grant not found"})
+		return
+	}
+
+	auditEvent(c, uid, username, "grant.set_export", g.DatasourceID, map[string]any{
+		"grant_id":      id,
+		"target_user":   g.UserID,
+		"datasource_id": g.DatasourceID,
+		"can_export":    *req.CanExport,
+	})
+	c.JSON(http.StatusOK, gin.H{"can_export": *req.CanExport})
 }

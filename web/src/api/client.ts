@@ -143,6 +143,11 @@ export async function createGrantRequest(payload: {
   datasource_id: number
   days: number
   reason: string
+  /**
+   * 是否申请「可导出查询结果」。不传等价于不要——
+   * 后端不会补默认值，这个勾选是用户明确表达诉求的地方。
+   */
+  can_export?: boolean
 }): Promise<number> {
   const { data } = await http.post<{ id: number }>('/grant/requests', payload)
   return data.id
@@ -193,6 +198,17 @@ export async function listActiveGrants(): Promise<GrantView[]> {
 
 export async function revokeGrant(id: number): Promise<void> {
   await http.post(`/grants/${id}/revoke`)
+}
+
+/**
+ * 开关某条授权的导出能力。
+ *
+ * 只改授权记录，不动申请单（申请单是「当时申请了什么」的留痕）。
+ * 后端不重建 Casbin 策略：导出判定在导出接口里现查 can_export，
+ * 所以改完立刻生效，没有「等 60 秒刷新」的延迟。
+ */
+export async function setGrantExport(id: number, canExport: boolean): Promise<void> {
+  await http.post(`/grants/${id}/export`, { can_export: canExport })
 }
 
 // ---------- 元数据（库 / 表 / 字段） ----------
@@ -267,6 +283,92 @@ export async function executeSQL(payload: {
 }): Promise<QueryResult> {
   const { data } = await http.post<QueryResult>('/query/sql', payload)
   return data
+}
+
+/**
+ * 导出查询结果为 Excel。
+ *
+ * 与 executeSQL / executeMongo 的区别：多一道「这个数据源是否批了导出」
+ * 的权限闸门（授权记录上的 can_export），所以前端需要按数据源判断
+ * 按钮可见性，而不是按人判断。
+ *
+ * 后端用同一份凭证重新执行同一条语句再生成文件，所以这里必须把查询
+ * 参数原样传过去——不是把前端表格里的数据回传。
+ *
+ * 失败时后端回 JSON（{error}），成功时回二进制。用 responseType: 'blob'
+ * 之后，错误响应也会是 blob，需要在这里读出来转成可读的 Error。
+ */
+export async function exportQuery(payload: {
+  datasource_id: number
+  type: 'sql' | 'mongo'
+  database?: string
+  collection?: string
+  /** Mongo 原生命令，与 collection/filter 二选一 */
+  command?: string
+  filter?: string
+  sql?: string
+  row_limit?: number
+  filename?: string
+}): Promise<{ blob: Blob; filename: string; truncated: boolean }> {
+  const res = await http.post('/query/export', payload, { responseType: 'blob' })
+  const blob = res.data as Blob
+
+  // 服务端回的是错误 JSON：读出来抛出去，而不是让用户下载一个
+  // 内容是 {"error":"..."} 的 .xlsx（Excel 打开会报文件损坏）。
+  if (blob.type.includes('application/json')) {
+    const text = await blob.text()
+    let msg = '导出失败'
+    try {
+      msg = JSON.parse(text).error || msg
+    } catch {
+      if (text) msg = text
+    }
+    throw new Error(msg)
+  }
+
+  return {
+    blob,
+    filename: filenameFromHeader(res.headers['content-disposition']),
+    truncated: res.headers['x-export-truncated'] === '1',
+  }
+}
+
+/**
+ * 把 blob 落到本地磁盘。
+ *
+ * 用一次性的 <a download> 而不是 window.open：后者会被浏览器当成弹窗拦截，
+ * 而这里要的是「点了就下载」，不打开新标签页。
+ * objectURL 必须回收，否则每导一次就泄漏一份完整文件的引用。
+ */
+export function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  // 立刻 revoke 在某些浏览器里会让下载中断，推迟一拍更稳。
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
+/**
+ * 从 Content-Disposition 取文件名，优先用 RFC 5987 的 filename*，
+ * 它才是能正确带中文的那一份（filename 被后端降级成了下划线）。
+ */
+function filenameFromHeader(header: unknown): string {
+  const fallback = 'query_result.xlsx'
+  if (typeof header !== 'string' || !header) return fallback
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(header)
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim())
+    } catch {
+      // 编码坏了就退回到普通 filename
+    }
+  }
+  const plain = /filename="?([^";]+)"?/i.exec(header)
+  return plain ? plain[1].trim() : fallback
 }
 
 export async function executeRedis(payload: {

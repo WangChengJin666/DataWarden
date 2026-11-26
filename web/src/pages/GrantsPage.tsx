@@ -5,6 +5,7 @@ import {
   message,
   Popconfirm,
   Space,
+  Switch,
   Table,
   Tag,
   Typography,
@@ -12,7 +13,12 @@ import {
 import { ReloadOutlined, StopOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import dayjs from 'dayjs'
-import { getCurrentUser, listActiveGrants, revokeGrant } from '@/api/client'
+import {
+  getCurrentUser,
+  listActiveGrants,
+  revokeGrant,
+  setGrantExport,
+} from '@/api/client'
 import { isAllDatabasesScope } from '@/api/scope'
 import type { GrantView } from '@/api/types'
 
@@ -32,6 +38,8 @@ export default function GrantsPage() {
   const [items, setItems] = useState<GrantView[]>([])
   const [loading, setLoading] = useState(false)
   const [revoking, setRevoking] = useState<number | null>(null)
+  // 正在切换导出开关的授权 id，用于禁用单个开关，避免连点产生竞态
+  const [toggling, setToggling] = useState<number | null>(null)
 
   const isDBA = ['dba', 'superadmin'].includes(getCurrentUser()?.role ?? '')
 
@@ -64,6 +72,25 @@ export default function GrantsPage() {
     }
   }
 
+  /**
+   * 开关某条授权的导出能力。
+   *
+   * 成功后直接就地改 state，不重新拉全表：整表刷新会让滚动位置和
+   * 用户刚看的那一行一起跳走，而这里改的只是一格布尔值。
+   */
+  const doToggleExport = async (r: GrantView, next: boolean) => {
+    setToggling(r.id)
+    try {
+      await setGrantExport(r.id, next)
+      setItems((prev) => prev.map((it) => (it.id === r.id ? { ...it, can_export: next } : it)))
+      message.success(next ? '已开启导出' : '已关闭导出')
+    } catch (e) {
+      message.error((e as Error).message)
+    } finally {
+      setToggling(null)
+    }
+  }
+
   const columns: ColumnsType<GrantView> = [
     { title: 'ID', dataIndex: 'id', width: 70 },
     { title: '用户', dataIndex: 'username', width: 110 },
@@ -80,6 +107,27 @@ export default function GrantsPage() {
         ) : (
           <Text code>{v}</Text>
         ),
+    },
+    {
+      title: '导出',
+      dataIndex: 'can_export',
+      width: 90,
+      // 导出权限单独开关，而不是只能连整条授权一起收回：
+      // 「先别让他导数据」的需求远多于「让他完全不能查」，
+      // 逼着 DBA 二选一就只能整条收回再重新走一遍审批。
+      render: (v: boolean, r) => (
+        <Space size={4}>
+          <Switch
+            size="small"
+            checked={v}
+            loading={toggling === r.id}
+            onChange={(next) => void doToggleExport(r, next)}
+          />
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {v ? '可导出' : '仅查看'}
+          </Text>
+        </Space>
+      ),
     },
     {
       title: '到期时间',
@@ -153,13 +201,15 @@ export default function GrantsPage() {
       <Text type="secondary" style={{ fontSize: 13, display: 'block', marginBottom: 16 }}>
         这里是当前真正生效的授权（未撤销且未过期）。授权到期后由后台定时任务自动失效，
         通常在一分钟内清理完成；需要立即收回时用下面的「收回」按钮。
+        「导出」一列可以单独开关该授权能否把查询结果导出成 Excel——
+        关闭后用户仍能查询，只是拿不到文件；改动立即生效，且会记入审计日志。
       </Text>
       <Table
         rowKey="id"
         columns={columns}
         dataSource={items}
         loading={loading}
-        scroll={{ x: 1020 }}
+        scroll={{ x: 1110 }}
         pagination={{ pageSize: 20, showTotal: (t) => `共 ${t} 条` }}
         locale={{ emptyText: '当前没有生效中的授权' }}
       />

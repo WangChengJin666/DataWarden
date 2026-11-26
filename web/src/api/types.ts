@@ -96,6 +96,13 @@ export interface GrantView {
    */
   scope: string
   action: string
+  /**
+   * 这条授权是否允许导出查询结果。
+   *
+   * 跟着「单条授权」走：同一个人可能 A 数据源批了导出、B 数据源没批，
+   * 那是两次独立审批各自的决定。默认 false（审批时没勾就是不批）。
+   */
+  can_export: boolean
   expires_at: string
   created_at: string
 }
@@ -127,6 +134,13 @@ export interface DatasourceBrief {
   database: string
   /** 我在这个数据源上的授权范围（已结构化，无需再 split） */
   scopes: ScopeView[]
+  /**
+   * 我在这个数据源上能否把查询结果导出成 Excel。
+   *
+   * 后端已按数据源算好（多条授权取「或」；管理角色恒为 true），
+   * 前端直接用它控制「导出 Excel」按钮的显隐，不需要自己再判断。
+   */
+  can_export: boolean
 }
 
 export interface GrantRequest {
@@ -139,6 +153,8 @@ export interface GrantRequest {
   scope: string
   days: number
   reason: string
+  /** 申请人是否要求导出权限。留痕用，实际权限由审批通过时复制的值决定。 */
+  can_export: boolean
   status: GrantRequestStatus
   reviewer_id?: number
   review_comment: string

@@ -23,9 +23,9 @@ func NewGrantStore(pool *pgxpool.Pool) *GrantStore {
 func (s *GrantStore) Create(ctx context.Context, g *model.Grant) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO grant_record (user_id, datasource_id, scope, action, expires_at)
-		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-		g.UserID, g.DatasourceID, g.Scope, g.Action, g.ExpiresAt,
+		`INSERT INTO grant_record (user_id, datasource_id, scope, action, can_export, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		g.UserID, g.DatasourceID, g.Scope, g.Action, g.CanExport, g.ExpiresAt,
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("insert grant: %w", err)
@@ -45,7 +45,7 @@ func (s *GrantStore) Create(ctx context.Context, g *model.Grant) (int64, error) 
 // → g 段没有这个人 → 策略不生效」，授权记录本身保留，便于恢复。
 func (s *GrantStore) ActiveGrants(ctx context.Context) ([]model.Grant, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT g.id, g.user_id, g.datasource_id, g.scope, g.action,
+		`SELECT g.id, g.user_id, g.datasource_id, g.scope, g.action, g.can_export,
 		        g.expires_at, g.revoked_at, g.created_at
 		 FROM grant_record g
 		 WHERE g.revoked_at IS NULL
@@ -64,7 +64,7 @@ func (s *GrantStore) ActiveGrants(ctx context.Context) ([]model.Grant, error) {
 	for rows.Next() {
 		var g model.Grant
 		if err := rows.Scan(&g.ID, &g.UserID, &g.DatasourceID, &g.Scope,
-			&g.Action, &g.ExpiresAt, &g.RevokedAt, &g.CreatedAt); err != nil {
+			&g.Action, &g.CanExport, &g.ExpiresAt, &g.RevokedAt, &g.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan grant: %w", err)
 		}
 		out = append(out, g)
@@ -97,7 +97,7 @@ func (s *GrantStore) ListActive(ctx context.Context, limit int) ([]model.GrantVi
 	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT g.id, g.user_id, u.username, g.datasource_id, d.name,
-		        g.scope, g.action, g.expires_at, g.created_at
+		        g.scope, g.action, g.can_export, g.expires_at, g.created_at
 		 FROM grant_record g
 		 JOIN app_user u   ON u.id = g.user_id
 		 JOIN datasource d ON d.id = g.datasource_id
@@ -114,7 +114,7 @@ func (s *GrantStore) ListActive(ctx context.Context, limit int) ([]model.GrantVi
 	for rows.Next() {
 		var g model.GrantView
 		if err := rows.Scan(&g.ID, &g.UserID, &g.Username, &g.DatasourceID,
-			&g.DatasourceName, &g.Scope, &g.Action, &g.ExpiresAt, &g.CreatedAt); err != nil {
+			&g.DatasourceName, &g.Scope, &g.Action, &g.CanExport, &g.ExpiresAt, &g.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan grant view: %w", err)
 		}
 		out = append(out, g)
@@ -133,10 +133,16 @@ func (s *GrantStore) ListActive(ctx context.Context, limit int) ([]model.GrantVi
 //
 // 用 array_agg 一次性把同一数据源的多个 scope 收成数组，
 // 避免在 Go 层循环里再查一次（N+1）。
+//
+// 导出权限用 bool_or 聚合成一个布尔值：同一数据源上可能同时存在多条
+// 生效授权（续期没撤销旧的、或改口径前批过一条），只要其中一条批了导出，
+// 这个人就能导出——权限取「或」而不是「最后一条」。用 SQL 聚合而不是
+// 在 Go 里扫数组，是为了让「多条授权怎么合并」只有一处定义。
 func (s *GrantStore) MyDatasources(ctx context.Context, userID int64) ([]model.DatasourceBrief, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT d.id, d.name, d.type, d.description, d.db_name,
-		        array_agg(g.scope ORDER BY g.scope) AS scopes
+		        array_agg(g.scope ORDER BY g.scope) AS scopes,
+		        bool_or(g.can_export) AS can_export
 		 FROM grant_record g
 		 JOIN datasource d ON d.id = g.datasource_id
 		 WHERE g.user_id = $1
@@ -155,7 +161,7 @@ func (s *GrantStore) MyDatasources(ctx context.Context, userID int64) ([]model.D
 		var typ string
 		var rawScopes []string
 		if err := rows.Scan(&b.ID, &b.Name, &typ, &b.Description,
-			&b.Database, &rawScopes); err != nil {
+			&b.Database, &rawScopes, &b.CanExport); err != nil {
 			return nil, fmt.Errorf("scan my datasource: %w", err)
 		}
 		b.Type = model.DatasourceType(typ)
@@ -174,6 +180,11 @@ func (s *GrantStore) MyDatasources(ctx context.Context, userID int64) ([]model.D
 // 字段清单与 MyDatasources 严格一致（不含 host/port/username）：
 // 即便是 DBA，查询页也没有展示内网拓扑的需求，多余字段只会随响应扩散出去。
 // Scopes 固定为空数组——给管理角色构造「全库全表」的假授权记录会误导前端展示。
+//
+// CanExport 恒为 true：导出能力与查询能力绑定，管理角色既然免授权就能查
+// 任意数据源，就没有理由拦着他们导出——况且免授权账号本来就已经能拿到
+// 全部数据，闸门装在这里只是让自己用不了功能。真正需要卡的是开发者，
+// 而他们的取值来自 grant_record.can_export。
 func (s *GrantStore) AllDatasources(ctx context.Context) ([]model.DatasourceBrief, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, name, type, description, db_name
@@ -195,6 +206,7 @@ func (s *GrantStore) AllDatasources(ctx context.Context) ([]model.DatasourceBrie
 		}
 		b.Type = model.DatasourceType(typ)
 		b.Scopes = []model.ScopeView{}
+		b.CanExport = true
 		out = append(out, b)
 	}
 	return out, rows.Err()
@@ -330,14 +342,71 @@ func parseScopes(raw []string) []model.ScopeView {
 func (s *GrantStore) Get(ctx context.Context, id int64) (*model.Grant, error) {
 	var g model.Grant
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, user_id, datasource_id, scope, action, expires_at, revoked_at, created_at
+		`SELECT id, user_id, datasource_id, scope, action, can_export,
+		        expires_at, revoked_at, created_at
 		 FROM grant_record WHERE id = $1`, id,
 	).Scan(&g.ID, &g.UserID, &g.DatasourceID, &g.Scope, &g.Action,
-		&g.ExpiresAt, &g.RevokedAt, &g.CreatedAt)
+		&g.CanExport, &g.ExpiresAt, &g.RevokedAt, &g.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("query grant %d: %w", id, err)
 	}
 	return &g, nil
+}
+
+// SetCanExport 单独开关某条授权的导出能力，仅 DBA / superadmin 可调。
+//
+// 为什么需要这个入口：审批通过时导出是随申请单一起批的，
+// 但 DBA 审批时可能没注意到勾选，事后想把导出关掉（数据敏感、
+// 或这段时间在排查泄漏）只能等授权过期或整条回收——
+// 整条回收会把「查询」一起收走，代价过大。
+//
+// 只改 grant_record，不动 grant_request：申请单是"当时申请了什么"的留痕，
+// 事后调整权限不该去改历史单据。审计日志负责记录这次变更（谁、什么时候、
+// 哪个用户哪个源），查不到情况时以审计为准。
+//
+// 返回 (是否命中, error)：没命中说明授权不存在；调用方据此区分 404 与 500。
+func (s *GrantStore) SetCanExport(ctx context.Context, id int64, canExport bool) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE grant_record SET can_export = $2 WHERE id = $1`, id, canExport)
+	if err != nil {
+		return false, fmt.Errorf("update grant can_export: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// CanExport 判断某用户在某数据源上是否有导出权限。
+//
+// 这是导出接口的唯一闸门，因此判定条件必须与「能查询」严格一致，
+// 否则会出现两种方向相反的事故：
+//   - 判宽了（只看 can_export=true）：一条已撤销或已过期的授权仍能导出，
+//     等于给了比查询更大的权限面；
+//   - 判严了（漏掉某一档 scope）：整源授权能查却不能导出。
+//
+// 所以这里复用 ActiveGrants 的过滤条件（未撤销、未过期、账号未被删除），
+// 再加一条 can_export。多条授权取「或」，与 MyDatasources 的 bool_or 一致。
+//
+// 停用（disabled）账号不在 SQL 里排除：它们能登录本身就被登录链路挡了，
+// 而已签发的 token 在 12 小时内仍可用——这个口径与查询侧完全相同，
+// 导出不该比查询更严（那会造成「能查不能导」的困惑）。
+func (s *GrantStore) CanExport(ctx context.Context, userID, datasourceID int64) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+		     SELECT 1 FROM grant_record g
+		      WHERE g.user_id = $1
+		        AND g.datasource_id = $2
+		        AND g.can_export
+		        AND g.revoked_at IS NULL
+		        AND g.expires_at > now()
+		        AND EXISTS (
+		            SELECT 1 FROM app_user u
+		             WHERE u.id = g.user_id AND u.status <> $3
+		        )
+		 )`, userID, datasourceID, string(model.StatusDeleted)).Scan(&ok)
+	if err != nil {
+		return false, fmt.Errorf("query export permission: %w", err)
+	}
+	return ok, nil
 }
 
 // GrantScopes 返回某用户在某数据源上生效授权的 scope 列表。

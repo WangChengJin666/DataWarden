@@ -10,7 +10,10 @@ type Deps struct {
 	Issuer      *auth.TokenIssuer
 	AuthHandler *AuthHandler
 	Datasource  *DatasourceHandler
-	Query       *QueryHandler
+	// Query 负责 SQL / Mongo / Redis 查询；Export 负责把结果导出成 Excel，
+	// 两者共用同一个 querysvc.Service（导出多一道权限闸门）。
+	Query  *QueryHandler
+	Export *ExportHandler
 	GrantReq    *GrantRequestHandler
 	Grant       *GrantHandler
 	Metadata    *MetadataHandler
@@ -61,6 +64,11 @@ func NewRouter(d Deps) *gin.Engine {
 		if d.Redis != nil {
 			authed.POST("/query/redis", d.Redis.Query)
 		}
+		// 导出：单独的权限闸门（授权记录上的 can_export），
+		// 不是「能查就能导」——导出是数据外带，必须由审批单独批过。
+		if d.Export != nil {
+			authed.POST("/query/export", d.Export.Export)
+		}
 
 		// 元数据：查询页的库 / 表下拉与编辑器补全都依赖它。
 		// 不限制为 DBA——开发者本来就要选库选表，返回内容已按授权过滤。
@@ -88,6 +96,9 @@ func NewRouter(d Deps) *gin.Engine {
 		if d.Grant != nil {
 			authed.GET("/grants", requireDBAMiddleware(), d.Grant.List)
 			authed.POST("/grants/:id/revoke", requireDBAMiddleware(), d.Grant.Revoke)
+			// 开关某条授权的导出能力。不改 Casbin 策略，
+			// 导出判定在 /query/export 里现查 grant_record.can_export，改完即时生效。
+			authed.POST("/grants/:id/export", requireDBAMiddleware(), d.Grant.SetExport)
 			// 「我能查哪些数据源」：查询页的下拉用这个，不能给开发者开
 			// GET /datasources（那条限 DBA 且含 host/port/username）。
 			authed.GET("/grants/mine", d.Grant.ListMine)

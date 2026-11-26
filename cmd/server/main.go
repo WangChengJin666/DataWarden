@@ -122,6 +122,16 @@ func main() {
 			Service: querySvc,
 			Factory: makeAdapterFactory(ctx, dsStore),
 		},
+		Export: &httpapi.ExportHandler{
+			Service: querySvc,
+			Factory: makeAdapterFactory(ctx, dsStore),
+			// 导出闸门读的是 grant_record.can_export（单个数据源一条授权），
+			// 所以 A 源批了导出、B 源没批时，B 源的导出请求会在这里被拒。
+			Grants: grantStore,
+			// 只用于把「没查询权限」与「有查询权限但没批导出」区分开，
+			// 给出不同的提示；不参与放行判断。
+			Enforcer: enforcer,
+		},
 		Redis: &httpapi.RedisHandler{
 			Enforcer: enforcer,
 			Factory:  makeRedisTargetFactory(ctx, dsStore, cfg),

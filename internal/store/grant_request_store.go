@@ -23,9 +23,9 @@ func NewGrantRequestStore(pool *pgxpool.Pool) *GrantRequestStore {
 func (s *GrantRequestStore) Create(ctx context.Context, r *model.GrantRequest) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO grant_request (user_id, datasource_id, scope, days, reason, status)
-		 VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING id`,
-		r.UserID, r.DatasourceID, r.Scope, r.Days, r.Reason,
+		`INSERT INTO grant_request (user_id, datasource_id, scope, days, reason, can_export, status)
+		 VALUES ($1, $2, $3, $4, $5, $6, 'pending') RETURNING id`,
+		r.UserID, r.DatasourceID, r.Scope, r.Days, r.Reason, r.CanExport,
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("insert grant request: %w", err)
@@ -35,7 +35,7 @@ func (s *GrantRequestStore) Create(ctx context.Context, r *model.GrantRequest) (
 
 const grantRequestSelect = `
 	SELECT gr.id, gr.user_id, u.username, gr.datasource_id, d.name,
-	       gr.scope, gr.days, gr.reason, gr.status,
+	       gr.scope, gr.days, gr.reason, gr.can_export, gr.status,
 	       gr.reviewer_id, gr.review_comment, gr.reviewed_at, gr.grant_id, gr.created_at
 	FROM grant_request gr
 	JOIN app_user u ON u.id = gr.user_id
@@ -47,7 +47,7 @@ func scanGrantRequest(row interface {
 	var r model.GrantRequest
 	err := row.Scan(
 		&r.ID, &r.UserID, &r.Username, &r.DatasourceID, &r.DatasourceName,
-		&r.Scope, &r.Days, &r.Reason, &r.Status,
+		&r.Scope, &r.Days, &r.Reason, &r.CanExport, &r.Status,
 		&r.ReviewerID, &r.ReviewComment, &r.ReviewedAt, &r.GrantID, &r.CreatedAt,
 	)
 	if err != nil {
@@ -176,6 +176,10 @@ func (s *GrantRequestStore) ListByUser(ctx context.Context, userID int64, limit 
 // scope 只用于留痕。历史 pending 单或手工插入的库级 scope 若被原样带进
 // grant_record，就会绕过新口径产出一条只覆盖单库的授权，
 // 而界面上它和整源授权看起来没有区别——这种静默偏差最难排查。
+// 导出权限在审批通过时从申请单**复制**到授权记录，而不是审批时让 DBA
+// 重新勾选：审批人依据的正是「申请人申请了导出」这件事，复制过去才和
+// 审批时看到的一致。若审批时另设开关，界面上"通过了这条单子"与实际
+// 拿到的能力就可能完全不同。
 func (s *GrantRequestStore) Approve(ctx context.Context, reqID, reviewerID int64, comment string) (*model.Grant, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -186,12 +190,13 @@ func (s *GrantRequestStore) Approve(ctx context.Context, reqID, reviewerID int64
 	var (
 		userID, dsID int64
 		days         int
+		canExport    bool
 		status       string
 	)
 	err = tx.QueryRow(ctx,
-		`SELECT user_id, datasource_id, days, status
+		`SELECT user_id, datasource_id, days, can_export, status
 		 FROM grant_request WHERE id = $1 FOR UPDATE`, reqID,
-	).Scan(&userID, &dsID, &days, &status)
+	).Scan(&userID, &dsID, &days, &canExport, &status)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, fmt.Errorf("grant request %d not found", reqID)
@@ -207,13 +212,14 @@ func (s *GrantRequestStore) Approve(ctx context.Context, reqID, reviewerID int64
 		DatasourceID: dsID,
 		Scope:        authz.ScopeAllDatabases,
 		Action:       "read",
+		CanExport:    canExport,
 		ExpiresAt:    time.Now().AddDate(0, 0, days),
 	}
 	var grantID int64
 	err = tx.QueryRow(ctx,
-		`INSERT INTO grant_record (user_id, datasource_id, scope, action, expires_at)
-		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-		g.UserID, g.DatasourceID, g.Scope, g.Action, g.ExpiresAt,
+		`INSERT INTO grant_record (user_id, datasource_id, scope, action, can_export, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		g.UserID, g.DatasourceID, g.Scope, g.Action, g.CanExport, g.ExpiresAt,
 	).Scan(&grantID)
 	if err != nil {
 		return nil, fmt.Errorf("insert grant: %w", err)

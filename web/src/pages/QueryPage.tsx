@@ -19,7 +19,12 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { CopyOutlined, PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons'
+import {
+  CopyOutlined,
+  DownloadOutlined,
+  PlayCircleOutlined,
+  ReloadOutlined,
+} from '@ant-design/icons'
 import CodeMirror from '@uiw/react-codemirror'
 import { Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
@@ -29,11 +34,13 @@ import {
   executeMongo,
   executeRedis,
   executeSQL,
+  exportQuery,
   getCurrentUser,
   getSchema,
   listDatabases,
   listMyDatasources,
   listTables,
+  saveBlob,
 } from '@/api/client'
 import type { DatasourceBrief, QueryResult, RedisKeyValue, RedisQueryResult } from '@/api/types'
 import { buildSqlExtensions, type SchemaMap } from '@/sql/completion'
@@ -421,6 +428,9 @@ export default function QueryPage() {
   const [sql, setSql] = useState('')
   const [rowLimit, setRowLimit] = useState(100)
   const [loading, setLoading] = useState(false)
+  // 导出单独一个 loading：它比查询慢（要重新执行 + 生成文件），
+  // 复用查询的 loading 会让「执行」按钮在导出期间也跟着转。
+  const [exporting, setExporting] = useState(false)
   const [result, setResult] = useState<QueryResult | null>(null)
 
   const [redisMode, setRedisMode] = useState<'exact' | 'scan'>('exact')
@@ -800,6 +810,116 @@ export default function QueryPage() {
   // 直接闭包捕获会拿到首帧的旧值）
   runRef.current = run
 
+  /**
+   * 当前数据源是否允许导出。
+   *
+   * 判定粒度是**数据源**，不是人：后端在 /grants/mine 里为每个数据源
+   * 单独算好 can_export（多条授权取「或」，管理角色恒为 true）。
+   * 于是「A 数据源批了导出、B 数据源没批」时，切到 B 按钮就消失，
+   * 不需要用户在点击后才收到一个 403。
+   */
+  const canExport = current?.can_export === true
+
+  /**
+   * 把当前查询结果导出成 Excel。
+   *
+   * 为什么重新发一次请求而不是把页面上这一份表格转成 CSV：
+   *   - 页面上的数据是脱敏、限行、且只渲染了当前分页的；
+   *   - 后端按同一份凭证重新执行同一条语句，导出的内容可复现，
+   *     审计里也能对上「他导走的到底是什么」。
+   *
+   * 参数与 run() 里发的那次完全一致：用户看到什么就导出什么。
+   * 行数上限交给后端（默认 5000，可在输入框里给到 20000），
+   * 前端只负责把用户填的值传过去。
+   */
+  const doExport = async () => {
+    if (!datasourceId) {
+      message.warning('请先选择数据源')
+      return
+    }
+    if (!canExport) {
+      message.warning('当前数据源的授权不包含导出权限，请到「申请授权」页申请')
+      return
+    }
+
+    // 校验与 run() 保持一致：导出实际上就是"执行 + 落文件"，
+    // 允许导出的条件不能比允许查询更松。
+    const effectiveSql = isSQL ? (pickStatementText() || sql) : sql
+    let payload: Parameters<typeof exportQuery>[0]
+    if (isMongo) {
+      if (!database.trim()) {
+        message.warning('请选择库')
+        return
+      }
+      if (mongoMode === 'collection') {
+        if (!mongoCollection.trim()) {
+          message.warning('请选择或填写集合名')
+          return
+        }
+        if (!mongoFilter.trim().startsWith('{')) {
+          message.warning('过滤条件必须是 JSON 对象，例如 {"status":"active"}')
+          return
+        }
+        payload = {
+          datasource_id: datasourceId,
+          type: 'mongo',
+          database: database.trim(),
+          collection: mongoCollection.trim(),
+          filter: mongoFilter.trim(),
+          row_limit: rowLimit,
+          filename: `${current?.name ?? 'mongo'}_${mongoCollection.trim()}`,
+        }
+      } else {
+        if (!mongoCommand.trim()) {
+          message.warning('请输入 MongoDB 命令')
+          return
+        }
+        payload = {
+          datasource_id: datasourceId,
+          type: 'mongo',
+          database: database.trim(),
+          command: mongoCommand.trim(),
+          row_limit: rowLimit,
+          filename: `${current?.name ?? 'mongo'}_导出`,
+        }
+      }
+    } else {
+      if (!database.trim()) {
+        message.warning('请选择库')
+        return
+      }
+      if (!effectiveSql.trim()) {
+        message.warning('请输入 SQL')
+        return
+      }
+      payload = {
+        datasource_id: datasourceId,
+        type: 'sql',
+        database: database.trim(),
+        sql: effectiveSql,
+        row_limit: rowLimit,
+        filename: `${current?.name ?? 'query'}_${database.trim()}`,
+      }
+    }
+
+    setExporting(true)
+    try {
+      const { blob, filename, truncated } = await exportQuery(payload)
+      saveBlob(blob, filename)
+      if (truncated) {
+        // 截断必须说清楚：用户拿到文件时看不到「还有更多行」，
+        // 不说就可能拿一份不完整的数据去做结论。
+        message.warning(`已导出（结果达到行数上限被截断，可调大「限 N 行」后重导）：${filename}`)
+      } else {
+        message.success(`已导出：${filename}`)
+      }
+    } catch (e) {
+      message.error((e as Error).message)
+    } finally {
+      setExporting(false)
+    }
+  }
+
   // 编辑器扩展只构造一次：schema 与方言都通过 ref 读取实时值，
   // 避免每次 schemaMap 变化就重建扩展（会重置补全面板与选区）。
   const extensions = useMemo(
@@ -973,6 +1093,36 @@ export default function QueryPage() {
     </Space>
   ) : null
 
+  /**
+   * 「导出 Excel」按钮。
+   *
+   * 只在当前数据源批了导出时出现——没批的时候不显示（而不是显示成禁用），
+   * 因为这个按钮代表的是"这个数据源没有这个能力"，而不是"暂时不可用"；
+   * 灰按钮会让人反复去看权限，而权限根本没给这个数据源。
+   * 管理角色免授权，后端恒返回 can_export=true，所以他们总能看到。
+   */
+  const exportButton = () => {
+    if (!canExport) return null
+    return (
+      <Tooltip
+        title={
+          isRedis
+            ? 'Redis 结果暂不支持导出'
+            : '按当前查询条件重新执行并导出为 Excel（受「限 N 行」约束）'
+        }
+      >
+        <Button
+          icon={<DownloadOutlined />}
+          onClick={() => void doExport()}
+          loading={exporting}
+          disabled={isRedis || (!result && !isMongo)}
+        >
+          导出 Excel
+        </Button>
+      </Tooltip>
+    )
+  }
+
   return (
     <Space direction="vertical" size="large" style={{ width: '100%' }}>
       <Card title="数据查询">
@@ -1006,6 +1156,9 @@ export default function QueryPage() {
                   : '授权范围按库判定：有该库的权限即可查询库下任意集合。'}
                 只允许查询操作，
                 写操作与会写库的聚合阶段（$out、$merge）一律拦截。结果中的手机号、身份证、邮箱等字段会自动脱敏。
+                {canExport
+                  ? ' 当前数据源已批导出权限，可把结果导出为 Excel；导出的内容同样经过脱敏，并单独记入审计日志。'
+                  : ''}
               </span>
             ) : isRedis ? (
               <span>
@@ -1021,6 +1174,9 @@ export default function QueryPage() {
                   ? '管理角色免授权，任意数据源、任意库表都可查询。'
                   : '授权范围按库判定：选好数据源和库，该库下所有表都可以查，不需要逐表申明。'}
                 结果中的手机号、身份证、邮箱等字段会自动脱敏。
+                {canExport
+                  ? ' 当前数据源已批导出权限，可把结果导出为 Excel；导出的内容同样经过脱敏，并单独记入审计日志。'
+                  : ''}
               </span>
             )
           }
@@ -1375,7 +1531,11 @@ export default function QueryPage() {
         </div>
       </Card>
 
-      {result ? <Card title="查询结果">{resultTable}</Card> : null}
+      {result ? (
+        <Card title="查询结果" extra={exportButton()}>
+          {resultTable}
+        </Card>
+      ) : null}
       {redisResult ? <Card title="Redis 查询结果">{redisTable}</Card> : null}
 
       <Paragraph type="secondary" style={{ fontSize: 12 }}>

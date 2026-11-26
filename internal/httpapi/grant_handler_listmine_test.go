@@ -18,12 +18,16 @@ import (
 // 这个测试关心的是「按角色走哪条分支」，不是 SQL 是否正确，
 // 所以把两个方法的结果都记下来，断言调用的是哪一个。
 type fakeGrantStore struct {
-	mineCalled  bool
-	allCalled   bool
-	mineItems   []model.DatasourceBrief
-	allItems    []model.DatasourceBrief
-	listCalled  bool
+	mineCalled   bool
+	allCalled    bool
+	mineItems    []model.DatasourceBrief
+	allItems     []model.DatasourceBrief
+	listCalled   bool
 	revokeCalled bool
+	// exportArgs 记录 SetCanExport 收到的参数，用于断言导出开关接口。
+	exportCalled bool
+	exportHit    bool
+	exportValue  bool
 }
 
 func (f *fakeGrantStore) ListActive(context.Context, int) ([]model.GrantView, error) {
@@ -38,6 +42,12 @@ func (f *fakeGrantStore) Get(context.Context, int64) (*model.Grant, error) {
 func (f *fakeGrantStore) Revoke(context.Context, int64) error {
 	f.revokeCalled = true
 	return nil
+}
+
+func (f *fakeGrantStore) SetCanExport(_ context.Context, _ int64, canExport bool) (bool, error) {
+	f.exportCalled = true
+	f.exportValue = canExport
+	return f.exportHit, nil
 }
 
 func (f *fakeGrantStore) MyDatasources(context.Context, int64) ([]model.DatasourceBrief, error) {
