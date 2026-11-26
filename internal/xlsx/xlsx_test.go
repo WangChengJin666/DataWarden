@@ -102,6 +102,52 @@ func TestFromQueryResult_WritesHeaderAndRows(t *testing.T) {
 	}
 }
 
+// 整数一律按文本写：数值单元格在 Excel 里超过 11 位就显示成科学计数法，
+// 超过 15 位还会被四舍五入——订单号、雪花 ID 导出后就是一份错的、
+// 且用户看不出来的数据。
+func TestFromQueryResult_IntegersAsText(t *testing.T) {
+	columns := []string{"bigint", "smallint", "uint", "integral_float", "decimal", "huge_float"}
+	rows := [][]any{{
+		int64(1475910000000000001), int32(42), uint64(18446744073709551615),
+		20.0, 12.5, 1e18,
+	}}
+	data, err := FromQueryResult(columns, rows)
+	if err != nil {
+		t.Fatalf("FromQueryResult: %v", err)
+	}
+	sheet := readZip(t, data)["xl/worksheets/sheet1.xml"]
+
+	// 三种整数 + 整数值的浮点：必须是文本单元格，且位数一字不差
+	for _, want := range []string{
+		`1475910000000000001`, `42`, `18446744073709551615`, `20`,
+	} {
+		if !strings.Contains(sheet, `xml:space="preserve">`+want+`</t>`) {
+			t.Errorf("%q 应按文本写出且保持完整位数，工作表：%s", want, sheet)
+		}
+	}
+	// 整数列不能出现数值单元格：数值单元格里 42 会写成 <v>42</v>
+	for _, bad := range []string{`<v>1475910000000000001</v>`, `<v>42</v>`, `<v>18446744073709551615</v>`, `<v>20</v>`} {
+		if strings.Contains(sheet, bad) {
+			t.Errorf("整数被写成了数值单元格 %q：%s", bad, sheet)
+		}
+	}
+	// 带小数的保持数值：金额列导出后还要能在 Excel 里求和
+	if !strings.Contains(sheet, `<v>12.5</v>`) {
+		t.Errorf("带小数的浮点应保持数值单元格：%s", sheet)
+	}
+	// 整数型的浮点同样转文本，且不能打成科学计数法（1e+18）
+	if !strings.Contains(sheet, `xml:space="preserve">1000000000000000000</t>`) {
+		t.Errorf("1e18 应按文本写成完整整数：%s", sheet)
+	}
+	if strings.Contains(sheet, "1e+18") {
+		t.Errorf("出现了科学计数法：%s", sheet)
+	}
+	// 文本单元格要带文本格式，否则 Excel 会提示"数字以文本形式存储"并可能自动转换
+	if !strings.Contains(sheet, `<c r="B2" s="2" t="inlineStr"`) {
+		t.Errorf("文本单元格应带文本格式 s=2：%s", sheet)
+	}
+}
+
 // 转义是必须的：& < > 原样写进 XML 会让文件打不开，
 // 而数据库里的文本随时会出现这些字符。
 func TestFromQueryResult_EscapesXML(t *testing.T) {

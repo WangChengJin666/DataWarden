@@ -24,7 +24,7 @@ import (
 
 // 单元格格式编号（对应 styles.xml 里 cellXfs 的下标）。
 //
-// 专门给「长数字」留了一档是有原因的：订单号、身份证号这类值虽然
+// 专门给「文本」留了一档是有原因的：订单号、身份证号这类值虽然
 // 是数字，按数值写进 Excel 后会被显示成 1.47591E+16，用户拿到的文件
 // 一打开就是错的。第 49 号是 Excel 内置格式 "@"（文本），
 // 用它锁定这些单元格，Excel 就不会自作主张地转成科学计数法。
@@ -178,9 +178,23 @@ func sheetColsXML(columns []string) string {
 //
 // 类型取舍：
 //   - nil → 空单元格（不写 <v>，Excel 显示为空白，与 NULL 的展示一致）
-//   - 数字 → 数值单元格，但超过 15 位有效数字的转成文本（见下）
+//   - 整数 → **文本**（见下）
+//   - 浮点数 → 值是整数的转成文本；带小数的仍写数值
 //   - 布尔 → 布尔单元格
 //   - 其余 → 内联字符串
+//
+// 为什么整数按文本写：
+//
+//	Excel 只保留 15 位有效数字，且对 12 位以上的数默认用科学计数法显示。
+//	订单号、雪花 ID、身份证号导出后一打开就是 1.47591E+16，末几位还被
+//	四舍五入成 0——用户拿到的是一份错的、且看不出来的数据。写成数值再
+//	套"文本格式"救不回来：格式只改显示，15 位之后的精度在存储时已经丢了。
+//	所以必须在写单元格时就用 t="inlineStr" + numFmtId=49。
+//
+// 代价是这一列在 Excel 里不能直接 SUM。对整数列来说这个代价可以接受：
+//	数据库里的整数绝大多数是 ID / 计数，前者本来就不该参与运算，后者
+//	导出后通常只用来看。金额类字段（numeric / decimal）在驱动侧多为
+//	浮点或字符串，不落在这个分支里。
 func writeCell(b *bytes.Buffer, col, row int, v any, style int) {
 	ref := colName(col+1) + strconv.Itoa(row)
 
@@ -194,16 +208,17 @@ func writeCell(b *bytes.Buffer, col, row int, v any, style int) {
 	if style == styleHeader {
 		styleAttr = fmt.Sprintf(` s="%d"`, styleHeader)
 	}
+	textStyle := fmt.Sprintf(` s="%d"`, styleText)
 
 	switch val := v.(type) {
 	case int, int8, int16, int32, int64:
-		fmt.Fprintf(b, `<c r="%s"%s><v>%d</v></c>`, ref, styleAttr, toInt64(val))
+		writeInlineStr(b, ref, textStyle, strconv.FormatInt(toInt64(val), 10))
 	case uint, uint8, uint16, uint32, uint64:
-		fmt.Fprintf(b, `<c r="%s"%s><v>%d</v></c>`, ref, styleAttr, toUint64(val))
+		writeInlineStr(b, ref, textStyle, strconv.FormatUint(toUint64(val), 10))
 	case float32:
-		writeFloat(b, ref, styleAttr, float64(val))
+		writeFloat(b, ref, styleAttr, textStyle, float64(val))
 	case float64:
-		writeFloat(b, ref, styleAttr, val)
+		writeFloat(b, ref, styleAttr, textStyle, val)
 	case bool:
 		v := "0"
 		if val {
@@ -215,14 +230,13 @@ func writeCell(b *bytes.Buffer, col, row int, v any, style int) {
 		// 统一写成 base64 之外的「十六进制」更接近用户在库里看到的样子。
 		writeInlineStr(b, ref, styleAttr, fmt.Sprintf("0x%x", val))
 	default:
+		// 文本类型传过来的长数字串同样保住前导零与完整位数。
 		text := fmt.Sprintf("%v", val)
-		// 长数字串也可能是文本类型传过来的（驱动把 numeric 给了字符串），
-		// 一律当文本写，保住前导零与完整位数。
 		if style == styleHeader {
 			writeInlineStr(b, ref, styleAttr, text)
 			return
 		}
-		writeInlineStr(b, ref, fmt.Sprintf(` s="%d"`, styleText), text)
+		writeInlineStr(b, ref, textStyle, text)
 	}
 }
 
@@ -230,9 +244,21 @@ func writeCell(b *bytes.Buffer, col, row int, v any, style int) {
 //
 // 直接 fmt 输出 "NaN" 会生成 <v>NaN</v>，Excel 打开时判定为非法数值，
 // 整个文件报损坏。宁可写成一格文本 "NaN"，也不要让用户拿到打不开的文件。
-func writeFloat(b *bytes.Buffer, ref, styleAttr string, f float64) {
+//
+// 值是整数的浮点（20.0、1e18）也按文本写：它们多半来自 BIGINT / COUNT，
+// 走数值单元格同样会被显示成科学计数法。带小数的保持数值单元格，
+// 这样金额列导出后还能在 Excel 里直接求和。超过 2^53 的整数型浮点
+// 本身在数据库驱动那一层就已经丢了精度（驱动给的是 float64），这里
+// 写出的是它实际持有的值，不会再有第二次损失。
+func writeFloat(b *bytes.Buffer, ref, styleAttr, textStyle string, f float64) {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
-		writeInlineStr(b, ref, fmt.Sprintf(` s="%d"`, styleText), strconv.FormatFloat(f, 'g', -1, 64))
+		writeInlineStr(b, ref, textStyle, strconv.FormatFloat(f, 'g', -1, 64))
+		return
+	}
+	// 用 'f' 而不是 'g'：整数值的浮点用 'g' 会打成 1e+18，Excel 里的文本
+	// 单元格不会把它还原成数字，用户看到的就是 "1e+18" 这个字符串。
+	if f == math.Trunc(f) {
+		writeInlineStr(b, ref, textStyle, strconv.FormatFloat(f, 'f', -1, 64))
 		return
 	}
 	// 'g' 会丢掉末尾的 .0（1 变成 1 而不是 1.0），对导出而言更自然。
