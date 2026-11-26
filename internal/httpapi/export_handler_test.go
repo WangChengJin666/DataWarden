@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -57,19 +59,26 @@ func TestCreateGrantRequest_PersistsCanExport(t *testing.T) {
 }
 
 // fakeExportGrants 是导出闸门的替身。
+//
+// 键是「数据源ID/库名」，而不是只按数据源：判定粒度是库，
+// 用数据源做键就测不出「同一数据源的 A 库能导、B 库不能」这个关键场景。
 type fakeExportGrants struct {
-	// allowed 按数据源 ID 给出结论，用于验证「A 源能导、B 源不能」。
-	allowed map[int64]bool
-	called  []int64
+	allowed map[string]bool
+	called  []string
 	err     error
 }
 
-func (f *fakeExportGrants) CanExport(_ context.Context, _ int64, datasourceID int64) (bool, error) {
-	f.called = append(f.called, datasourceID)
+func grantKey(datasourceID int64, database string) string {
+	return strconv.FormatInt(datasourceID, 10) + "/" + database
+}
+
+func (f *fakeExportGrants) CanExportDatabase(_ context.Context, _ int64, datasourceID int64, database string) (bool, error) {
+	key := grantKey(datasourceID, database)
+	f.called = append(f.called, key)
 	if f.err != nil {
 		return false, f.err
 	}
-	return f.allowed[datasourceID], nil
+	return f.allowed[key], nil
 }
 
 // fakeEnforcer 固定返回「有查询权限」，用于确认拒绝原因是"没批导出"
@@ -143,7 +152,13 @@ func newExportHandler(grants ExportStore) *ExportHandler {
 // 判定必须按「数据源」而不是按「人」：放在用户维度上，就会出现
 // 「A 源批过导出、B 源也能导」的越权，而两个源本来是一次一审批。
 func TestExport_DeveloperNeedsCanExportOnThatDatasource(t *testing.T) {
-	grants := &fakeExportGrants{allowed: map[int64]bool{1: true, 2: false}}
+	grants := &fakeExportGrants{allowed: map[string]bool{
+		grantKey(1, "shop"): true,
+		// 同一数据源 1 上的另一个库：查询权限有、导出没批
+		grantKey(1, "crm"): false,
+		// 另一个数据源整体未批
+		grantKey(2, "shop"): false,
+	}}
 	h := newExportHandler(grants)
 
 	t.Run("已批导出的数据源放行", func(t *testing.T) {
@@ -187,10 +202,45 @@ func TestExport_DeveloperNeedsCanExportOnThatDatasource(t *testing.T) {
 	}
 }
 
+// 同一数据源的不同库必须分开判定。
+//
+// 这是「权限放大」的回归用例：数据源 1 上 shop 库批了导出、crm 库没批。
+// 若闸门只看「这个数据源上有没有任一 can_export=true 的授权」，
+// crm 会被顺带放开——用户确实有 crm 的查询授权，但那次审批里
+// 从没同意过导出。两个库是两次独立决定。
+func TestExport_JudgedPerDatabaseNotPerDatasource(t *testing.T) {
+	grants := &fakeExportGrants{allowed: map[string]bool{
+		grantKey(1, "shop"): true,
+	}}
+	h := newExportHandler(grants)
+
+	w := doExport(t, h, string(model.RoleDeveloper), map[string]any{
+		"datasource_id": 1, "type": "sql", "database": "shop", "sql": "select 1",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("shop 库应放行，status = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	w = doExport(t, h, string(model.RoleDeveloper), map[string]any{
+		"datasource_id": 1, "type": "sql", "database": "crm", "sql": "select 1",
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("crm 库未批导出，status = %d, want 403, body=%s", w.Code, w.Body.String())
+	}
+
+	// 两次调用必须带上各自的库名，否则闸门拿不到判定依据
+	want := []string{grantKey(1, "shop"), grantKey(1, "crm")}
+	for i := range want {
+		if i >= len(grants.called) || grants.called[i] != want[i] {
+			t.Fatalf("闸门收到的判定依据 = %v, want %v", grants.called, want)
+		}
+	}
+}
+
 // 有查询权限但没批导出时，提示必须与"根本没权限查这个源"区分开：
 // 前者用户能自己解决（去申请导出），后者是另一回事。
 func TestExport_DistinguishesNoGrantFromNoExport(t *testing.T) {
-	noExport := newExportHandler(&fakeExportGrants{allowed: map[int64]bool{}})
+	noExport := newExportHandler(&fakeExportGrants{allowed: map[string]bool{}})
 	w := doExport(t, noExport, string(model.RoleDeveloper), map[string]any{
 		"datasource_id": 3, "type": "sql", "database": "shop", "sql": "select 1",
 	})
@@ -199,7 +249,7 @@ func TestExport_DistinguishesNoGrantFromNoExport(t *testing.T) {
 	}
 	var resp struct{ Error string }
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Error == "no permission on this datasource" {
+	if resp.Error == "no permission on this database" {
 		t.Error("有查询权限但没批导出，不应提示成「没有查询权限」")
 	}
 
@@ -208,7 +258,7 @@ func TestExport_DistinguishesNoGrantFromNoExport(t *testing.T) {
 	noGrant := &ExportHandler{
 		Service:  newTestQueryServiceWithEnforcer(&recordingAuditor{}, fakeEnforcer{allow: true}),
 		Factory:  fakeFactory,
-		Grants:   &fakeExportGrants{allowed: map[int64]bool{}},
+		Grants:   &fakeExportGrants{allowed: map[string]bool{}},
 		Enforcer: fakeEnforcer{allow: false},
 	}
 	w = doExport(t, noGrant, string(model.RoleDeveloper), map[string]any{
@@ -218,15 +268,21 @@ func TestExport_DistinguishesNoGrantFromNoExport(t *testing.T) {
 		t.Fatalf("status = %d, want 403", w.Code)
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Error != "no permission on this datasource" {
-		t.Errorf("error = %q，want no permission on this datasource", resp.Error)
+	// 判定对象是 ds:<id>:<库>:*，拒绝话术也随之落到库上：
+	// 说「数据源」会让用户以为整个源都没权限，而实际只差这个库。
+	// 判定对象是 ds:<id>:<库>:*，拒绝话术也随之落到库上：
+	// 说「数据源」会让用户以为整个源都没权限，而实际只差这个库。
+	// 文案后面还带一句「需先申请数据源授权」，所以用前缀匹配：
+	// 断言的是"说清了是哪个库、以及该走哪条路"，不是逐字比对。
+	if !strings.HasPrefix(resp.Error, "no permission on this database") {
+		t.Errorf("error = %q，want 前缀 no permission on this database", resp.Error)
 	}
 }
 
 // 管理角色免授权，导出也不该拦——他们本来就能查任意数据源，
 // 拦导出只是让自己用不了功能，不减少任何泄露面。
 func TestExport_PrivilegedSkipsExportGate(t *testing.T) {
-	grants := &fakeExportGrants{allowed: map[int64]bool{}}
+	grants := &fakeExportGrants{allowed: map[string]bool{}}
 	h := newExportHandler(grants)
 	for _, role := range []model.Role{model.RoleDBA, model.RoleSuperAdmin} {
 		w := doExport(t, h, string(role), map[string]any{
@@ -256,7 +312,7 @@ func TestExport_FailsClosedWhenGateErrors(t *testing.T) {
 // Redis 结果不做导出：它的形态是 key→值，摊平成二维表没有合理语义。
 // 明确回 400 而不是生成一个乱七八糟的文件。
 func TestExport_RejectsRedis(t *testing.T) {
-	h := newExportHandler(&fakeExportGrants{allowed: map[int64]bool{1: true}})
+	h := newExportHandler(&fakeExportGrants{allowed: map[string]bool{grantKey(1, "shop"): true}})
 	w := doExport(t, h, string(model.RoleDeveloper), map[string]any{
 		"datasource_id": 1, "type": "redis", "key": "user:1",
 	})
@@ -313,3 +369,64 @@ func TestClampExportRows(t *testing.T) {
 type contextError struct{}
 
 func (contextError) Error() string { return "db down" }
+
+// type 非法必须先于权限判定返回 400。
+//
+// 顺序反了的后果是误导：一个 type 拼错、但本来有导出权限的开发者，
+// 会先撞上权限闸门，看到「当前授权不包含导出权限」——然后跑去申请
+// 一个他早就有的权限。这类提示比没有提示更难查。
+func TestExport_InvalidTypeBeforePermissionCheck(t *testing.T) {
+	// 闸门配成"一律拒绝"，若权限判定先行，就会得到 403 而不是 400
+	grants := &fakeExportGrants{allowed: map[string]bool{}}
+	h := newExportHandler(grants)
+
+	for _, typ := range []string{"mysql", "SQLx", "", "redis"} {
+		w := doExport(t, h, string(model.RoleDeveloper), map[string]any{
+			"datasource_id": 1, "type": typ, "database": "shop", "sql": "select 1",
+		})
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("type=%q 应返回 400，实际 %d，body=%s", typ, w.Code, w.Body.String())
+		}
+	}
+	if len(grants.called) != 0 {
+		t.Errorf("type 非法时不应进入权限判定，实际调用了 %v", grants.called)
+	}
+}
+
+// type 的大小写与空白应当被归一，而不是被判非法。
+func TestExport_TypeIsNormalized(t *testing.T) {
+	h := newExportHandler(&fakeExportGrants{allowed: map[string]bool{
+		grantKey(1, "shop"): true,
+	}})
+	for _, typ := range []string{"sql", "SQL", " sql "} {
+		w := doExport(t, h, string(model.RoleDeveloper), map[string]any{
+			"datasource_id": 1, "type": typ, "database": "shop", "sql": "select 1",
+		})
+		if w.Code != http.StatusOK {
+			t.Errorf("type=%q 应被归一为 sql，实际 %d，body=%s", typ, w.Code, w.Body.String())
+		}
+	}
+}
+
+// 库名带首尾空白时，权限判定与 Casbin 对象必须用同一个归一后的值。
+//
+// 两侧不同口径的后果是一类很难查的误报：授权判定用的是修剪后的库名
+// （通过），拼 Casbin 对象却用了原值 "ds:1: shop:*"，前缀对不上，
+// 用户被告知「该库无查询权限」——而他明明有。
+func TestExport_DatabaseNameNormalizedSymmetrically(t *testing.T) {
+	grants := &fakeExportGrants{allowed: map[string]bool{
+		grantKey(1, "shop"): true,
+	}}
+	h := newExportHandler(grants)
+
+	w := doExport(t, h, string(model.RoleDeveloper), map[string]any{
+		"datasource_id": 1, "type": "sql", "database": "  shop  ", "sql": "select 1",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("带空白的库名应被归一后放行，status = %d, body=%s", w.Code, w.Body.String())
+	}
+	// 闸门收到的必须是修剪后的库名
+	if len(grants.called) != 1 || grants.called[0] != grantKey(1, "shop") {
+		t.Fatalf("闸门收到的库名 = %v, want [%s]", grants.called, grantKey(1, "shop"))
+	}
+}

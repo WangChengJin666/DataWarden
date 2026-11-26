@@ -59,7 +59,11 @@ func (s *Service) ExecuteMongo(ctx context.Context, req MongoRequest, ad adapter
 			"collection": req.Collection,
 			"error":      err.Error(),
 		})
-		return nil, ErrNoDatabase
+		// 用的是 ErrNoCollection 而不是 ErrNoDatabase：这是"集合名写坏了"，
+		// 不是"没声明库"。两者在 handler 里的提示完全不同
+		//（"请先选择集合" vs "请先选择数据库"），混用会把人引到错误的
+		// 修正方向上——尤其导出的错误提示是用户唯一的排错依据。
+		return nil, ErrNoCollection
 	}
 	if authzDB == "" {
 		s.auditMongo(ctx, req, "mongo.denied", map[string]any{"reason": "no database declared"})

@@ -131,13 +131,23 @@ func (s *GrantStore) ListActive(ctx context.Context, limit int) ([]model.GrantVi
 // 只返回精简字段：host/port/username 一律不带出去，
 // SELECT 里就是明确的列清单，避免以后有人图省事写成 SELECT *。
 //
+// 必须排除已逻辑删除的账号（status='deleted'）：调用方传的是 token 里的
+// user_id，而账号被删后 token 在有效期内仍可用。不排除的话，一个已删除
+// 的人还能在查询页看到「我能查哪些数据源」——与 ActiveGrants / ListActive
+// 的口径不一致，那边早就排除了。判据在这条 SQL 里，不指望调用方记得。
+//
 // 用 array_agg 一次性把同一数据源的多个 scope 收成数组，
 // 避免在 Go 层循环里再查一次（N+1）。
 //
-// 导出权限用 bool_or 聚合成一个布尔值：同一数据源上可能同时存在多条
-// 生效授权（续期没撤销旧的、或改口径前批过一条），只要其中一条批了导出，
-// 这个人就能导出——权限取「或」而不是「最后一条」。用 SQL 聚合而不是
-// 在 Go 里扫数组，是为了让「多条授权怎么合并」只有一处定义。
+// 导出权限取「或」：同一数据源上可能同时存在多条生效授权
+//（续期没撤销旧的、或改口径前批过一条），只要其中一条批了导出，
+// 前端就在这个数据源上显示导出按钮。
+//
+// 注意这只是**展示层**的提示，不是授权判定：
+// 真正的闸门是 CanExportDatabase，它按「授权是否覆盖该库」逐条匹配。
+// 不能拿这里的 bool_or 去放行——一个数据源上有 shop、crm 两个库，
+// shop 那条批了导出、crm 那条没批，bool_or 会是 true，
+// 拿它放行就等于把 shop 的导出许可借给了 crm。
 func (s *GrantStore) MyDatasources(ctx context.Context, userID int64) ([]model.DatasourceBrief, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT d.id, d.name, d.type, d.description, d.db_name,
@@ -145,11 +155,13 @@ func (s *GrantStore) MyDatasources(ctx context.Context, userID int64) ([]model.D
 		        bool_or(g.can_export) AS can_export
 		 FROM grant_record g
 		 JOIN datasource d ON d.id = g.datasource_id
+		 JOIN app_user u   ON u.id = g.user_id
 		 WHERE g.user_id = $1
 		   AND g.revoked_at IS NULL
 		   AND g.expires_at > now()
+		   AND u.status <> $2
 		 GROUP BY d.id, d.name, d.type, d.description, d.db_name
-		 ORDER BY d.name`, userID)
+		 ORDER BY d.name`, userID, string(model.StatusDeleted))
 	if err != nil {
 		return nil, fmt.Errorf("query my datasources: %w", err)
 	}
@@ -374,39 +386,102 @@ func (s *GrantStore) SetCanExport(ctx context.Context, id int64, canExport bool)
 	return tag.RowsAffected() > 0, nil
 }
 
-// CanExport 判断某用户在某数据源上是否有导出权限。
+// CanExportDatabase 判断某用户能否在**指定数据源的指定库**上导出。
 //
-// 这是导出接口的唯一闸门，因此判定条件必须与「能查询」严格一致，
-// 否则会出现两种方向相反的事故：
-//   - 判宽了（只看 can_export=true）：一条已撤销或已过期的授权仍能导出，
-//     等于给了比查询更大的权限面；
-//   - 判严了（漏掉某一档 scope）：整源授权能查却不能导出。
+// 这是导出接口唯一的权限闸门，判定粒度必须与「能不能查这个库」严格一致：
 //
-// 所以这里复用 ActiveGrants 的过滤条件（未撤销、未过期、账号未被删除），
-// 再加一条 can_export。多条授权取「或」，与 MyDatasources 的 bool_or 一致。
+//	grant_record 生效中
+//	  且 can_export = true
+//	  且 该条授权的 scope 覆盖这个库
 //
-// 停用（disabled）账号不在 SQL 里排除：它们能登录本身就被登录链路挡了，
-// 而已签发的 token 在 12 小时内仍可用——这个口径与查询侧完全相同，
-// 导出不该比查询更严（那会造成「能查不能导」的困惑）。
-func (s *GrantStore) CanExport(ctx context.Context, userID, datasourceID int64) (bool, error) {
-	var ok bool
-	err := s.pool.QueryRow(ctx,
-		`SELECT EXISTS (
-		     SELECT 1 FROM grant_record g
-		      WHERE g.user_id = $1
-		        AND g.datasource_id = $2
-		        AND g.can_export
-		        AND g.revoked_at IS NULL
-		        AND g.expires_at > now()
-		        AND EXISTS (
-		            SELECT 1 FROM app_user u
-		             WHERE u.id = g.user_id AND u.status <> $3
-		        )
-		 )`, userID, datasourceID, string(model.StatusDeleted)).Scan(&ok)
+// 为什么不能按数据源整体判：一个数据源下有多个库时，授权是逐条记录、
+// 逐次审批的。shop 库那条批了导出、crm 库那条没批，是两次独立决定；
+// 若只看「这个数据源上有没有任一 can_export=true 的授权」，crm 就被
+// 顺带放开了——用户能查 crm（有查询授权）也确实导出了 crm 的数据，
+// 但那一次审批里从没同意过。这是真实的权限放大，不是显示问题。
+//
+// 「覆盖这个库」的三种形态都要认（与 SyncGrants 生成策略的规则同源）：
+//   - "*"        整个数据源（申请审批通过后落这种）
+//   - "<库>:*"   该库整库
+//   - "<库>:t1"  该库指定表（表不参与鉴权，能查库下别的表也就覆盖该库）
+// "*:*" 属于"显示得出、鉴权不生效"的脏数据，这里同样不认，
+// 与 authz.SyncGrants 跳过它保持一致。
+//
+// 已撤销 / 已过期的授权一律不算：导出的是文件，出去就收不回，
+// 比查询更不能靠"过期了但策略还没刷新"的空档。
+//
+// 停用（disabled）账号不在 SQL 里排除：登录链路已经挡住它们，
+// 且已签发 token 在 12 小时内仍可用——口径与查询侧完全相同。
+func (s *GrantStore) CanExportDatabase(ctx context.Context, userID, datasourceID int64, database string) (bool, error) {
+	// 兜底修剪：正常路径上调用方已归一，但这里是安全判定，
+	// 不能假定每个调用方都记得。空库名直接 fail-closed。
+	database = strings.TrimSpace(database)
+	if database == "" {
+		// 库名未知就无法判定覆盖关系。fail-closed：不放行，
+		// 由上层决定提示"请先选库"还是"没有权限"。
+		return false, nil
+	}
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT g.scope FROM grant_record g
+		  WHERE g.user_id = $1
+		    AND g.datasource_id = $2
+		    AND g.can_export
+		    AND g.revoked_at IS NULL
+		    AND g.expires_at > now()
+		    AND EXISTS (
+		        SELECT 1 FROM app_user u
+		         WHERE u.id = g.user_id AND u.status <> $3
+		    )
+		  ORDER BY g.id`, userID, datasourceID, string(model.StatusDeleted))
 	if err != nil {
 		return false, fmt.Errorf("query export permission: %w", err)
 	}
-	return ok, nil
+	defer rows.Close()
+
+	for rows.Next() {
+		var scope string
+		if err := rows.Scan(&scope); err != nil {
+			return false, fmt.Errorf("scan export scope: %w", err)
+		}
+		if scopeCoversDatabase(scope, database) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// scopeCoversDatabase 判断一条授权 scope 是否覆盖指定库。
+//
+// database 必须是**已 TrimSpace** 的库名：scope 里的库段在写入时已被
+// NormalizeScope 修剪，两侧口径不一致会出现"授权判定通过、Casbin 对象
+// 对不上"的偏差。归一的职责放在 httpapi.exportAuthzDatabase 一处，
+// 那里产出的值同时用于查授权与拼 ds:<id>:<库>:*，不在这里再修剪一次
+// （两处各修剪一次看似更稳，实际会让"到底谁负责归一"变得含糊）。
+//
+// 与 authz.NormalizeScope 的归一规则对齐，但这里不生成策略、只做包含判断，
+// 所以单独实现：用 NormalizeScope 归一后再切库名，能同时覆盖
+// "shop"、"shop:*"、"shop:orders" 三种写法，以及 "*"。
+//
+// 归一失败的 scope 一律视为不覆盖（fail-closed）：畸形 scope 本来就不会
+// 生成策略，用户查不了那个库，也就不该能导出它。
+func scopeCoversDatabase(scope, database string) bool {
+	// 显式拒绝 "*:*"：它现在被判为 false 只是因为 NormalizeScope 把它当
+	// 非法值返回空串。若将来有人「修」NormalizeScope 让它接受 "*:*"，
+	// 这里会**悄悄**变成 true——一条鉴权侧根本不生成策略的脏数据，
+	// 突然就把导出权限开到了整个数据源。判定不能依赖别人的实现细节。
+	if strings.TrimSpace(scope) == authz.ScopeDatabaseAll {
+		return false
+	}
+	norm := authz.NormalizeScope(scope)
+	if norm == "" {
+		return false
+	}
+	if norm == authz.ScopeDatabaseAll {
+		return true
+	}
+	db, _, _ := strings.Cut(norm, ":")
+	return db == database
 }
 
 // GrantScopes 返回某用户在某数据源上生效授权的 scope 列表。
@@ -415,10 +490,14 @@ func (s *GrantStore) CanExport(ctx context.Context, userID, datasourceID int64) 
 // 不能去列整库的表，那会把用户无权看到的表名也暴露出来。
 func (s *GrantStore) GrantScopes(ctx context.Context, userID, datasourceID int64) ([]string, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT scope FROM grant_record
-		 WHERE user_id = $1 AND datasource_id = $2
-		   AND revoked_at IS NULL AND expires_at > now()
-		 ORDER BY id`, userID, datasourceID)
+		`SELECT g.scope FROM grant_record g
+		 WHERE g.user_id = $1 AND g.datasource_id = $2
+		   AND g.revoked_at IS NULL AND g.expires_at > now()
+		   AND EXISTS (
+		       SELECT 1 FROM app_user u
+		        WHERE u.id = g.user_id AND u.status <> $3
+		   )
+		 ORDER BY g.id`, userID, datasourceID, string(model.StatusDeleted))
 	if err != nil {
 		return nil, fmt.Errorf("query grant scopes: %w", err)
 	}

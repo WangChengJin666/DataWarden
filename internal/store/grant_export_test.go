@@ -58,14 +58,14 @@ func TestGrantStore_CanExportIsPerDatasource(t *testing.T) {
 		t.Fatalf("create grant B: %v", err)
 	}
 
-	gotA, err := gs.CanExport(ctx, uid, dsA)
+	gotA, err := gs.CanExportDatabase(ctx, uid, dsA, "shop")
 	if err != nil {
 		t.Fatalf("CanExport A: %v", err)
 	}
 	if !gotA {
 		t.Error("A 数据源已批导出，应当允许")
 	}
-	gotB, err := gs.CanExport(ctx, uid, dsB)
+	gotB, err := gs.CanExportDatabase(ctx, uid, dsB, "shop")
 	if err != nil {
 		t.Fatalf("CanExport B: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestGrantStore_CanExportIgnoresInactiveGrants(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create expired grant: %v", err)
 	}
-	ok, err := gs.CanExport(ctx, uid, dsID)
+	ok, err := gs.CanExportDatabase(ctx, uid, dsID, "shop")
 	if err != nil {
 		t.Fatalf("CanExport: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestGrantStore_CanExportIgnoresInactiveGrants(t *testing.T) {
 	if err := gs.Revoke(ctx, gid); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-	ok, err = gs.CanExport(ctx, uid, dsID)
+	ok, err = gs.CanExportDatabase(ctx, uid, dsID, "shop")
 	if err != nil {
 		t.Fatalf("CanExport: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestGrantRequestStore_ApproveCopiesCanExport(t *testing.T) {
 		if g.CanExport != want {
 			t.Errorf("授权上的 can_export = %v, want %v", g.CanExport, want)
 		}
-		ok, err := gs.CanExport(ctx, uid, dsID)
+		ok, err := gs.CanExportDatabase(ctx, uid, dsID, "shop")
 		if err != nil {
 			t.Fatalf("CanExport: %v", err)
 		}
@@ -194,7 +194,7 @@ func TestGrantStore_SetCanExport(t *testing.T) {
 	if !hit {
 		t.Fatal("SetCanExport 应当命中刚建的授权")
 	}
-	ok, _ := gs.CanExport(ctx, uid, dsID)
+	ok, _ := gs.CanExportDatabase(ctx, uid, dsID, "shop")
 	if !ok {
 		t.Error("开启后应当允许导出")
 	}
@@ -203,7 +203,7 @@ func TestGrantStore_SetCanExport(t *testing.T) {
 	if err != nil || !hit {
 		t.Fatalf("SetCanExport(false) hit=%v err=%v", hit, err)
 	}
-	ok, _ = gs.CanExport(ctx, uid, dsID)
+	ok, _ = gs.CanExportDatabase(ctx, uid, dsID, "shop")
 	if ok {
 		t.Error("关闭后不应再允许导出")
 	}
@@ -241,7 +241,7 @@ func TestGrantStore_CanExportAnyGrantAllows(t *testing.T) {
 		t.Fatalf("create second grant: %v", err)
 	}
 
-	ok, err := gs.CanExport(ctx, uid, dsID)
+	ok, err := gs.CanExportDatabase(ctx, uid, dsID, "shop")
 	if err != nil {
 		t.Fatalf("CanExport: %v", err)
 	}
@@ -255,5 +255,85 @@ func TestGrantStore_CanExportAnyGrantAllows(t *testing.T) {
 	}
 	if len(briefs) != 1 || !briefs[0].CanExport {
 		t.Errorf("下拉 can_export 应为 true，实际 %+v", briefs)
+	}
+}
+
+// scopeCoversDatabase 是导出闸门的核心判定，纯函数，直接覆盖所有写法。
+//
+// 这一组用例锁住"哪些 scope 算覆盖这个库"。写错任一支的方向都很糟：
+// 认多了是权限放大（把 A 库的导出许可借给 B 库），
+// 认少了是"明明批了却导不了"（用户只能反复申请）。
+func TestScopeCoversDatabase(t *testing.T) {
+	cases := []struct {
+		scope, db string
+		want      bool
+		why       string
+	}{
+		{"*", "shop", true, "整个数据源授权覆盖任意库"},
+		{"*", "crm", true, "同上"},
+		{"shop", "shop", true, "裸库名归一成 shop:*"},
+		{"shop:*", "shop", true, "整库授权"},
+		{"shop:orders,users", "shop", true, "表级授权也覆盖该库（表不参与鉴权）"},
+		{"shop:*", "crm", false, "库级授权不能覆盖另一个库"},
+		{"shop:orders", "crm", false, "同上"},
+		{"", "shop", false, "空 scope 不覆盖任何库"},
+		{"**", "shop", false, "畸形 scope 不生成策略，也不该放行导出"},
+		{"*:*", "shop", false, "脏数据不生成策略，鉴权侧跳过它，这里保持一致"},
+	}
+	for _, c := range cases {
+		if got := scopeCoversDatabase(c.scope, c.db); got != c.want {
+			t.Errorf("scopeCoversDatabase(%q, %q) = %v, want %v（%s）",
+				c.scope, c.db, got, c.want, c.why)
+		}
+	}
+}
+
+// 库级判定必须独立到「库」，不能因为同一个数据源上另一个库批了导出就放行。
+//
+// 这是权限放大的回归用例：一个数据源下 shop 库批了导出、crm 库没批，
+// 若按数据源整体判（bool_or），crm 会被顺带放开。
+func TestGrantStore_CanExportDatabaseIsPerDatabase(t *testing.T) {
+	pool, uid, dsID := newGrantFixture(t, "perdb", "pg-perdb")
+	ctx := context.Background()
+	gs := NewGrantStore(pool)
+
+	// shop 库：批了导出
+	if _, err := gs.Create(ctx, &model.Grant{
+		UserID: uid, DatasourceID: dsID, Scope: "shop:*", Action: "read",
+		CanExport: true, ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("create shop grant: %v", err)
+	}
+	// crm 库：只批了查询，没批导出
+	if _, err := gs.Create(ctx, &model.Grant{
+		UserID: uid, DatasourceID: dsID, Scope: "crm:*", Action: "read",
+		CanExport: false, ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("create crm grant: %v", err)
+	}
+
+	ok, err := gs.CanExportDatabase(ctx, uid, dsID, "shop")
+	if err != nil {
+		t.Fatalf("CanExportDatabase(shop): %v", err)
+	}
+	if !ok {
+		t.Error("shop 库批了导出，应当允许")
+	}
+
+	ok, err = gs.CanExportDatabase(ctx, uid, dsID, "crm")
+	if err != nil {
+		t.Fatalf("CanExportDatabase(crm): %v", err)
+	}
+	if ok {
+		t.Error("crm 库没批导出，不能因为同数据源的 shop 批了就放开")
+	}
+
+	// 空库名必须 fail-closed，不能当成"整个数据源都行"
+	ok, err = gs.CanExportDatabase(ctx, uid, dsID, "")
+	if err != nil {
+		t.Fatalf("CanExportDatabase(empty): %v", err)
+	}
+	if ok {
+		t.Error("库名为空时不能放行")
 	}
 }

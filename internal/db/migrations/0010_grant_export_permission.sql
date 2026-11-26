@@ -27,6 +27,10 @@
 --    Casbin 策略的 act 段直接使用，改成 'read,export' 这类组合值会
 --    让 Enforce 的 act 匹配出现歧义（同一个字段两种语义）。
 --
+-- 关于 COMMENT ON COLUMN 会被每次启动重跑：PG 里对相同文本的 COMMENT
+-- 是空更新（不重写、不留死元组），拿到的是瞬时锁，可以接受。
+-- 但新增列时**必须**保留 IF NOT EXISTS，否则第二次启动就直接报错。
+--
 -- 幂等脚本，可重复执行。
 
 ALTER TABLE grant_record  ADD COLUMN IF NOT EXISTS can_export BOOLEAN NOT NULL DEFAULT false;

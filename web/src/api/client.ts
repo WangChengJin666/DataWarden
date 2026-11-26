@@ -310,27 +310,68 @@ export async function exportQuery(payload: {
   row_limit?: number
   filename?: string
 }): Promise<{ blob: Blob; filename: string; truncated: boolean }> {
-  const res = await http.post('/query/export', payload, { responseType: 'blob' })
-  const blob = res.data as Blob
+  const res = await http.post('/query/export', payload, {
+    // 超时要比后端自己的执行超时略长，但不能长太多。
+    //
+    // 后端 querysvc 的执行超时是 QUERY_TIMEOUT_SEC（默认 30s），
+    // 超了会由后端主动中断并返回 500。若前端设 300s，用户要点完之后
+    // 干等 5 分钟才见到失败——而真正的失败信息后端在 30s 时就已经给了。
+    // 这里的余量只用来覆盖"查询已跑完、xlsx 生成 + 传输"这段：
+    // 90s 足够 2 万行生成与下载，又不会把失败反馈拖到无法忍受。
+    //
+    // 若部署时把 QUERY_TIMEOUT_SEC 调到 60 以上，这里要同步放大，
+    // 否则会在后端还在跑的时候就把请求判超时。
+    timeout: 90_000,
+    responseType: 'blob',
+    // 只豁免 403，让 401 继续走全局拦截器。
+    //
+    // 为什么必须豁免 403：全局拦截器遇到 403 会 clearSession() 并跳 /login。
+    // 而「这个库没批导出」是与登录无关的权限拒绝（开发者本人有效），
+    // 走全局拦截器会把人直接踢下线，看起来像账号出问题，实际只是点错了库。
+    //
+    // 为什么必须保留 401：token 过期时用户必须被送回登录页。
+    // 若这里写成 `() => true`（对所有状态码都放行），401 也会被吞掉，
+    // 用户只会看到「导出失败（HTTP 401）」，页面却停在那里不跳转——
+    // 那比原来的行为更糟。所以豁免范围只到 403。
+    validateStatus: (status) => (status >= 200 && status < 300) || status === 403,
+  })
 
-  // 服务端回的是错误 JSON：读出来抛出去，而不是让用户下载一个
-  // 内容是 {"error":"..."} 的 .xlsx（Excel 打开会报文件损坏）。
-  if (blob.type.includes('application/json')) {
-    const text = await blob.text()
-    let msg = '导出失败'
-    try {
-      msg = JSON.parse(text).error || msg
-    } catch {
-      if (text) msg = text
-    }
-    throw new Error(msg)
+  // 403：后端回的是 JSON 错误体，但 responseType 是 blob，
+  // 全局拦截器读 err.response.data.error 只会拿到 Blob，
+  // 提示会退化成 "[object Blob]"。所以在这里自己读出来。
+  if (res.status === 403) {
+    throw new Error(await readBlobError(res.data as Blob, res.status))
   }
+  const blob = res.data as Blob
 
   return {
     blob,
     filename: filenameFromHeader(res.headers['content-disposition']),
     truncated: res.headers['x-export-truncated'] === '1',
   }
+}
+
+/**
+ * 从错误响应里读出可读的错误文案。
+ *
+ * 导出接口出错时回的是 JSON（没挂 responseType 的普通接口能直接读 data.error），
+ * 但这里 data 已经是 Blob。必须手动 text() + JSON.parse，
+ * 否则用户只能看到一句 "[object Blob]"。
+ */
+async function readBlobError(blob: Blob | undefined, status: number): Promise<string> {
+  if (!blob) return `导出失败（HTTP ${status}）`
+  try {
+    const text = await blob.text()
+    const msg = JSON.parse(text).error
+    if (typeof msg === 'string' && msg) return msg
+  } catch {
+    // 不是 JSON（网关返回 HTML 错误页之类），走下面的兜底
+  }
+  // 走到这里说明后端没有给 JSON 错误体（网关错误页之类）。
+  // 401 已经交给全局拦截器，这里保留一句兜底只为兜住极端情况。
+  if (status === 403) return '当前授权不包含导出权限，请到「申请授权」页申请'
+  if (status === 401) return '登录已过期，请重新登录'
+  return `导出失败（HTTP ${status}）`
 }
 
 /**

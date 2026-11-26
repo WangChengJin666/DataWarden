@@ -56,6 +56,18 @@ const { Text, Paragraph } = Typography
 // 表现为「list、zset 查出来有 key 但值是空的」。
 const REDIS_COLLECTION_TYPES = new Set(['list', 'set', 'zset'])
 
+/** 单次查询在页面上最多展示 / 取回的行数。与 querysvc 的交互上限一致。 */
+const QUERY_MAX_ROWS = 1000
+
+/**
+ * 导出允许的最大行数，必须与后端 exportMaxRowLimit 保持一致。
+ *
+ * 两处各写一份常量当然不理想，但跨语言的"共享常量"要么靠构建期生成
+ * 类型文件，要么靠接口下发；为一个上限值引入那套机制不值得。
+ * 这里用注释钉住对应关系，改动后端时 grep 这个数字能找到前端。
+ */
+const EXPORT_MAX_ROWS = 20000
+
 /** 表格内每个集合 key 只铺这么多元素做预览，完整内容在弹窗里看。 */
 const REDIS_PREVIEW_ITEMS = 3
 
@@ -427,6 +439,16 @@ export default function QueryPage() {
 
   const [sql, setSql] = useState('')
   const [rowLimit, setRowLimit] = useState(100)
+
+  /**
+   * 查询请求实际带的行数上限。
+   *
+   * 与 rowLimit 分开：rowLimit 是输入框里的值，有导出权限时可以调到 20000，
+   * 那是给导出用的；而页面上的查询结果最多翻 50 行/页，取 20000 行
+   * 只是让后端多扫内存、多传几十 MB，对用户毫无用处。
+   * 这里封顶到 QUERY_MAX_ROWS，保证"查询看结果"始终轻量。
+   */
+  const queryRowLimit = Math.min(rowLimit, QUERY_MAX_ROWS)
   const [loading, setLoading] = useState(false)
   // 导出单独一个 loading：它比查询慢（要重新执行 + 生成文件），
   // 复用查询的 loading 会让「执行」按钮在导出期间也跟着转。
@@ -775,13 +797,16 @@ export default function QueryPage() {
                 database: database.trim(),
                 collection: mongoCollection.trim(),
                 filter: mongoFilter.trim(),
-                row_limit: rowLimit,
+                // 查询用 queryRowLimit，不用导出用的 rowLimit：
+                // 页面表格翻页也只显示 50 行，取 20000 行纯属浪费后端
+                // 内存与传输。两个上限分开，用户调大"限 N 行"是为了导出全量。
+                row_limit: queryRowLimit,
               }
             : {
                 datasource_id: datasourceId,
                 database: database.trim(),
                 command: mongoCommand.trim(),
-                row_limit: rowLimit,
+                row_limit: queryRowLimit,
               }
         setResult(normalizeResult(await executeMongo(payload)))
         return
@@ -795,7 +820,7 @@ export default function QueryPage() {
             // 而编辑器补全也不再依赖它。审计里的 tables 保持缺省，
             // 「这次查了哪些表」以 SQL 本身为准（已随审计一起落库）。
             sql: effectiveSql,
-            row_limit: rowLimit,
+            row_limit: queryRowLimit,
           }),
         ),
       )
@@ -837,10 +862,17 @@ export default function QueryPage() {
       message.warning('请先选择数据源')
       return
     }
-    if (!canExport) {
-      message.warning('当前数据源的授权不包含导出权限，请到「申请授权」页申请')
-      return
-    }
+    // 不在这里用 canExport 提前拦截。
+    //
+    // canExport 来自页面加载时的那份 /grants/mine 快照，可能已经陈旧：
+    // DBA 刚批了导出而用户没刷新页面时它是 false，本地拦截会把本来
+    // 该成功的导出挡掉；反过来快照说 true、授权刚被收紧时，
+    // 拦截也拦不住（那种情况只有后端知道）。两头的正确答案都在后端。
+    //
+    // 所以交给 /query/export 判定：它是权威源，且改完即时生效。
+    // 被拒时会带回明确文案（"没批导出" 还是 "该库没有查询权限"），
+    // 比这里一句笼统的提示更有指导性。按钮本身的显隐仍按 canExport，
+    // 那是为了"没批导出时不要显出一个点了必然失败的按钮"。
 
     // 校验与 run() 保持一致：导出实际上就是"执行 + 落文件"，
     // 允许导出的条件不能比允许查询更松。
@@ -1319,9 +1351,15 @@ export default function QueryPage() {
                 </Popover>
               ) : null}
 
+              {/* 上限按能力分开：查询走 querysvc 的单次上限（1000，再多
+                  也没法在页面上看），有导出权限时放宽到后端的导出上限
+                  （20000）——导出的用途就是拿全量，卡在 1000 等于让人
+                  导出个截图。两个值都与后端的 clamp 范围对齐，超出会被
+                  后端夹回去，但界面先给出正确的范围，避免用户以为
+                  "填了 20000 却只拿到 1000 行"是 bug。 */}
               <InputNumber
                 min={1}
-                max={1000}
+                max={canExport ? EXPORT_MAX_ROWS : QUERY_MAX_ROWS}
                 value={rowLimit}
                 onChange={(v) => setRowLimit(v ?? 100)}
                 addonBefore="限"

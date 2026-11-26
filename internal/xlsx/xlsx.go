@@ -60,6 +60,16 @@ func FromQueryResult(columns []string, rows [][]any) ([]byte, error) {
 	if len(rows) > maxRows {
 		return nil, fmt.Errorf("行数 %d 超过 Excel 上限 %d", len(rows), maxRows)
 	}
+	// 单元格总数保护：行数与列数各自都在 Excel 上限内，乘积仍可能大到
+	// 撑爆内存。工作表 XML 是整段拼在内存里的（约每格几十字节），
+	// 20000 行 × 16384 列 ≈ 3 亿格，任何机器都扛不住，而这是"合法"请求。
+	// 这里给出明确错误，而不是让进程 OOM——后者会把整个服务带走。
+	const maxCells = 5_000_000
+	if total := len(columns) * (len(rows) + 1); total > maxCells {
+		return nil, fmt.Errorf(
+			"结果规模过大（%d 列 × %d 行 ≈ %d 单元格），超过导出上限 %d；请减少列或行后重试",
+			len(columns), len(rows)+1, total, maxCells)
+	}
 
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
